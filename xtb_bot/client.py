@@ -633,6 +633,11 @@ class XtbApiClient(BaseBrokerClient):
 
         was_reconnect = self._stream_last_disconnect_ts is not None
         self._stream_ws = stream_ws
+        # Stop old reader thread if still running
+        self._stream_stop_event.set()
+        old_thread = self._stream_reader_thread
+        if old_thread is not None and old_thread.is_alive():
+            old_thread.join(timeout=2.0)
         self._stream_stop_event.clear()
         self._stream_reader_thread = threading.Thread(
             target=self._stream_reader_loop,
@@ -860,7 +865,7 @@ class XtbApiClient(BaseBrokerClient):
             descr = response.get("errorDescr", "No description")
             raise BrokerError(f"XTB command {command} failed: {code} {descr}")
 
-        return response.get("returnData", {})
+        return response.get("returnData") or {}
 
     def _perform_control_ping(self, timeout_sec: float) -> bool:
         ws = self._ensure_connected()

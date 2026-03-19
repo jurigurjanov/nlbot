@@ -149,9 +149,9 @@ class MeanReversionBbStrategy(Strategy):
     def _mean_std(values: Sequence[float]) -> tuple[float, float]:
         return mean_std(values)
 
-    @staticmethod
-    def _rsi_sma(prices: Sequence[float]) -> float:
-        return rsi_sma(prices)
+    def _rsi_sma(self, prices: Sequence[float]) -> float:
+        period_slice = prices[-(self.rsi_period + 1):] if len(prices) > self.rsi_period + 1 else prices
+        return rsi_sma(period_slice)
 
     def _rsi_wilder(self, prices: Sequence[float]) -> float:
         return rsi_wilder(prices, self.rsi_period)
@@ -281,8 +281,8 @@ class MeanReversionBbStrategy(Strategy):
         if not self.trend_filter_enabled or trend_ma is None:
             return True, False
 
-        blocked = (expected_side == Side.SELL and last >= trend_ma) or (
-            expected_side == Side.BUY and last <= trend_ma
+        blocked = (expected_side == Side.SELL and last <= trend_ma) or (
+            expected_side == Side.BUY and last >= trend_ma
         )
         if not blocked:
             return True, False

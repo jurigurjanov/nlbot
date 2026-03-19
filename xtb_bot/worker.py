@@ -1985,10 +1985,13 @@ class SymbolWorker(threading.Thread):
 
     def _apply_trailing_stop(self, position: Position, new_stop_loss: float, progress: float) -> None:
         old_stop = position.stop_loss
-        if self.mode == RunMode.EXECUTION:
-            self.broker.modify_position(position, new_stop_loss, position.take_profit)
-
         position.stop_loss = new_stop_loss
+        try:
+            if self.mode == RunMode.EXECUTION:
+                self.broker.modify_position(position, new_stop_loss, position.take_profit)
+        except Exception:
+            position.stop_loss = old_stop
+            raise
         self.store.upsert_trade(position, self.name, self.strategy_name, self.mode.value)
         trailing_settings = self._effective_trailing_settings(position)
         self.store.record_event(
@@ -2348,9 +2351,14 @@ class SymbolWorker(threading.Thread):
             if guarded is None:
                 return False
             new_stop_loss = guarded
-        if self.mode == RunMode.EXECUTION:
-            self.broker.modify_position(position, new_stop_loss, position.take_profit)
+        old_stop = position.stop_loss
         position.stop_loss = new_stop_loss
+        try:
+            if self.mode == RunMode.EXECUTION:
+                self.broker.modify_position(position, new_stop_loss, position.take_profit)
+        except Exception:
+            position.stop_loss = old_stop
+            raise
         self.store.upsert_trade(position, self.name, self.strategy_name, self.mode.value)
         self.store.record_event(
             "WARN",
@@ -2382,6 +2390,10 @@ class SymbolWorker(threading.Thread):
         if not events:
             return None
 
+        if len(self._handled_news_events) > 500:
+            current_event_ids = {e.event_id for e in events}
+            self._handled_news_events = self._handled_news_events & current_event_ids
+
         for event in events:
             if event.event_id in self._handled_news_events:
                 continue
@@ -2408,7 +2420,6 @@ class SymbolWorker(threading.Thread):
                 bid=bid,
                 ask=ask,
             )
-            return None
         return None
 
     def _normalize_volume(self, raw_volume: float) -> float:
@@ -3109,14 +3120,15 @@ class SymbolWorker(threading.Thread):
                 self.prices.append(tick.mid)
                 self.price_timestamps.append(tick.timestamp)
                 current_volume: float | None = None
+                parsed_volume = 0.0
                 if tick.volume is not None:
                     try:
                         parsed_volume = float(tick.volume)
                     except (TypeError, ValueError):
                         parsed_volume = 0.0
-                    if parsed_volume > 0:
-                        current_volume = parsed_volume
-                        self.volumes.append(parsed_volume)
+                if parsed_volume > 0:
+                    current_volume = parsed_volume
+                self.volumes.append(parsed_volume)
                 self._cache_price_sample(tick.timestamp, tick.mid, current_volume)
                 self._reset_broker_error_trackers()
                 current_spread_pips = self._spread_in_pips(tick.bid, tick.ask)
@@ -3196,8 +3208,8 @@ class SymbolWorker(threading.Thread):
                                     )
                                     if dynamic_exit_reason:
                                         self._close_position(active, mark_price, dynamic_exit_reason)
-                                if self.position_book.get(self.symbol) is not None and force_flatten:
-                                    self._close_position(active, mark_price, f"emergency:{reason}")
+                                    elif self.position_book.get(self.symbol) is not None and force_flatten:
+                                        self._close_position(active, mark_price, f"emergency:{reason}")
 
                 active = self.position_book.get(self.symbol)
                 if not active:

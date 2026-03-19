@@ -853,10 +853,12 @@ def _as_symbols(value: Any) -> list[str]:
 
 
 def _resolve(raw_file: dict[str, Any], env_key: str, file_key: str, default: Any = None) -> Any:
-    _ = (raw_file, file_key)
     env_val = os.getenv(env_key)
     if env_val not in (None, ""):
         return env_val
+    file_val = raw_file.get(file_key)
+    if file_val is not None:
+        return file_val
     return default
 
 
@@ -867,13 +869,15 @@ def _resolve_dual_env(
     file_key: str,
     default: Any = None,
 ) -> Any:
-    _ = (raw_file, file_key)
     primary = os.getenv(primary_env_key)
     if primary not in (None, ""):
         return primary
     secondary = os.getenv(secondary_env_key)
     if secondary not in (None, ""):
         return secondary
+    file_val = raw_file.get(file_key)
+    if file_val is not None:
+        return file_val
     return default
 
 

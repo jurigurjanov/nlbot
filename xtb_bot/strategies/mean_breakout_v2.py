@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime, timezone
 import math
+import threading
 
 from xtb_bot.models import Side, Signal
 from xtb_bot.numeric import atr_wilder, ema, mean_std
@@ -91,6 +92,7 @@ class MeanBreakoutStrategyV2(Strategy):
         self.stop_loss_pips = self.base_sl
         self.take_profit_pips = max(self.base_tp, self.base_sl * self.rr_ratio)
         self.min_history = max(self.z_window + self.slope_window + 1, self.br_window + 2, self.atr_window + 2)
+        self._signal_lock = threading.Lock()
 
     @staticmethod
     def _ema(values: Sequence[float], window: int) -> float:
@@ -316,7 +318,7 @@ class MeanBreakoutStrategyV2(Strategy):
         current_ema = self._ema(subset, self.z_window)
 
         mean, std = mean_std(subset)
-        zscore = (float(prices[-1]) - current_ema) / std if std > 0 else 0.0
+        zscore = (float(prices[-1]) - mean) / std if std > 0 else 0.0
 
         prev_slice_start = -(self.z_window + self.slope_window)
         prev_slice_end = -self.slope_window
@@ -354,6 +356,10 @@ class MeanBreakoutStrategyV2(Strategy):
         )
 
     def generate_signal(self, ctx: StrategyContext) -> Signal:
+        with self._signal_lock:
+            return self._generate_signal_locked(ctx)
+
+    def _generate_signal_locked(self, ctx: StrategyContext) -> Signal:
         raw_prices = [float(v) for v in ctx.prices]
         raw_timestamps = [float(v) for v in ctx.timestamps]
         prices, using_closed_candles = self._resample_closed_candle_closes(raw_prices, raw_timestamps)

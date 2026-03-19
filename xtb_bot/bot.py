@@ -235,7 +235,7 @@ class TradingBot:
         if params is None:
             if str(strategy_name).strip().lower() == str(self.config.strategy).strip().lower():
                 return dict(self.config.strategy_params)
-            return dict(self.config.strategy_params)
+            return {}
         return dict(params)
 
     def _make_worker(self, assignment: WorkerAssignment, stop_event: threading.Event) -> SymbolWorker:
@@ -1732,8 +1732,8 @@ class TradingBot:
 
         self._connect_broker()
         final_restored, summary = self._restore_open_positions()
+        self.position_book.bootstrap(final_restored)
         if final_restored:
-            self.position_book.bootstrap(final_restored)
             logger.info(
                 "Restored %d open positions from %s for mode=%s",
                 len(final_restored),
