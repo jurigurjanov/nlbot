@@ -311,7 +311,10 @@ class MomentumStrategy(Strategy):
                 "session_end_hour_utc": self.session_end_hour_utc,
             }
         try:
-            hour_utc = datetime.fromtimestamp(float(ctx.timestamps[-1]), tz=timezone.utc).hour
+            raw_ts = float(ctx.timestamps[-1])
+            if raw_ts > 10_000_000_000:
+                raw_ts = raw_ts / 1000.0
+            hour_utc = datetime.fromtimestamp(raw_ts, tz=timezone.utc).hour
         except (ValueError, OSError, OverflowError):
             return False, {
                 "session_filter_enabled": True,
@@ -366,7 +369,14 @@ class MomentumStrategy(Strategy):
             return True, payload
 
         current_volume = ctx.current_volume
-        history = [float(value) for value in ctx.volumes if float(value) > 0]
+        history = []
+        for value in ctx.volumes:
+            try:
+                fv = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(fv) and fv > 0:
+                history.append(fv)
         payload["current_volume"] = current_volume
         payload["volume_history_len"] = len(history)
 

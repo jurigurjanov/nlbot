@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 import json
 import math
+import threading
 
 from xtb_bot.models import Side, Signal
 from xtb_bot.numeric import adx_from_close, atr_wilder, ema, ema_last_two
@@ -117,6 +118,7 @@ class G1Strategy(Strategy):
             1e-6, float(params.get("g1_confidence_velocity_norm_ratio", 0.0005))
         )
         self._adx_regime_active_by_symbol: dict[str, bool] = {}
+        self._signal_lock = threading.Lock()
 
         self.fx_profile = self._build_profile(
             params=params,
@@ -605,6 +607,10 @@ class G1Strategy(Strategy):
         return max(0.05, min(1.0, value))
 
     def generate_signal(self, ctx: StrategyContext) -> Signal:
+        with self._signal_lock:
+            return self._generate_signal_locked(ctx)
+
+    def _generate_signal_locked(self, ctx: StrategyContext) -> Signal:
         raw_prices = [float(value) for value in ctx.prices]
         raw_timestamps = [float(value) for value in ctx.timestamps]
         prices, using_closed_candles = self._resample_closed_candle_closes(raw_prices, raw_timestamps)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import threading
 from zoneinfo import ZoneInfo
 
 from xtb_bot.models import Side, Signal
@@ -53,6 +54,7 @@ class MeanBreakoutSessionStrategy(Strategy):
         self._session_start_hour, self._session_start_minute = self._parse_hhmm(self.session_start)
         self._last_traded_session_key: str | None = None
         self.min_history = 4
+        self._signal_lock = threading.Lock()
 
     @staticmethod
     def _as_bool(value: object, default: bool) -> bool:
@@ -85,6 +87,8 @@ class MeanBreakoutSessionStrategy(Strategy):
             return 9, 0
 
     def _session_window(self, now_ts: float) -> tuple[float, float, str]:
+        if now_ts > 10_000_000_000:
+            now_ts = now_ts / 1000.0
         now_local = datetime.fromtimestamp(now_ts, tz=self._tz)
         session_open_local = now_local.replace(
             hour=self._session_start_hour,
@@ -128,6 +132,10 @@ class MeanBreakoutSessionStrategy(Strategy):
         )
 
     def generate_signal(self, ctx: StrategyContext) -> Signal:
+        with self._signal_lock:
+            return self._generate_signal_locked(ctx)
+
+    def _generate_signal_locked(self, ctx: StrategyContext) -> Signal:
         prices = [float(value) for value in ctx.prices]
         timestamps = [float(value) for value in ctx.timestamps]
 

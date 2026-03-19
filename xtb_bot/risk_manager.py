@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
 import math
+import threading
 
 from xtb_bot.config import RiskConfig
 from xtb_bot.models import AccountSnapshot, SymbolSpec
@@ -64,6 +65,7 @@ class RiskManager:
         self.store = store
         self._open_slot_lease_sec = max(1.0, float(self.cfg.open_slot_lease_sec))
         self._max_positions_slot_alert_key = "risk.max_positions_slot_alert_active"
+        self._lock = threading.Lock()
 
     @staticmethod
     def _is_fx_pair_symbol(symbol: str) -> bool:
@@ -191,7 +193,7 @@ class RiskManager:
     ) -> tuple[float, str, dict[str, float]]:
         margin_entry, entry_scale_source = self._normalize_entry_for_margin(entry, symbol_spec)
         conversion_rate, conversion_source = self._resolve_margin_conversion_rate(symbol_spec)
-        notional_native = margin_entry * max(symbol_spec.contract_size, 0.0) * max(volume, 0.0)
+        notional_native = margin_entry * max(symbol_spec.contract_size, 1.0) * max(volume, 0.0)
         notional = notional_native * conversion_rate
         diagnostics: dict[str, float] = {
             "margin_entry": margin_entry,
@@ -432,9 +434,9 @@ class RiskManager:
 
     def _next_day_unlock_at(self, day: str) -> str:
         try:
-            day_dt = datetime.strptime(day, "%Y-%m-%d")
+            day_dt = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except ValueError:
-            day_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            day_dt = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         unlock_dt = day_dt + timedelta(days=1)
         return unlock_dt.strftime("%Y-%m-%d 00:00:00")
 
@@ -491,198 +493,199 @@ class RiskManager:
         symbol_spec: SymbolSpec | None = None,
         current_spread_pips: float | None = None,
     ) -> RiskDecision:
-        stats = self.compute_stats(snapshot, open_positions_count=open_positions_count)
-        day = self._current_day()
+        with self._lock:
+            stats = self.compute_stats(snapshot, open_positions_count=open_positions_count)
+            day = self._current_day()
 
-        if self._is_daily_locked(day):
-            unlock_at = self.store.get_kv("risk.daily_lock_until") or self._next_day_unlock_at(day)
-            reason = self.store.get_kv("risk.daily_lock_reason") or "Daily drawdown lock active"
-            return RiskDecision(
-                allowed=False,
-                reason=f"Daily drawdown lock active until {unlock_at} ({reason})",
-                suggested_volume=0.0,
-            )
-
-        if stats.total_drawdown_pct >= self.cfg.max_total_drawdown_pct:
-            return RiskDecision(
-                allowed=False,
-                reason="Total drawdown limit reached",
-                suggested_volume=0.0,
-            )
-
-        if stats.daily_drawdown_pct >= self.cfg.max_daily_drawdown_pct:
-            self._lock_daily_drawdown(day, stats, snapshot)
-            unlock_at = self.store.get_kv("risk.daily_lock_until") or self._next_day_unlock_at(day)
-            return RiskDecision(
-                allowed=False,
-                reason=f"Daily drawdown limit reached; trading locked until {unlock_at}",
-                suggested_volume=0.0,
-            )
-
-        if snapshot.margin_free <= 0:
-            return RiskDecision(
-                allowed=False,
-                reason="No free margin",
-                suggested_volume=0.0,
-            )
-
-        if open_positions_count >= self.cfg.max_open_positions:
-            if self.store.get_kv("risk.max_positions_alert_active") != "1":
-                self.store.set_kv("risk.max_positions_alert_active", "1")
-                self.store.record_event(
-                    "WARN",
-                    symbol,
-                    "Trade blocked: max open positions limit reached",
-                    {
-                        "symbol": symbol,
-                        "current_open_positions": open_positions_count,
-                        "max_open_positions": self.cfg.max_open_positions,
-                    },
-                )
-                logger.warning(
-                    "Trade blocked by max open positions: current=%s limit=%s symbol=%s",
-                    open_positions_count,
-                    self.cfg.max_open_positions,
-                    symbol,
-                )
-            return RiskDecision(
-                allowed=False,
-                reason="Max open positions reached",
-                suggested_volume=0.0,
-            )
-        if self.store.get_kv("risk.max_positions_alert_active") == "1":
-            self.store.set_kv("risk.max_positions_alert_active", "0")
-        pending_slots = self.pending_open_slots()
-        effective_open_positions = open_positions_count + pending_slots
-        if pending_slots > 0 and effective_open_positions >= self.cfg.max_open_positions:
-            if self.store.get_kv(self._max_positions_slot_alert_key) != "1":
-                self.store.set_kv(self._max_positions_slot_alert_key, "1")
-                self.store.record_event(
-                    "WARN",
-                    symbol,
-                    "Trade blocked: max open positions limit reached",
-                    {
-                        "symbol": symbol,
-                        "current_open_positions": open_positions_count,
-                        "pending_open_slots": pending_slots,
-                        "effective_open_positions": effective_open_positions,
-                        "max_open_positions": self.cfg.max_open_positions,
-                    },
-                )
-                logger.warning(
-                    "Trade blocked by max open positions (with pending): current=%s pending=%s effective=%s limit=%s symbol=%s",
-                    open_positions_count,
-                    pending_slots,
-                    effective_open_positions,
-                    self.cfg.max_open_positions,
-                    symbol,
-                )
-            return RiskDecision(
-                allowed=False,
-                reason="Max open positions reached",
-                suggested_volume=0.0,
-            )
-        if self.store.get_kv(self._max_positions_slot_alert_key) == "1":
-            self.store.set_kv(self._max_positions_slot_alert_key, "0")
-
-        if symbol_spec is None:
-            return RiskDecision(
-                allowed=False,
-                reason="Symbol specification unavailable",
-                suggested_volume=0.0,
-            )
-
-        # Use realized balance as a conservative base for per-trade risk sizing.
-        capital_base = max(min(snapshot.balance, snapshot.equity), 0.0)
-        volume, diagnostics = self._estimate_volume(
-            capital_base=capital_base,
-            entry=entry,
-            stop_loss=stop_loss,
-            symbol_spec=symbol_spec,
-            current_spread_pips=current_spread_pips,
-        )
-        if volume <= 0:
-            reason = (
-                "Calculated volume is zero or below instrument minimum "
-                f"(raw={float(diagnostics.get('raw_volume', 0.0)):.6f}, "
-                f"lot_min={float(diagnostics.get('lot_min', 0.0)):.6f}, "
-                f"risk_per_lot={float(diagnostics.get('risk_per_lot', 0.0)):.6f}, "
-                f"spread_pips={float(diagnostics.get('spread_pips', 0.0)):.4f}, "
-                f"reason={diagnostics.get('reason')})"
-            )
-            return RiskDecision(
-                allowed=False,
-                reason=reason,
-                suggested_volume=0.0,
-            )
-
-        if self.cfg.margin_check_enabled:
-            required_margin, margin_source, margin_diagnostics = self._estimate_required_margin(
-                entry, volume, symbol_spec
-            )
-            adjusted_required_margin = max(required_margin, 0.0)
-            margin_overlays: list[str] = []
-
-            overhead_pct = max(float(self.cfg.margin_overhead_pct), 0.0)
-            if overhead_pct > 0:
-                adjusted_required_margin *= 1.0 + (overhead_pct / 100.0)
-                margin_overlays.append(f"overhead_pct:{overhead_pct:.2f}")
-
-            weekend_multiplier = max(float(self.cfg.margin_weekend_multiplier), 1.0)
-            if weekend_multiplier > 1.0 and self._is_weekend_margin_window():
-                adjusted_required_margin *= weekend_multiplier
-                margin_overlays.append(f"weekend_multiplier:{weekend_multiplier:.2f}")
-            holiday_multiplier = max(float(self.cfg.margin_holiday_multiplier), 1.0)
-            if holiday_multiplier > 1.0 and self._is_holiday_margin_window():
-                adjusted_required_margin *= holiday_multiplier
-                margin_overlays.append(f"holiday_multiplier:{holiday_multiplier:.2f}")
-
-            commission_per_lot = max(float(self.cfg.margin_commission_per_lot), 0.0)
-            if commission_per_lot > 0:
-                commission_estimate = commission_per_lot * max(volume, 0.0)
-                adjusted_required_margin += commission_estimate
-                margin_overlays.append(f"commission_estimate:{commission_estimate:.2f}")
-
-            if margin_overlays:
-                margin_source = f"{margin_source}|{'|'.join(margin_overlays)}"
-
-            required_with_buffer = adjusted_required_margin * max(self.cfg.margin_safety_buffer, 1.0)
-            if required_with_buffer > snapshot.margin_free:
-                effective_leverage = float(margin_diagnostics.get("effective_leverage", 0.0))
-                leverage_text = f"{effective_leverage:.2f}" if effective_leverage > 0 else "n/a"
+            if self._is_daily_locked(day):
+                unlock_at = self.store.get_kv("risk.daily_lock_until") or self._next_day_unlock_at(day)
+                reason = self.store.get_kv("risk.daily_lock_reason") or "Daily drawdown lock active"
                 return RiskDecision(
                     allowed=False,
-                    reason=(
-                        "Insufficient free margin for suggested volume "
-                        f"(required={required_with_buffer:.2f}, base_required={required_margin:.2f}, "
-                        f"adjusted_required={adjusted_required_margin:.2f}, free={snapshot.margin_free:.2f}, "
-                        f"buffer={max(self.cfg.margin_safety_buffer, 1.0):.2f}, "
-                        f"notional={float(margin_diagnostics.get('notional', 0.0)):.2f}, "
-                        f"effective_leverage={leverage_text}, source={margin_source}, volume={volume:.4f})"
-                    ),
-                    suggested_volume=0.0,
-                )
-            min_free_after_open = max(
-                float(self.cfg.margin_min_free_after_open),
-                snapshot.equity * (max(float(self.cfg.margin_min_free_after_open_pct), 0.0) / 100.0),
-            )
-            free_after_open = snapshot.margin_free - required_with_buffer
-            if free_after_open < min_free_after_open:
-                return RiskDecision(
-                    allowed=False,
-                    reason=(
-                        "Free margin reserve would be breached after opening trade "
-                        f"(free_after_open={free_after_open:.2f}, reserve={min_free_after_open:.2f}, "
-                        f"required={required_with_buffer:.2f}, source={margin_source}, volume={volume:.4f})"
-                    ),
+                    reason=f"Daily drawdown lock active until {unlock_at} ({reason})",
                     suggested_volume=0.0,
                 )
 
-        return RiskDecision(
-            allowed=True,
-            reason="OK",
-            suggested_volume=volume,
-        )
+            if stats.total_drawdown_pct >= self.cfg.max_total_drawdown_pct:
+                return RiskDecision(
+                    allowed=False,
+                    reason="Total drawdown limit reached",
+                    suggested_volume=0.0,
+                )
+
+            if stats.daily_drawdown_pct >= self.cfg.max_daily_drawdown_pct:
+                self._lock_daily_drawdown(day, stats, snapshot)
+                unlock_at = self.store.get_kv("risk.daily_lock_until") or self._next_day_unlock_at(day)
+                return RiskDecision(
+                    allowed=False,
+                    reason=f"Daily drawdown limit reached; trading locked until {unlock_at}",
+                    suggested_volume=0.0,
+                )
+
+            if snapshot.margin_free <= 0:
+                return RiskDecision(
+                    allowed=False,
+                    reason="No free margin",
+                    suggested_volume=0.0,
+                )
+
+            if open_positions_count >= self.cfg.max_open_positions:
+                if self.store.get_kv("risk.max_positions_alert_active") != "1":
+                    self.store.set_kv("risk.max_positions_alert_active", "1")
+                    self.store.record_event(
+                        "WARN",
+                        symbol,
+                        "Trade blocked: max open positions limit reached",
+                        {
+                            "symbol": symbol,
+                            "current_open_positions": open_positions_count,
+                            "max_open_positions": self.cfg.max_open_positions,
+                        },
+                    )
+                    logger.warning(
+                        "Trade blocked by max open positions: current=%s limit=%s symbol=%s",
+                        open_positions_count,
+                        self.cfg.max_open_positions,
+                        symbol,
+                    )
+                return RiskDecision(
+                    allowed=False,
+                    reason="Max open positions reached",
+                    suggested_volume=0.0,
+                )
+            if self.store.get_kv("risk.max_positions_alert_active") == "1":
+                self.store.set_kv("risk.max_positions_alert_active", "0")
+            pending_slots = self.pending_open_slots()
+            effective_open_positions = open_positions_count + pending_slots
+            if pending_slots > 0 and effective_open_positions >= self.cfg.max_open_positions:
+                if self.store.get_kv(self._max_positions_slot_alert_key) != "1":
+                    self.store.set_kv(self._max_positions_slot_alert_key, "1")
+                    self.store.record_event(
+                        "WARN",
+                        symbol,
+                        "Trade blocked: max open positions limit reached",
+                        {
+                            "symbol": symbol,
+                            "current_open_positions": open_positions_count,
+                            "pending_open_slots": pending_slots,
+                            "effective_open_positions": effective_open_positions,
+                            "max_open_positions": self.cfg.max_open_positions,
+                        },
+                    )
+                    logger.warning(
+                        "Trade blocked by max open positions (with pending): current=%s pending=%s effective=%s limit=%s symbol=%s",
+                        open_positions_count,
+                        pending_slots,
+                        effective_open_positions,
+                        self.cfg.max_open_positions,
+                        symbol,
+                    )
+                return RiskDecision(
+                    allowed=False,
+                    reason="Max open positions reached",
+                    suggested_volume=0.0,
+                )
+            if self.store.get_kv(self._max_positions_slot_alert_key) == "1":
+                self.store.set_kv(self._max_positions_slot_alert_key, "0")
+
+            if symbol_spec is None:
+                return RiskDecision(
+                    allowed=False,
+                    reason="Symbol specification unavailable",
+                    suggested_volume=0.0,
+                )
+
+            # Use realized balance as a conservative base for per-trade risk sizing.
+            capital_base = max(min(snapshot.balance, snapshot.equity), 0.0)
+            volume, diagnostics = self._estimate_volume(
+                capital_base=capital_base,
+                entry=entry,
+                stop_loss=stop_loss,
+                symbol_spec=symbol_spec,
+                current_spread_pips=current_spread_pips,
+            )
+            if volume <= 0:
+                reason = (
+                    "Calculated volume is zero or below instrument minimum "
+                    f"(raw={float(diagnostics.get('raw_volume', 0.0)):.6f}, "
+                    f"lot_min={float(diagnostics.get('lot_min', 0.0)):.6f}, "
+                    f"risk_per_lot={float(diagnostics.get('risk_per_lot', 0.0)):.6f}, "
+                    f"spread_pips={float(diagnostics.get('spread_pips', 0.0)):.4f}, "
+                    f"reason={diagnostics.get('reason')})"
+                )
+                return RiskDecision(
+                    allowed=False,
+                    reason=reason,
+                    suggested_volume=0.0,
+                )
+
+            if self.cfg.margin_check_enabled:
+                required_margin, margin_source, margin_diagnostics = self._estimate_required_margin(
+                    entry, volume, symbol_spec
+                )
+                adjusted_required_margin = max(required_margin, 0.0)
+                margin_overlays: list[str] = []
+
+                overhead_pct = max(float(self.cfg.margin_overhead_pct), 0.0)
+                if overhead_pct > 0:
+                    adjusted_required_margin *= 1.0 + (overhead_pct / 100.0)
+                    margin_overlays.append(f"overhead_pct:{overhead_pct:.2f}")
+
+                weekend_multiplier = max(float(self.cfg.margin_weekend_multiplier), 1.0)
+                if weekend_multiplier > 1.0 and self._is_weekend_margin_window():
+                    adjusted_required_margin *= weekend_multiplier
+                    margin_overlays.append(f"weekend_multiplier:{weekend_multiplier:.2f}")
+                holiday_multiplier = max(float(self.cfg.margin_holiday_multiplier), 1.0)
+                if holiday_multiplier > 1.0 and self._is_holiday_margin_window():
+                    adjusted_required_margin *= holiday_multiplier
+                    margin_overlays.append(f"holiday_multiplier:{holiday_multiplier:.2f}")
+
+                commission_per_lot = max(float(self.cfg.margin_commission_per_lot), 0.0)
+                if commission_per_lot > 0:
+                    commission_estimate = commission_per_lot * max(volume, 0.0)
+                    adjusted_required_margin += commission_estimate
+                    margin_overlays.append(f"commission_estimate:{commission_estimate:.2f}")
+
+                if margin_overlays:
+                    margin_source = f"{margin_source}|{'|'.join(margin_overlays)}"
+
+                required_with_buffer = adjusted_required_margin * max(self.cfg.margin_safety_buffer, 1.0)
+                if required_with_buffer > snapshot.margin_free:
+                    effective_leverage = float(margin_diagnostics.get("effective_leverage", 0.0))
+                    leverage_text = f"{effective_leverage:.2f}" if effective_leverage > 0 else "n/a"
+                    return RiskDecision(
+                        allowed=False,
+                        reason=(
+                            "Insufficient free margin for suggested volume "
+                            f"(required={required_with_buffer:.2f}, base_required={required_margin:.2f}, "
+                            f"adjusted_required={adjusted_required_margin:.2f}, free={snapshot.margin_free:.2f}, "
+                            f"buffer={max(self.cfg.margin_safety_buffer, 1.0):.2f}, "
+                            f"notional={float(margin_diagnostics.get('notional', 0.0)):.2f}, "
+                            f"effective_leverage={leverage_text}, source={margin_source}, volume={volume:.4f})"
+                        ),
+                        suggested_volume=0.0,
+                    )
+                min_free_after_open = max(
+                    float(self.cfg.margin_min_free_after_open),
+                    snapshot.equity * (max(float(self.cfg.margin_min_free_after_open_pct), 0.0) / 100.0),
+                )
+                free_after_open = snapshot.margin_free - required_with_buffer
+                if free_after_open < min_free_after_open:
+                    return RiskDecision(
+                        allowed=False,
+                        reason=(
+                            "Free margin reserve would be breached after opening trade "
+                            f"(free_after_open={free_after_open:.2f}, reserve={min_free_after_open:.2f}, "
+                            f"required={required_with_buffer:.2f}, source={margin_source}, volume={volume:.4f})"
+                        ),
+                        suggested_volume=0.0,
+                    )
+
+            return RiskDecision(
+                allowed=True,
+                reason="OK",
+                suggested_volume=volume,
+            )
 
     def try_acquire_open_slot(self, symbol: str, open_positions_count: int) -> SlotDecision:
         reservation_id, pending_slots, effective_open_positions = self.store.acquire_open_slot(
@@ -736,15 +739,16 @@ class RiskManager:
         snapshot: AccountSnapshot,
         open_positions_count: int | None = None,
     ) -> tuple[bool, str]:
-        if open_positions_count is not None and open_positions_count <= 0:
+        with self._lock:
+            if open_positions_count is not None and open_positions_count <= 0:
+                return False, ""
+            stats = self.compute_stats(snapshot, open_positions_count=open_positions_count)
+            day = self._current_day()
+            if self._is_daily_locked(day):
+                unlock_at = self.store.get_kv("risk.daily_lock_until") or self._next_day_unlock_at(day)
+                return True, f"Daily drawdown lock active until {unlock_at}"
+            if stats.total_drawdown_pct >= self.cfg.max_total_drawdown_pct:
+                return True, "Total drawdown exceeded"
+            if stats.daily_drawdown_pct >= self.cfg.max_daily_drawdown_pct:
+                return True, "Daily drawdown exceeded"
             return False, ""
-        stats = self.compute_stats(snapshot, open_positions_count=open_positions_count)
-        day = self._current_day()
-        if self._is_daily_locked(day):
-            unlock_at = self.store.get_kv("risk.daily_lock_until") or self._next_day_unlock_at(day)
-            return True, f"Daily drawdown lock active until {unlock_at}"
-        if stats.total_drawdown_pct >= self.cfg.max_total_drawdown_pct:
-            return True, "Total drawdown exceeded"
-        if stats.daily_drawdown_pct >= self.cfg.max_daily_drawdown_pct:
-            return True, "Daily drawdown exceeded"
-        return False, ""

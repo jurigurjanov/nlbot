@@ -357,8 +357,11 @@ def _sanitize_deal_reference(value: str) -> str:
     return "".join(ch for ch in str(value or "") if ch.isalnum() or ch in {"-", "_"})
 
 
-def _format_open_deal_reference(value: str) -> str:
+def _format_open_deal_reference(value: str, attempt: int = 0) -> str:
     normalized = _sanitize_deal_reference(value)
+    if attempt > 0:
+        suffix = f"-a{attempt}"
+        return normalized[: 30 - len(suffix)] + suffix
     return normalized[:30]
 
 
@@ -4538,8 +4541,10 @@ class IgApiClient(BaseBrokerClient):
         if stream_thread_to_join is not None and stream_thread_to_join.is_alive():
             stream_thread_to_join.join(timeout=2.0)
 
+        with self._lock:
+            was_connected = self._connected
         try:
-            if self._connected:
+            if was_connected:
                 self._request("DELETE", "/session", version="1", auth=True)
         except Exception:
             pass
@@ -4702,6 +4707,7 @@ class IgApiClient(BaseBrokerClient):
                         if stream_enabled:
                             self._last_stream_rest_fallback_ts_by_symbol[upper] = now_wall
                         break
+                with self._lock:
                     if stream_enabled:
                         cached = self._get_cached_tick_locked(upper, max_age_sec=stale_tick_max_age_sec)
                     else:
@@ -4934,7 +4940,8 @@ class IgApiClient(BaseBrokerClient):
             if self._stream_next_retry_at is not None:
                 next_retry_in_sec = max(0.0, self._stream_next_retry_at - now)
 
-            desired_subscriptions = len(self._stream_desired_subscriptions)
+            desired_subscriptions_snapshot = frozenset(self._stream_desired_subscriptions)
+            desired_subscriptions = len(desired_subscriptions_snapshot)
             active_subscriptions = len(self._stream_symbol_to_table)
             last_error = self._stream_last_error
             reconnect_attempts = self._stream_reconnect_attempts
@@ -4953,7 +4960,7 @@ class IgApiClient(BaseBrokerClient):
         if not stream_enabled:
             reason = "stream_disabled_rest_only"
         elif stream_connected:
-            if upper and upper in self._stream_desired_subscriptions:
+            if upper and upper in desired_subscriptions_snapshot:
                 if last_tick_age_sec is None:
                     reason = "stream_warmup_rest_fallback"
                 elif last_tick_age_sec > max(0.1, max_tick_age_sec):
@@ -5056,6 +5063,7 @@ class IgApiClient(BaseBrokerClient):
             )
 
         attempts = self._epic_attempt_order(symbol)
+        _deal_attempt_counter = 0
         for epic in attempts:
             try:
                 candidate_spec, candidate_body = self._resolve_open_candidate_spec(
@@ -5113,6 +5121,7 @@ class IgApiClient(BaseBrokerClient):
                 continue
             advance_epic = False
             for currency_code in currency_attempts:
+                _deal_attempt_counter += 1
                 candidate_entry, candidate_stop_loss, candidate_take_profit = self._remap_open_levels_for_candidate(
                     symbol=symbol,
                     side=side,
@@ -5147,7 +5156,7 @@ class IgApiClient(BaseBrokerClient):
                     "currencyCode": currency_code,
                     "stopLevel": float(candidate_stop_loss),
                     "limitLevel": float(candidate_take_profit),
-                    "dealReference": _format_open_deal_reference(comment),
+                    "dealReference": _format_open_deal_reference(comment, attempt=_deal_attempt_counter),
                 }
                 open_level = self._open_level_with_tolerance(
                     side=side,
@@ -5449,6 +5458,7 @@ class IgApiClient(BaseBrokerClient):
                 continue
             advance_epic = False
             for currency_code in currency_attempts:
+                _deal_attempt_counter += 1
                 candidate_entry, candidate_stop_loss, candidate_take_profit = self._remap_open_levels_for_candidate(
                     symbol=symbol,
                     side=side,
@@ -5483,7 +5493,7 @@ class IgApiClient(BaseBrokerClient):
                     "currencyCode": currency_code,
                     "stopLevel": float(candidate_stop_loss),
                     "limitLevel": float(candidate_take_profit),
-                    "dealReference": _format_open_deal_reference(comment),
+                    "dealReference": _format_open_deal_reference(comment, attempt=_deal_attempt_counter),
                 }
                 open_level = self._open_level_with_tolerance(
                     side=side,

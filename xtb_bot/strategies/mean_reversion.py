@@ -166,7 +166,7 @@ class MeanReversionStrategy(Strategy):
         confidence = min(1.0, abs(z) / (self.threshold * 2.0))
 
         if z <= -self.threshold:
-            if slow_ma is not None and last_price < slow_ma:
+            if slow_ma is not None and last_price > slow_ma:
                 return self._hold(
                     "blocked_by_trend_filter",
                     zscore=z,
@@ -191,7 +191,7 @@ class MeanReversionStrategy(Strategy):
             )
 
         if z >= self.threshold:
-            if slow_ma is not None and last_price > slow_ma:
+            if slow_ma is not None and last_price < slow_ma:
                 return self._hold(
                     "blocked_by_trend_filter",
                     zscore=z,

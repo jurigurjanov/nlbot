@@ -274,9 +274,9 @@ class IndexHybridStrategy(Strategy):
         if upper in {"AUS200", "AU200"}:
             return 1.0
         if upper in {"US100", "US500", "US30", "DE40", "UK100", "FRA40", "JP225", "EU50"}:
-            return 1.0
+            return 0.1
         if upper.startswith(("US", "DE", "UK", "FRA", "JP", "EU")) and any(ch.isdigit() for ch in upper):
-            return 1.0
+            return 0.1
         if upper.endswith("JPY"):
             return 0.01
         if upper.startswith("XAU") or upper.startswith("XAG"):
