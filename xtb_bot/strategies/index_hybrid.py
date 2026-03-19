@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from xtb_bot.models import Side, Signal
 from xtb_bot.numeric import atr_wilder, ema, zscore
 from xtb_bot.strategies.base import Strategy, StrategyContext
+from xtb_bot.strategies.pip_size import pip_size as _pip_size_lookup
 
 
 class IndexHybridStrategy(Strategy):
@@ -270,20 +271,7 @@ class IndexHybridStrategy(Strategy):
 
     @staticmethod
     def _pip_size(symbol: str) -> float:
-        upper = symbol.upper()
-        if upper in {"AUS200", "AU200"}:
-            return 1.0
-        if upper in {"US100", "US500", "US30", "DE40", "UK100", "FRA40", "JP225", "EU50"}:
-            return 0.1
-        if upper.startswith(("US", "DE", "UK", "FRA", "JP", "EU")) and any(ch.isdigit() for ch in upper):
-            return 0.1
-        if upper.endswith("JPY"):
-            return 0.01
-        if upper.startswith("XAU") or upper.startswith("XAG"):
-            return 0.1
-        if upper in {"WTI", "BRENT"}:
-            return 0.1
-        return 0.0001
+        return _pip_size_lookup(symbol)
 
     def _trend_confidence(self, ema_gap_ratio: float, breakout_distance_ratio: float) -> float:
         gap_score = min(1.0, ema_gap_ratio / self.trend_confidence_gap_norm)
@@ -394,7 +382,10 @@ class IndexHybridStrategy(Strategy):
         if not timestamps:
             return None, None
         try:
-            now = datetime.fromtimestamp(float(timestamps[-1]), tz=timezone.utc)
+            raw_ts = float(timestamps[-1])
+            if raw_ts > 10_000_000_000:
+                raw_ts = raw_ts / 1000.0
+            now = datetime.fromtimestamp(raw_ts, tz=timezone.utc)
         except (ValueError, OSError, OverflowError):
             return None, None
         hour = int(now.hour)
