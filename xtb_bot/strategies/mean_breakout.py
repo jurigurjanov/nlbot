@@ -55,7 +55,9 @@ class MeanBreakoutStrategy(Strategy):
             breakout_strength = max(0.0, (last - channel_upper) / max(abs(last), 1e-9))
             confidence = min(
                 1.0,
-                abs(zscore) / max(self.zscore_threshold * 2.0, 1e-9) + breakout_strength * 400.0 + 0.2,
+                abs(zscore) / max(self.zscore_threshold * 2.0, 1e-9) * 0.4
+                + min(1.0, breakout_strength * 50.0) * 0.4
+                + 0.2,
             )
             return Signal(
                 side=Side.BUY,
@@ -78,7 +80,9 @@ class MeanBreakoutStrategy(Strategy):
             breakout_strength = max(0.0, (channel_lower - last) / max(abs(last), 1e-9))
             confidence = min(
                 1.0,
-                abs(zscore) / max(self.zscore_threshold * 2.0, 1e-9) + breakout_strength * 400.0 + 0.2,
+                abs(zscore) / max(self.zscore_threshold * 2.0, 1e-9) * 0.4
+                + min(1.0, breakout_strength * 50.0) * 0.4
+                + 0.2,
             )
             return Signal(
                 side=Side.SELL,

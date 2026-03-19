@@ -97,7 +97,7 @@ class MeanBreakoutSessionStrategy(Strategy):
             microsecond=0,
         )
         box_end_local = session_open_local + timedelta(minutes=self.box_minutes)
-        session_key = session_open_local.strftime("%Y-%m-%d")
+        session_key = session_open_local.strftime("%Y-%m-%d_%H:%M")
         return session_open_local.timestamp(), box_end_local.timestamp(), session_key
 
     def _opening_box(
@@ -107,11 +107,13 @@ class MeanBreakoutSessionStrategy(Strategy):
         box_start_ts: float,
         box_end_ts: float,
     ) -> tuple[float, float, int] | None:
-        box_prices = [
-            float(price)
-            for price, ts in zip(prices, timestamps)
-            if box_start_ts <= float(ts) < box_end_ts
-        ]
+        box_prices = []
+        for price, ts in zip(prices, timestamps):
+            raw_ts = float(ts)
+            if raw_ts > 10_000_000_000:
+                raw_ts = raw_ts / 1000.0
+            if box_start_ts <= raw_ts < box_end_ts:
+                box_prices.append(float(price))
         if len(box_prices) < 2:
             return None
         return max(box_prices), min(box_prices), len(box_prices)
@@ -145,6 +147,8 @@ class MeanBreakoutSessionStrategy(Strategy):
             return self._hold_with_reason("missing_or_misaligned_timestamps")
 
         now_ts = float(timestamps[-1])
+        if now_ts > 10_000_000_000:
+            now_ts = now_ts / 1000.0
         session_open_ts, box_end_ts, session_key = self._session_window(now_ts)
 
         if now_ts < session_open_ts:
