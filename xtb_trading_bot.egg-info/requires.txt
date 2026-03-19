@@ -1,0 +1,4 @@
+websocket-client>=1.8.0
+
+[dev]
+pytest>=8.0.0

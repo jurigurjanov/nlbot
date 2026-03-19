@@ -1,0 +1,194 @@
+Metadata-Version: 2.4
+Name: xtb-trading-bot
+Version: 0.1.0
+Summary: Multi-threaded IG/XTB trading bot with strategy and mode switching
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: websocket-client>=1.8.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+
+# IG Trading Bot (Python)
+
+Многопоточный бот для IG.com (с совместимостью XTB) с изоляцией по инструментам, риск-контролем и персистентным состоянием.
+
+## Что реализовано
+
+- Работа с основными инструментами:
+  - По умолчанию: `EURUSD, GBPUSD, USDJPY, US100, XAUUSD, WTI`
+  - Список задается в `IG_SYMBOLS`/`XTB_SYMBOLS` в `.env`
+- Защита капитала:
+  - `max_risk_per_trade_pct`
+  - `max_daily_drawdown_pct`
+  - `max_total_drawdown_pct`
+  - `max_open_positions`
+  - дневной lock: при достижении дневной просадки торговля блокируется до следующего дня
+  - динамический размер позиции перед каждой сделкой: от текущего баланса и фактической дистанции SL
+  - ограничение на риск в сделке: `max_risk_per_trade_pct` в диапазоне `(0, 2]`
+  - ограничение выхода по цели: `min_tp_sl_ratio` в диапазоне `2.0..3.0` (TP не меньше SL * ratio)
+  - time-based выходы: `session_close_buffer_min` для индексов и `news_event_buffer_min` для high-impact событий
+  - фильтр спреда перед входом: блокировка входа при аномальном расширении (`spread_anomaly_multiplier`, default `3.0`)
+  - проверка связи перед входом: при latency > `connectivity_max_latency_ms` или отсутствии `PONG` вход блокируется
+  - проверка здоровья потока/котировок перед входом: при деградации вход блокируется до восстановления
+- Многопоточность:
+  - Отдельный поток на каждый инструмент (`worker-<SYMBOL>`)
+  - Автоматический рестарт упавшего воркера
+- Независимое состояние по потоку и сделке:
+  - SQLite (`worker_states`, `trades`, `events`, `account_snapshots`)
+  - Восстановление открытых позиций после перезапуска
+- Переключение стратегий:
+  - `g1` (EMA cross + ADX/ATR + динамический SL/TP, с отдельными авто-профилями для FX и индексов)
+  - `donchian_breakout` (breakout-only по каналу Дончиана)
+  - `index_hybrid` (гибрид для индексов: trend-following + mean-reversion)
+  - `mean_breakout` (z-score + breakout уровней: подтвержденный пробой после отклонения от среднего)
+  - `mean_breakout_session` (пробой opening range: коробка первых 15-30 минут сессии)
+  - `mean_reversion_rsi` (RSI mean-reversion: overbought/oversold уровни)
+  - `mean_reversion_bb` (Bollinger Bands mean-reversion, опционально с RSI-фильтром)
+  - `momentum`
+  - `mean_reversion`
+  - `trend_following` (EMA 50/200 + опциональный breakout канала Дончиана)
+- Переключение режимов:
+  - `signal_only` (только сигналы)
+  - `paper` (бумажная торговля)
+  - `execution` (реальные заявки через API брокера)
+- Поддержка demo/live:
+  - `account_type=demo|live`
+  - endpoint выбирается автоматически, можно переопределить `IG_ENDPOINT`/`XTB_ENDPOINT`
+- Magic Number / customComment:
+  - каждая сделка получает уникальный `trade_uid` и тег в формате `MAGIC_PREFIX:INSTANCE:TRADE_UID:SYMBOL`
+  - тег передается в поле комментария/ссылки сделки и позволяет отличать сделки бота
+- Execution-подтверждение:
+  - после отправки сделки выполняется опрос статуса подтверждения брокера
+  - сделка считается открытой/закрытой только после статуса accepted
+- Streaming котировки:
+  - для XTB и IG используется stream-кэш котировок (для IG через Lightstreamer)
+  - для IG включен auto-reconnect + автопереподписка и fallback на REST при деградации стрима
+  - стрим IG можно включать/выключать через `IG_STREAM_ENABLED=true|false`
+  - при входе/модификации всегда используется актуальная `bid/ask` из брокерского клиента
+
+## Структура
+
+- `run_bot.py` — CLI entrypoint
+- `xtb_bot/bot.py` — оркестратор
+- `xtb_bot/worker.py` — поток на инструмент
+- `xtb_bot/client.py` — базовый брокерский интерфейс, XTB и mock клиент
+- `xtb_bot/ig_client.py` — IG API клиент
+- `xtb_bot/risk_manager.py` — риск-менеджмент и ограничения
+- `xtb_bot/state_store.py` — SQLite persistence
+- `xtb_bot/strategies/` — стратегии и фабрика
+- `xtb_bot/config.py` — конфиг из `.env`/env
+
+## Быстрый старт
+
+1. Установить зависимости:
+
+```bash
+python -m pip install -e .
+```
+
+2. Создать `.env` из примера:
+
+```bash
+cp .env.example .env
+```
+
+3. Заполнить `.env` и запуск:
+
+```bash
+xtb-bot --mode paper --strategy momentum
+```
+
+## Полезные команды
+
+Список стратегий:
+
+```bash
+xtb-bot --list-strategies
+```
+
+Запуск в сигнальном режиме:
+
+```bash
+xtb-bot --mode signal_only
+```
+
+Запуск в live execution:
+
+```bash
+xtb-bot --mode execution --strategy mean_reversion
+```
+
+Запуск `g1`:
+
+```bash
+xtb-bot --strategy g1
+```
+
+Принудительно включить/выключить IG stream из CLI:
+
+```bash
+xtb-bot --ig-stream-enabled
+xtb-bot --no-ig-stream-enabled
+```
+
+Строгий старт без fallback в mock при ошибке подключения:
+
+```bash
+xtb-bot --strict-broker-connect
+```
+
+Показать последние алерты из SQLite:
+
+```bash
+xtb-bot --show-alerts --alerts-limit 20
+```
+
+## Тесты
+
+Установка dev-зависимостей:
+
+```bash
+python -m pip install -e '.[dev]'
+```
+
+Запуск тестов:
+
+```bash
+pytest -q
+```
+
+## Хранилище состояния
+
+По умолчанию: `./state/xtb_bot.db`
+
+Таблицы:
+- `worker_states` — heartbeat и состояние каждого потока
+- `trades` — жизненный цикл каждой сделки
+- `events` — журнал событий/ошибок
+- `account_snapshots` — снимки аккаунта и drawdown
+- `kv` — служебные якоря риск-менеджера
+
+## Важно
+
+- Перед использованием `execution` проверьте параметры риска на demo.
+- Размер позиции рассчитывается по `tickSize/tickValue/lotMin/lotMax/lotStep`, полученным из спецификации инструмента брокера.
+- Для XTB клиент использует stream-кэш с fallback на command API; для IG используется Lightstreamer stream-кэш с fallback на REST.
+- Для IG в `events` пишутся метрики использования потока: `Stream usage metrics` (`price_requests_total`, `stream_hits_total`, `rest_fallback_hits_total`, `stream_hit_rate_pct`).
+- По умолчанию фикс-лот отключен (`default_volume=0`), размер лота берется из риск-менеджера.
+- Если нужен верхний лимит лота, можно задать `default_volume > 0` (это cap, а не фикс-лот логики входа).
+- При срабатывании `max_daily_drawdown_pct` (по умолчанию `5%`) бот ставит дневной lock и не открывает новые сделки до смены даты.
+- При активации дневного lock создается отдельный alert в `events` с причиной и `unlock_at` (начало следующего дня), плюс warning в логах.
+- Для CFD default лимит одновременных позиций = `5` (рекомендуемо `3..5`), жесткий верхний порог валидации конфига = `15`.
+- При блокировке входа из-за `max_open_positions` создается `WARN`-alert в `events`.
+- Выходы из позиции работают по независимым триггерам: `stop_loss`, `take_profit`, `reverse_signal` (обратный сигнал текущей стратегии).
+- Поддерживается bot-side trailing stop: активация при `trailing_activation_ratio` (default `0.5`), перенос SL в безубыток и подтяжка на `trailing_distance_pips`.
+- Каждое подтягивание трейлинга пишет `WARN`-alert в `events` (`message=Trailing stop adjusted`).
+- В `execution` trailing-modify выполняется через modify-эндпоинт брокера с подтверждением статуса.
+- Для индексов (например, `US100`, `DE40`) бот закрывает позиции за `session_close_buffer_min` минут до close торговой сессии (защита от гэпов).
+- Новостной фильтр проверяет high-impact события брокера (если доступны): за `news_event_buffer_min` минут до события бот либо закрывает позицию (`news_event_action=close`), либо переводит её в безубыток (`breakeven`).
+- Перед входом бот проверяет текущий спред (`ask-bid`) в пипсах; если он выше `средний_спред * spread_anomaly_multiplier` (default `3x`), вход блокируется и пишется `WARN`-alert.
+- Перед входом бот делает connectivity-check к API брокера; при latency > `500ms` или проблемах соединения новые сделки не открываются.
+- Для stream socket включен health-check с auto-reconnect и exponential backoff; деградации/восстановления пишутся в `events` (`Stream health degraded/recovered`), а новые входы блокируются при нездоровом стриме.
+- Для маркировки ордеров используйте `bot_magic_prefix`; `bot_magic_instance` можно задать вручную или оставить авто-генерацию (сохранится в `kv`).
+- Если брокер недоступен в `paper` или `signal_only`, бот автоматически переключится на mock-цены для непрерывного теста логики.
+- Чтобы запретить fallback в mock, включите `BOT_STRICT_BROKER_CONNECT=true` (или CLI `--strict-broker-connect`).
