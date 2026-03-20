@@ -1794,6 +1794,71 @@ class IgApiClient(BaseBrokerClient):
         )
         return after
 
+    # ------------------------------------------------------------------
+    # Adaptive lot_step correction after "set increments" rejection.
+    # ------------------------------------------------------------------
+
+    _COMMON_LOT_STEPS: tuple[float, ...] = (0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
+
+    def _adapt_lot_step_after_increment_reject(
+        self,
+        symbol: str,
+        epic: str,
+        candidate_spec: SymbolSpec,
+        attempted_volume: float,
+    ) -> None:
+        """Infer the correct lot_step after a 'set increments' rejection.
+
+        When the broker rejects with "Order size must be traded in set
+        increments", the current lot_step is wrong.  We try common step
+        values and pick the smallest one that the attempted volume is NOT
+        a valid multiple of (meaning it would have been rounded).
+        """
+        upper_symbol = str(symbol).strip().upper()
+        upper_epic = str(epic).strip().upper()
+        current_step = float(candidate_spec.lot_step)
+        attempted = float(attempted_volume)
+
+        inferred_step = current_step
+        for step in self._COMMON_LOT_STEPS:
+            if step <= current_step:
+                continue
+            remainder = attempted / step
+            if abs(remainder - round(remainder)) > 1e-9:
+                # attempted is NOT a multiple of this step — this is likely the real step.
+                inferred_step = step
+                break
+
+        if inferred_step <= current_step:
+            # Fallback: just double the current step.
+            inferred_step = min(10.0, current_step * 2.0)
+
+        with self._lock:
+            cached_spec = self._symbol_spec_cache.get(upper_symbol)
+            specs_to_update = [candidate_spec]
+            if cached_spec is not None and cached_spec is not candidate_spec:
+                specs_to_update.append(cached_spec)
+
+            for spec in specs_to_update:
+                old_step = float(spec.lot_step)
+                if inferred_step > old_step:
+                    spec.lot_step = inferred_step
+                    spec.lot_precision = max(0, _precision_from_step(inferred_step))
+                    metadata = spec.metadata if isinstance(spec.metadata, dict) else {}
+                    metadata["lot_step_source"] = "adaptive_increment_reject"
+                    metadata["lot_step_update_attempted"] = attempted
+                    metadata["lot_step_update_ts"] = time.time()
+
+        logger.warning(
+            "IG adaptive lot_step update for %s after increment reject: %.4f -> %.4f "
+            "(attempted=%.4f epic=%s)",
+            upper_symbol,
+            current_step,
+            inferred_step,
+            attempted,
+            upper_epic,
+        )
+
     def _wait_for_deal_confirm(self, deal_reference: str) -> dict[str, Any] | None:
         deadline = time.time() + max(1.0, self.confirm_timeout_sec)
         while time.time() < deadline:
@@ -1874,6 +1939,8 @@ class IgApiClient(BaseBrokerClient):
             return "INSTRUMENT_NOT_TRADEABLE_IN_THIS_CURRENCY"
         if "MINIMUM ORDER SIZE" in combined or "SIZE BELOW MINIMUM REQUIREMENT" in combined:
             return "MINIMUM_ORDER_SIZE_ERROR"
+        if "TRADED IN SET INCREMENTS" in combined or "SIZE INCREMENT" in combined:
+            return "DEAL_SIZE_INCREMENT_ERROR"
         if "ATTACHED ORDER LEVEL" in combined or "STOP TOO CLOSE" in combined:
             return "ATTACHED_ORDER_LEVEL_ERROR"
         if "MARKET NOT AVAILABLE" in combined:
@@ -5183,6 +5250,13 @@ class IgApiClient(BaseBrokerClient):
                             attempted_volume=float(volume),
                             reason="MINIMUM_ORDER_SIZE_ERROR",
                         )
+                    if "set increments" in error_text.lower() or "size increment" in error_text.lower():
+                        self._adapt_lot_step_after_increment_reject(
+                            symbol=symbol,
+                            epic=epic,
+                            candidate_spec=candidate_spec,
+                            attempted_volume=float(volume),
+                        )
                     self._maybe_start_allowance_cooldown(error_text, "trade open")
                     contextual_error = BrokerError(
                         f"{error_text} | epic={epic} direction={direction} "
@@ -5285,6 +5359,13 @@ class IgApiClient(BaseBrokerClient):
                             attempted_volume=float(volume),
                             reason=reason,
                         )
+                        if reason == "DEAL_SIZE_INCREMENT_ERROR":
+                            self._adapt_lot_step_after_increment_reject(
+                                symbol=symbol,
+                                epic=epic,
+                                candidate_spec=candidate_spec,
+                                attempted_volume=float(volume),
+                            )
                         if self._is_guaranteed_stop_required_text(reason) and not use_guaranteed_stop:
                             self._mark_symbol_guaranteed_stop_required(symbol, source="open_confirm_reject")
                             last_rejected_error = reject_error
@@ -5520,6 +5601,13 @@ class IgApiClient(BaseBrokerClient):
                             attempted_volume=float(volume),
                             reason="MINIMUM_ORDER_SIZE_ERROR",
                         )
+                    if "set increments" in error_text.lower() or "size increment" in error_text.lower():
+                        self._adapt_lot_step_after_increment_reject(
+                            symbol=symbol,
+                            epic=epic,
+                            candidate_spec=candidate_spec,
+                            attempted_volume=float(volume),
+                        )
                     self._maybe_start_allowance_cooldown(error_text, "trade open")
                     contextual_error = BrokerError(
                         f"{error_text} | epic={epic} direction={direction} "
@@ -5628,6 +5716,13 @@ class IgApiClient(BaseBrokerClient):
                             attempted_volume=float(volume),
                             reason=reason,
                         )
+                        if reason == "DEAL_SIZE_INCREMENT_ERROR":
+                            self._adapt_lot_step_after_increment_reject(
+                                symbol=symbol,
+                                epic=epic,
+                                candidate_spec=candidate_spec,
+                                attempted_volume=float(volume),
+                            )
                         if self._is_guaranteed_stop_required_text(reason) and not use_guaranteed_stop:
                             self._mark_symbol_guaranteed_stop_required(symbol, source="open_confirm_reject")
                             last_rejected_error = reject_error
