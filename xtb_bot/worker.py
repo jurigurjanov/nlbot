@@ -312,6 +312,67 @@ class SymbolWorker(threading.Thread):
             "protective_exit_allow_adx_regime_loss",
             True,
         )
+        # --- Early loss exit parameters ---
+        self.early_loss_exit_enabled = self._strategy_bool_param(
+            strategy_params,
+            "early_loss_exit_enabled",
+            False,
+        )
+        self.early_loss_exit_grace_sec = max(
+            0.0,
+            self._strategy_float_param(
+                strategy_params,
+                "early_loss_exit_grace_sec",
+                30.0,
+            ),
+        )
+        self.early_loss_exit_loss_threshold = max(
+            0.0,
+            min(
+                1.0,
+                self._strategy_float_param(
+                    strategy_params,
+                    "early_loss_exit_loss_threshold",
+                    0.3,
+                ),
+            ),
+        )
+        self.early_loss_exit_decay_sec = max(
+            1.0,
+            self._strategy_float_param(
+                strategy_params,
+                "early_loss_exit_decay_sec",
+                300.0,
+            ),
+        )
+        self.early_loss_exit_min_ratio = max(
+            0.0,
+            min(
+                1.0,
+                self._strategy_float_param(
+                    strategy_params,
+                    "early_loss_exit_min_ratio",
+                    0.5,
+                ),
+            ),
+        )
+        self.early_loss_exit_velocity_pips_sec = max(
+            0.0,
+            self._strategy_float_param(
+                strategy_params,
+                "early_loss_exit_velocity_pips_sec",
+                0.0,
+            ),
+        )
+        self.early_loss_exit_velocity_window_sec = max(
+            1.0,
+            self._strategy_float_param(
+                strategy_params,
+                "early_loss_exit_velocity_window_sec",
+                10.0,
+            ),
+        )
+        self._early_loss_velocity_history: dict[str, deque[tuple[float, float]]] = {}
         self.debug_indicators_interval_sec = max(
             0.0,
             self._strategy_float_param(
@@ -3050,6 +3111,88 @@ class SymbolWorker(threading.Thread):
 
         return None
 
+    # ------------------------------------------------------------------
+    # Early loss exit — close losing positions before full SL is reached.
+    # ------------------------------------------------------------------
+
+    def _early_loss_exit_reason(
+        self,
+        position: Position,
+        bid: float,
+        ask: float,
+        now_ts: float,
+    ) -> str | None:
+        if not self.early_loss_exit_enabled:
+            return None
+
+        # --- compute adverse move ratio vs SL distance ---
+        mark = bid if position.side == Side.BUY else ask
+        stop_distance = abs(position.open_price - position.stop_loss)
+        if stop_distance <= 1e-9:
+            return None
+
+        if position.side == Side.BUY:
+            adverse_move = position.open_price - mark
+        else:
+            adverse_move = mark - position.open_price
+
+        if adverse_move <= 0:
+            # Position is in profit or at breakeven — clear velocity history and skip.
+            self._early_loss_velocity_history.pop(position.position_id, None)
+            return None
+
+        loss_ratio = adverse_move / stop_distance
+
+        # --- minimum threshold gate ---
+        if loss_ratio < self.early_loss_exit_loss_threshold:
+            return None
+
+        # --- grace period ---
+        elapsed = now_ts - position.opened_at
+        if elapsed < self.early_loss_exit_grace_sec:
+            return None
+
+        # --- velocity check ---
+        if self.early_loss_exit_velocity_pips_sec > 0:
+            tick_size = (
+                self.symbol_spec.tick_size if self.symbol_spec is not None else 1e-4
+            )
+            adverse_pips = adverse_move / max(tick_size, 1e-9)
+            history = self._early_loss_velocity_history.setdefault(
+                position.position_id,
+                deque(maxlen=200),
+            )
+            history.append((now_ts, adverse_pips))
+
+            # Prune entries older than velocity window.
+            window = self.early_loss_exit_velocity_window_sec
+            while history and (now_ts - history[0][0]) > window * 1.5:
+                history.popleft()
+
+            if len(history) >= 2:
+                oldest_ts, oldest_pips = history[0]
+                dt = now_ts - oldest_ts
+                if dt >= 1.0:
+                    velocity = (adverse_pips - oldest_pips) / dt
+                    if velocity >= self.early_loss_exit_velocity_pips_sec:
+                        self._early_loss_velocity_history.pop(
+                            position.position_id, None
+                        )
+                        return (
+                            f"early_loss_exit:velocity:{velocity:.2f}pps"
+                        )
+
+        # --- progressive decay check ---
+        elapsed_after_grace = elapsed - self.early_loss_exit_grace_sec
+        decay_progress = min(1.0, elapsed_after_grace / self.early_loss_exit_decay_sec)
+        allowed_ratio = 1.0 - decay_progress * (1.0 - self.early_loss_exit_min_ratio)
+
+        if loss_ratio >= allowed_ratio:
+            self._early_loss_velocity_history.pop(position.position_id, None)
+            return f"early_loss_exit:decay:{loss_ratio:.0%}"
+
+        return None
+
     def _load_symbol_spec(self) -> None:
         if self.symbol_spec is not None:
             return
@@ -3195,21 +3338,27 @@ class SymbolWorker(threading.Thread):
                                 if new_stop is not None:
                                     self._apply_trailing_stop(active, new_stop, progress)
 
-                                exit_signal = self._strategy_exit_signal()
-                                reverse_reason = self._reverse_signal_exit_reason_from_signal(active, exit_signal)
-                                if reverse_reason:
-                                    self._close_position(active, mark_price, reverse_reason)
+                                early_loss_reason = self._early_loss_exit_reason(
+                                    active, tick.bid, tick.ask, tick.timestamp,
+                                )
+                                if early_loss_reason:
+                                    self._close_position(active, mark_price, early_loss_reason)
                                 else:
-                                    dynamic_exit_reason = self._strategy_dynamic_exit_reason(
-                                        active,
-                                        tick.bid,
-                                        tick.ask,
-                                        exit_signal,
-                                    )
-                                    if dynamic_exit_reason:
-                                        self._close_position(active, mark_price, dynamic_exit_reason)
-                                    elif self.position_book.get(self.symbol) is not None and force_flatten:
-                                        self._close_position(active, mark_price, f"emergency:{reason}")
+                                    exit_signal = self._strategy_exit_signal()
+                                    reverse_reason = self._reverse_signal_exit_reason_from_signal(active, exit_signal)
+                                    if reverse_reason:
+                                        self._close_position(active, mark_price, reverse_reason)
+                                    else:
+                                        dynamic_exit_reason = self._strategy_dynamic_exit_reason(
+                                            active,
+                                            tick.bid,
+                                            tick.ask,
+                                            exit_signal,
+                                        )
+                                        if dynamic_exit_reason:
+                                            self._close_position(active, mark_price, dynamic_exit_reason)
+                                        elif self.position_book.get(self.symbol) is not None and force_flatten:
+                                            self._close_position(active, mark_price, f"emergency:{reason}")
 
                 active = self.position_book.get(self.symbol)
                 if not active:

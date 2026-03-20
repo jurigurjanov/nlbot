@@ -3083,3 +3083,199 @@ def test_worker_restores_and_repairs_compressed_timestamps_for_closed_candle_str
     finally:
         restored_worker.broker.close()
         restored_worker.store.close()
+
+
+# ────────────────────────────────────────────────────────────
+#  Early loss exit tests
+# ────────────────────────────────────────────────────────────
+
+def _make_early_loss_worker(tmp_path, **overrides):
+    defaults = {
+        "early_loss_exit_enabled": True,
+        "early_loss_exit_grace_sec": 30.0,
+        "early_loss_exit_loss_threshold": 0.3,
+        "early_loss_exit_decay_sec": 300.0,
+        "early_loss_exit_min_ratio": 0.5,
+        "early_loss_exit_velocity_pips_sec": 0.0,
+        "early_loss_exit_velocity_window_sec": 10.0,
+    }
+    defaults.update(overrides)
+    return _make_worker(tmp_path, strategy_param_overrides=defaults)
+
+
+def _buy_position(opened_at: float = 1_000_000.0) -> Position:
+    return Position(
+        position_id="pos-buy-1",
+        symbol="EURUSD",
+        side=Side.BUY,
+        volume=0.1,
+        open_price=1.10000,
+        stop_loss=1.09700,   # 30 pips SL
+        take_profit=1.10600, # 60 pips TP
+        opened_at=opened_at,
+    )
+
+
+def _sell_position(opened_at: float = 1_000_000.0) -> Position:
+    return Position(
+        position_id="pos-sell-1",
+        symbol="EURUSD",
+        side=Side.SELL,
+        volume=0.1,
+        open_price=1.10000,
+        stop_loss=1.10300,   # 30 pips SL
+        take_profit=1.09400, # 60 pips TP
+        opened_at=opened_at,
+    )
+
+
+def test_early_loss_exit_disabled_returns_none(tmp_path):
+    worker = _make_early_loss_worker(tmp_path, early_loss_exit_enabled=False)
+    pos = _buy_position(opened_at=0.0)
+    # Deep in loss, well past grace — but feature is disabled.
+    result = worker._early_loss_exit_reason(pos, bid=1.09750, ask=1.09760, now_ts=500.0)
+    assert result is None
+
+
+def test_early_loss_exit_position_in_profit_returns_none(tmp_path):
+    worker = _make_early_loss_worker(tmp_path)
+    pos = _buy_position(opened_at=0.0)
+    # Price above open — in profit.
+    result = worker._early_loss_exit_reason(pos, bid=1.10100, ask=1.10110, now_ts=500.0)
+    assert result is None
+
+
+def test_early_loss_exit_below_threshold_returns_none(tmp_path):
+    worker = _make_early_loss_worker(tmp_path, early_loss_exit_loss_threshold=0.3)
+    pos = _buy_position(opened_at=0.0)
+    # Loss = 5 pips, SL distance = 30 pips → ratio = 0.167 < 0.3 threshold.
+    result = worker._early_loss_exit_reason(pos, bid=1.09950, ask=1.09960, now_ts=500.0)
+    assert result is None
+
+
+def test_early_loss_exit_within_grace_period_returns_none(tmp_path):
+    worker = _make_early_loss_worker(tmp_path, early_loss_exit_grace_sec=30.0)
+    pos = _buy_position(opened_at=100.0)
+    # Loss ratio = 20/30 = 0.67, but only 20s elapsed (within 30s grace).
+    result = worker._early_loss_exit_reason(pos, bid=1.09800, ask=1.09810, now_ts=120.0)
+    assert result is None
+
+
+def test_early_loss_exit_decay_triggers_after_grace(tmp_path):
+    worker = _make_early_loss_worker(
+        tmp_path,
+        early_loss_exit_grace_sec=10.0,
+        early_loss_exit_decay_sec=100.0,
+        early_loss_exit_min_ratio=0.5,
+        early_loss_exit_loss_threshold=0.3,
+    )
+    pos = _buy_position(opened_at=0.0)
+    # After grace (10s) + 50s decay → decay_progress = 50/100 = 0.5
+    # allowed_ratio = 1.0 - 0.5 * (1.0 - 0.5) = 1.0 - 0.25 = 0.75
+    # Loss = 25 pips / 30 pips = 0.833 > 0.75 → triggers
+    result = worker._early_loss_exit_reason(pos, bid=1.09750, ask=1.09760, now_ts=60.0)
+    assert result is not None
+    assert result.startswith("early_loss_exit:decay:")
+
+
+def test_early_loss_exit_decay_does_not_trigger_when_loss_below_allowed(tmp_path):
+    worker = _make_early_loss_worker(
+        tmp_path,
+        early_loss_exit_grace_sec=10.0,
+        early_loss_exit_decay_sec=100.0,
+        early_loss_exit_min_ratio=0.5,
+        early_loss_exit_loss_threshold=0.3,
+    )
+    pos = _buy_position(opened_at=0.0)
+    # After grace (10s) + 5s decay → decay_progress = 5/100 = 0.05
+    # allowed_ratio = 1.0 - 0.05 * 0.5 = 0.975
+    # Loss = 10 pips / 30 pips = 0.333 < 0.975 → no trigger
+    result = worker._early_loss_exit_reason(pos, bid=1.09900, ask=1.09910, now_ts=15.0)
+    assert result is None
+
+
+def test_early_loss_exit_full_decay_triggers_at_min_ratio(tmp_path):
+    worker = _make_early_loss_worker(
+        tmp_path,
+        early_loss_exit_grace_sec=0.0,
+        early_loss_exit_decay_sec=100.0,
+        early_loss_exit_min_ratio=0.5,
+        early_loss_exit_loss_threshold=0.3,
+    )
+    pos = _buy_position(opened_at=0.0)
+    # After 200s (past full decay) → decay_progress = min(1.0, 200/100) = 1.0
+    # allowed_ratio = 1.0 - 1.0 * 0.5 = 0.5
+    # Loss = 16 pips / 30 pips = 0.533 > 0.5 → triggers
+    result = worker._early_loss_exit_reason(pos, bid=1.09840, ask=1.09850, now_ts=200.0)
+    assert result is not None
+    assert "decay" in result
+
+
+def test_early_loss_exit_sell_position_decay(tmp_path):
+    worker = _make_early_loss_worker(
+        tmp_path,
+        early_loss_exit_grace_sec=0.0,
+        early_loss_exit_decay_sec=60.0,
+        early_loss_exit_min_ratio=0.5,
+        early_loss_exit_loss_threshold=0.3,
+    )
+    pos = _sell_position(opened_at=0.0)
+    # SELL position, ask = 1.10200 → adverse = 1.10200 - 1.10000 = 0.00200
+    # SL distance = |1.10000 - 1.10300| = 0.00300
+    # loss_ratio = 0.00200 / 0.00300 = 0.667
+    # After 120s (past full decay) → allowed = 0.5
+    # 0.667 > 0.5 → triggers
+    result = worker._early_loss_exit_reason(pos, bid=1.10190, ask=1.10200, now_ts=120.0)
+    assert result is not None
+    assert "decay" in result
+
+
+def test_early_loss_exit_velocity_triggers(tmp_path):
+    worker = _make_early_loss_worker(
+        tmp_path,
+        early_loss_exit_grace_sec=0.0,
+        early_loss_exit_loss_threshold=0.1,
+        early_loss_exit_velocity_pips_sec=2.0,
+        early_loss_exit_velocity_window_sec=10.0,
+    )
+    pos = _buy_position(opened_at=0.0)
+    # tick_size = 0.0001 for EURUSD
+    # First tick: 5 pips loss at t=1
+    worker._early_loss_exit_reason(pos, bid=1.09950, ask=1.09960, now_ts=1.0)
+    # Second tick: 30 pips loss at t=3 → velocity = (30-5)/2 = 12.5 pips/sec > 2.0
+    result = worker._early_loss_exit_reason(pos, bid=1.09700, ask=1.09710, now_ts=3.0)
+    assert result is not None
+    assert "velocity" in result
+
+
+def test_early_loss_exit_velocity_disabled_when_zero(tmp_path):
+    worker = _make_early_loss_worker(
+        tmp_path,
+        early_loss_exit_grace_sec=0.0,
+        early_loss_exit_loss_threshold=0.1,
+        early_loss_exit_velocity_pips_sec=0.0,
+        early_loss_exit_decay_sec=99999.0,  # effectively disable decay
+        early_loss_exit_min_ratio=0.0,      # no decay floor
+    )
+    pos = _buy_position(opened_at=0.0)
+    # Fast adverse move but velocity check disabled and decay is negligible.
+    # Loss = 10 pips / 30 pips = 0.333, allowed ≈ 1.0 → no trigger.
+    worker._early_loss_exit_reason(pos, bid=1.09950, ask=1.09960, now_ts=1.0)
+    result = worker._early_loss_exit_reason(pos, bid=1.09900, ask=1.09910, now_ts=3.0)
+    assert result is None
+
+
+def test_early_loss_exit_clears_velocity_history_on_profit(tmp_path):
+    worker = _make_early_loss_worker(
+        tmp_path,
+        early_loss_exit_grace_sec=0.0,
+        early_loss_exit_loss_threshold=0.1,
+        early_loss_exit_velocity_pips_sec=2.0,
+    )
+    pos = _buy_position(opened_at=0.0)
+    # Record a loss tick.
+    worker._early_loss_exit_reason(pos, bid=1.09900, ask=1.09910, now_ts=1.0)
+    assert pos.position_id in worker._early_loss_velocity_history
+    # Now price goes into profit — history should be cleared.
+    worker._early_loss_exit_reason(pos, bid=1.10100, ask=1.10110, now_ts=5.0)
+    assert pos.position_id not in worker._early_loss_velocity_history
