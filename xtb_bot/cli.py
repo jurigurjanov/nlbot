@@ -1329,7 +1329,44 @@ def main() -> None:
             storage_path = _resolve_storage_path(args.storage_path)
             anchor = _reset_risk_anchor(storage_path, args.risk_anchor_value)
         except (ConfigError, ValueError) as exc:
-            raise SystemExit(f"Configuration error: {exc}")
+            if args.risk_anchor_value is not None:
+                raise SystemExit(f"Configuration error: {exc}")
+            # No snapshots and no explicit value – try fetching live balance from broker.
+            try:
+                config = load_config(
+                    mode_override=args.mode,
+                    strategy_override=args.strategy,
+                    symbols_override=_parse_symbols_override(args.symbols),
+                    force_strategy_override=args.force,
+                    force_symbols_override=args.force_symbols,
+                    ig_stream_enabled_override=args.ig_stream_enabled,
+                    strict_broker_connect_override=True,
+                )
+                if args.storage_path:
+                    config.storage_path = _resolve_storage_path(args.storage_path)
+                bot = TradingBot(config)
+                try:
+                    bot.broker.connect()
+                    snapshot = bot.broker.get_account_snapshot()
+                    equity = snapshot.equity
+                    balance = snapshot.balance
+                    live_anchor = equity if equity > 0 else balance
+                    if live_anchor <= 0:
+                        raise SystemExit(
+                            "Configuration error: broker returned non-positive balance "
+                            f"(equity={equity}, balance={balance})"
+                        )
+                    storage_path = config.storage_path
+                    anchor = _reset_risk_anchor(storage_path, live_anchor)
+                    print(f"(fetched live account equity from broker)")
+                finally:
+                    bot.stop()
+            except SystemExit:
+                raise
+            except Exception as inner_exc:
+                raise SystemExit(
+                    f"Configuration error: no snapshots in DB and broker fetch failed: {inner_exc}"
+                )
         print(f"risk.start_equity has been reset to {anchor:.2f} in {storage_path}")
         return
 
