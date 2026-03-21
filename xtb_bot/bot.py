@@ -16,6 +16,7 @@ from xtb_bot.client import MockBrokerClient, XtbApiClient
 from xtb_bot.config import BotConfig
 from xtb_bot.ig_client import IgApiClient
 from xtb_bot.models import PendingOpen, Position, RunMode
+from xtb_bot.rate_limited_proxy import RateLimitedBrokerProxy
 from xtb_bot.position_book import PositionBook
 from xtb_bot.risk_manager import RiskManager
 from xtb_bot.state_store import StateStore
@@ -158,7 +159,7 @@ class TradingBot:
         self._last_passive_history_ts_by_symbol: dict[str, float] = {}
 
         if config.broker == "ig":
-            self.broker = IgApiClient(
+            ig_client = IgApiClient(
                 identifier=config.user_id,
                 password=config.password,
                 api_key=str(config.api_key or ""),
@@ -169,6 +170,11 @@ class TradingBot:
                 stream_enabled=config.ig_stream_enabled,
                 stream_tick_max_age_sec=config.ig_stream_tick_max_age_sec,
                 rest_market_min_interval_sec=config.ig_rest_market_min_interval_sec,
+            )
+            self.broker = RateLimitedBrokerProxy(
+                real_broker=ig_client,
+                symbols=list(config.symbols),
+                stop_event=self.stop_event,
             )
         else:
             self.broker = XtbApiClient(

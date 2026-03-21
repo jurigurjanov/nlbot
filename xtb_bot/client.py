@@ -109,6 +109,18 @@ class BaseBrokerClient(ABC):
         _ = position_id
         return None
 
+    def get_position_close_sync(
+        self,
+        position_id: str,
+        *,
+        deal_reference: str | None = None,
+        opened_at: float | None = None,
+        symbol: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        _ = (position_id, deal_reference, opened_at, symbol, kwargs)
+        return None
+
     def get_public_api_backoff_remaining_sec(self) -> float:
         return 0.0
 
