@@ -324,10 +324,13 @@ def test_bot_picks_ig_client_when_broker_is_ig(tmp_path):
     )
     bot = TradingBot(config)
     try:
-        assert isinstance(bot.broker, IgApiClient)
-        assert bot.broker._stream_enabled is False  # type: ignore[attr-defined]
-        assert bot.broker.stream_tick_max_age_sec == pytest.approx(config.ig_stream_tick_max_age_sec)
-        assert bot.broker.rest_market_min_interval_sec == pytest.approx(config.ig_rest_market_min_interval_sec)
+        from xtb_bot.rate_limited_proxy import RateLimitedBrokerProxy
+        assert isinstance(bot.broker, RateLimitedBrokerProxy)
+        real = bot.broker._broker
+        assert isinstance(real, IgApiClient)
+        assert real._stream_enabled is False  # type: ignore[attr-defined]
+        assert real.stream_tick_max_age_sec == pytest.approx(config.ig_stream_tick_max_age_sec)
+        assert real.rest_market_min_interval_sec == pytest.approx(config.ig_rest_market_min_interval_sec)
     finally:
         bot.store.close()
 
