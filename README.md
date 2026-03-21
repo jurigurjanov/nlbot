@@ -83,6 +83,7 @@
 - `xtb_bot/worker.py` — поток на инструмент
 - `xtb_bot/client.py` — базовый брокерский интерфейс, XTB и mock клиент
 - `xtb_bot/ig_client.py` — IG API клиент
+- `xtb_bot/rate_limited_proxy.py` — прокси с rate-limit'ами IG API (token bucket + кеш + фоновые поллеры)
 - `xtb_bot/risk_manager.py` — риск-менеджмент и ограничения
 - `xtb_bot/state_store.py` — SQLite persistence
 - `xtb_bot/strategies/` — стратегии и фабрика
@@ -832,6 +833,57 @@ IG_REST_MARKET_MIN_INTERVAL_SEC=1.0
 # десинхронизировать циклы воркеров по символам
 XTB_WORKER_POLL_JITTER_SEC=1.0
 ```
+
+### Rate-Limit Proxy (IG)
+
+Для IG API автоматически включается `RateLimitedBrokerProxy`, который соблюдает 4 категории лимитов:
+
+| Категория | Лимит | Что делает |
+|-----------|-------|-----------|
+| App non-trading | 60 req/min | Connectivity, stream health |
+| Account non-trading | 30 req/min | Account snapshot, symbol spec, позиции |
+| Account trading | 100 req/min | Open/close/modify позиций |
+| Historical data | 10,000 points/week | REST-цены, новости, session close |
+
+Архитектура:
+- 4 независимых token-bucket rate limiter'а (по одному на категорию)
+- 3 фоновых поллера кешируют read-only данные (connectivity, account snapshot, symbol specs, news events)
+- Торговые операции (open/close/modify) проходят напрямую к брокеру с rate limiter'ом
+- SymbolWorker'ы работают через тот же `BaseBrokerClient` интерфейс — без изменений
+
+Кеш TTL по умолчанию:
+- `get_connectivity_status()` — 5 сек
+- `get_stream_health_status()` — 5 сек
+- `get_account_snapshot()` — 10 сек
+- `get_symbol_spec()` — 10 мин
+- `get_session_close_utc()` — 1 час
+- `get_upcoming_high_impact_events()` — 5 мин
+
+### Глобальная инвалидация тренда
+
+Все MA-стратегии (momentum, trend_following, crypto_trend_following, g1, index_hybrid) автоматически закрывают позицию при развороте тренда:
+- Если позиция BUY и `fast_ema <= slow_ema` — закрытие по `strategy_exit:*:trend_invalidated`
+- Если позиция SELL и `fast_ema >= slow_ema` — закрытие по `strategy_exit:*:trend_invalidated`
+- Работает независимо от P&L позиции (в прибыли или убытке)
+- Не привязана к конкретной стратегии — любая стратегия, возвращающая `fast_ema`/`slow_ema` в metadata сигнала, получает эту защиту автоматически
+
+### Частота опроса позиций
+
+Бот ускоряет цикл опроса при открытой позиции:
+
+| Параметр | Значение по умолчанию | Описание |
+|----------|----------------------|----------|
+| `poll_interval_sec` | 5.0 сек | Интервал опроса без открытых позиций |
+| `active_position_poll_interval_sec` | min(1.0, poll_interval_sec) | Интервал при открытой позиции |
+| `worker_poll_jitter_sec` | 1.0 сек | Случайный разброс интервала (±) |
+
+`active_position_poll_interval_sec` можно задать в strategy_params для каждой стратегии.
+
+### Свежесть данных в CLI
+
+`xtb-bot --show-trades` показывает возраст данных для каждой сделки:
+- `(updated Xs ago)` / `(updated Xm ago)` / `(updated X.Xh ago)`
+- `STALE` — предупреждение для открытых сделок, не обновлявшихся более 30 секунд
 
 Строгий старт без fallback в mock при ошибке подключения:
 
