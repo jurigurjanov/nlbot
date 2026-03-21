@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 from xtb_bot.models import Side, Signal
 from xtb_bot.numeric import atr_wilder, tail_mean, zscore
+from xtb_bot.strategies.pip_size import pip_size as _pip_size_lookup
 from xtb_bot.strategies.base import Strategy, StrategyContext
 
 
@@ -104,18 +105,7 @@ class MeanReversionStrategy(Strategy):
 
     @staticmethod
     def _pip_size(symbol: str) -> float:
-        upper = symbol.upper()
-        if upper in {"US100", "US500", "US30", "DE40", "UK100", "FRA40", "JP225", "EU50"}:
-            return 1.0
-        if upper.startswith(("US", "DE", "UK", "FRA", "JP", "EU")) and any(ch.isdigit() for ch in upper):
-            return 1.0
-        if upper.endswith("JPY"):
-            return 0.01
-        if upper.startswith("XAU") or upper.startswith("XAG"):
-            return 0.1
-        if upper in {"WTI", "BRENT"}:
-            return 0.1
-        return 0.0001
+        return _pip_size_lookup(symbol)
 
     def _dynamic_sl_tp(self, ctx: StrategyContext, prices: Sequence[float]) -> tuple[float, float, float | None]:
         stop_pips = self.min_stop_loss_pips
@@ -163,7 +153,7 @@ class MeanReversionStrategy(Strategy):
         last_price = prices[-1]
         slow_ma = tail_mean(prices, self.trend_ma_window) if self.trend_filter_enabled else None
         stop_loss_pips, take_profit_pips, atr_pips = self._dynamic_sl_tp(ctx, prices)
-        confidence = min(1.0, abs(z) / (self.threshold * 2.0))
+        confidence = min(1.0, abs(z) / max(self.threshold * 2.0, 1e-9))
 
         if z <= -self.threshold:
             if slow_ma is not None and last_price > slow_ma:
@@ -171,7 +161,7 @@ class MeanReversionStrategy(Strategy):
                     "blocked_by_trend_filter",
                     zscore=z,
                     prices_len=len(prices),
-                    trend="below_sma",
+                    trend="above_sma",
                     trend_ma=slow_ma,
                     last_price=last_price,
                 )
@@ -196,7 +186,7 @@ class MeanReversionStrategy(Strategy):
                     "blocked_by_trend_filter",
                     zscore=z,
                     prices_len=len(prices),
-                    trend="above_sma",
+                    trend="below_sma",
                     trend_ma=slow_ma,
                     last_price=last_price,
                 )

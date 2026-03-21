@@ -10,6 +10,7 @@ import threading
 from xtb_bot.models import Side, Signal
 from xtb_bot.numeric import adx_from_close, atr_wilder, ema, ema_last_two
 from xtb_bot.strategies.base import Strategy, StrategyContext
+from xtb_bot.strategies.pip_size import pip_size as _pip_size_lookup
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,20 +340,7 @@ class G1Strategy(Strategy):
 
     @staticmethod
     def _pip_size(symbol: str) -> float:
-        upper = symbol.upper()
-        if upper in {"AUS200", "AU200"}:
-            return 1.0
-        if upper in {"US100", "US500", "US30", "DE40", "UK100", "FRA40", "JP225", "EU50"}:
-            return 0.1
-        if upper.startswith(("US", "DE", "UK", "FRA", "JP", "EU")) and any(ch.isdigit() for ch in upper):
-            return 0.1
-        if upper.endswith("JPY"):
-            return 0.01
-        if upper.startswith("XAU") or upper.startswith("XAG"):
-            return 0.1
-        if upper in {"WTI", "BRENT"}:
-            return 0.1
-        return 0.0001
+        return _pip_size_lookup(symbol)
 
     def _resample_closed_candle_closes(
         self,
@@ -618,6 +606,14 @@ class G1Strategy(Strategy):
         raw_prices = [float(value) for value in ctx.prices]
         raw_timestamps = [float(value) for value in ctx.timestamps]
         prices, using_closed_candles = self._resample_closed_candle_closes(raw_prices, raw_timestamps)
+        if not prices:
+            return Signal(
+                side=Side.HOLD,
+                confidence=0.0,
+                stop_loss_pips=float(self.params.get("stop_loss_pips", 25)),
+                take_profit_pips=float(self.params.get("take_profit_pips", 50)),
+                metadata={"reason": "empty_resampled_prices", "indicator": "g1"},
+            )
         profile = self._profile_for_symbol(ctx.symbol)
         min_history = self._profile_min_history(profile)
         if len(prices) < min_history:

@@ -7,6 +7,7 @@ import math
 from xtb_bot.models import Side, Signal
 from xtb_bot.numeric import atr_wilder, ema
 from xtb_bot.strategies.base import Strategy, StrategyContext
+from xtb_bot.strategies.pip_size import pip_size as _pip_size_lookup, is_crypto_symbol as _is_crypto, is_index_symbol as _is_index
 
 
 class TrendFollowingStrategy(Strategy):
@@ -138,32 +139,15 @@ class TrendFollowingStrategy(Strategy):
 
     @staticmethod
     def _pip_size(symbol: str) -> float:
-        upper = symbol.upper()
-        if upper in {"AUS200", "AU200"}:
-            return 1.0
-        if upper in {"US100", "US500", "US30", "DE40", "UK100", "FRA40", "JP225", "EU50"}:
-            return 0.1
-        if upper.startswith(("US", "DE", "UK", "FRA", "JP", "EU")) and any(ch.isdigit() for ch in upper):
-            return 0.1
-        if upper.endswith("JPY"):
-            return 0.01
-        if upper.startswith("XAU") or upper.startswith("XAG"):
-            return 0.1
-        if upper in {"WTI", "BRENT"}:
-            return 0.1
-        return 0.0001
+        return _pip_size_lookup(symbol)
 
     @staticmethod
     def _is_index_symbol(symbol: str) -> bool:
-        upper = symbol.upper()
-        if upper in {"US100", "US500", "US30", "DE40", "UK100", "FRA40", "JP225", "EU50"}:
-            return True
-        return upper.startswith(("US", "DE", "UK", "FRA", "JP", "EU")) and any(ch.isdigit() for ch in upper)
+        return _is_index(symbol)
 
     @staticmethod
     def _is_crypto_symbol(symbol: str) -> bool:
-        upper = symbol.upper()
-        return upper in {"BTC", "ETH", "LTC", "BCH", "DOGE", "XRP", "SOL"}
+        return _is_crypto(symbol)
 
     @staticmethod
     def _extract_finite_positive_volumes(raw_values: Sequence[float]) -> list[float]:
@@ -411,11 +395,14 @@ class TrendFollowingStrategy(Strategy):
         if self.max_timestamp_gap_sec > 0 and len(ctx.timestamps) >= 2:
             last_ts = float(ctx.timestamps[-1])
             prev_ts = float(ctx.timestamps[-2])
-            if (last_ts - prev_ts) > self.max_timestamp_gap_sec:
+            gap = last_ts - prev_ts
+            if last_ts > 10_000_000_000:
+                gap = gap / 1000.0
+            if gap > self.max_timestamp_gap_sec:
                 return self._hold(
                     "timestamp_gap_too_wide",
                     {
-                        "timestamp_gap_sec": last_ts - prev_ts,
+                        "timestamp_gap_sec": gap,
                         "trend_max_timestamp_gap_sec": self.max_timestamp_gap_sec,
                     },
                 )

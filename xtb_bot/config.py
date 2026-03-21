@@ -345,6 +345,13 @@ DEFAULT_STRATEGY_PARAMS = {
     "zscore_threshold": 1.8,
     "stop_loss_pips": 25,
     "take_profit_pips": 50,
+    "early_loss_exit_enabled": False,
+    "early_loss_exit_grace_sec": 30.0,
+    "early_loss_exit_loss_threshold": 0.3,
+    "early_loss_exit_decay_sec": 300.0,
+    "early_loss_exit_min_ratio": 0.5,
+    "early_loss_exit_velocity_pips_sec": 0.0,
+    "early_loss_exit_velocity_window_sec": 10.0,
 }
 
 

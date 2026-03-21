@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 from xtb_bot.models import Side, Signal
 from xtb_bot.numeric import atr_wilder, mean_std, rsi_sma, rsi_wilder, tail_mean
+from xtb_bot.strategies.pip_size import pip_size as _pip_size_lookup
 from xtb_bot.strategies.base import Strategy, StrategyContext
 
 
@@ -150,7 +151,7 @@ class MeanReversionBbStrategy(Strategy):
         return mean_std(values)
 
     def _rsi_sma(self, prices: Sequence[float]) -> float:
-        period_slice = prices[-(self.rsi_period + 1):] if len(prices) > self.rsi_period + 1 else prices
+        period_slice = prices[-(self.rsi_period + 1):] if len(prices) >= self.rsi_period + 1 else prices
         return rsi_sma(period_slice)
 
     def _rsi_wilder(self, prices: Sequence[float]) -> float:
@@ -217,20 +218,7 @@ class MeanReversionBbStrategy(Strategy):
 
     @staticmethod
     def _pip_size(symbol: str) -> float:
-        upper = symbol.upper()
-        if upper in {"AUS200", "AU200"}:
-            return 1.0
-        if upper in {"US100", "US500", "US30", "DE40", "UK100", "FRA40", "JP225", "EU50"}:
-            return 0.1
-        if upper.startswith(("US", "DE", "UK", "FRA", "JP", "EU")) and any(ch.isdigit() for ch in upper):
-            return 0.1
-        if upper.endswith("JPY"):
-            return 0.01
-        if upper.startswith("XAU") or upper.startswith("XAG"):
-            return 0.1
-        if upper in {"WTI", "BRENT"}:
-            return 0.1
-        return 0.0001
+        return _pip_size_lookup(symbol)
 
     def _dynamic_sl_tp(
         self,
@@ -652,7 +640,7 @@ class MeanReversionBbStrategy(Strategy):
             extension_ratio = band_extension_ratio if self.entry_mode == "touch" else max(prev_extension_ratio, 0.0)
             band_score = min(1.0, max(0.0, extension_ratio) / 0.15)
             rsi_score = (
-                min(1.0, max(0.0, (self.rsi_oversold - rsi) / max(self.rsi_oversold, 1e-9)))
+                min(1.0, max(0.0, (self.rsi_oversold - rsi) / max(self.rsi_oversold, 1.0)))
                 if self.use_rsi_filter
                 else min(1.0, abs(rsi - 50.0) / 50.0)
             )
@@ -745,20 +733,20 @@ class MeanReversionBbStrategy(Strategy):
             bb_midline=mean,
             upper=upper,
             lower=lower,
-                rsi=rsi,
-                rsi_method=self.rsi_method,
-                bb_distance=bb_distance,
-                band_extension_ratio=band_extension_ratio,
-                max_band_extension_ratio=self.max_band_extension_ratio,
-                entry_mode=self.entry_mode,
-                pip_size=pip_size,
-                pip_size_source=pip_size_source,
-                distance_sigma=distance_sigma,
-                take_profit_mode=self.take_profit_mode,
-                midline_target_pips=midline_target_pips,
-                rr_target_pips=rr_take_profit_pips,
-                trend_ma=trend_ma,
-                trend_slope_ratio=trend_slope_ratio,
-                volume_spike=volume_spike,
-                **volume_payload,
-            )
+            rsi=rsi,
+            rsi_method=self.rsi_method,
+            bb_distance=bb_distance,
+            band_extension_ratio=band_extension_ratio,
+            max_band_extension_ratio=self.max_band_extension_ratio,
+            entry_mode=self.entry_mode,
+            pip_size=pip_size,
+            pip_size_source=pip_size_source,
+            distance_sigma=distance_sigma,
+            take_profit_mode=self.take_profit_mode,
+            midline_target_pips=midline_target_pips,
+            rr_target_pips=rr_take_profit_pips,
+            trend_ma=trend_ma,
+            trend_slope_ratio=trend_slope_ratio,
+            volume_spike=volume_spike,
+            **volume_payload,
+        )

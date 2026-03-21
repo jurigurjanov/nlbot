@@ -8,6 +8,7 @@ import threading
 from xtb_bot.models import Side, Signal
 from xtb_bot.numeric import atr_wilder, tail_mean
 from xtb_bot.strategies.base import Strategy, StrategyContext
+from xtb_bot.strategies.pip_size import pip_size as _pip_size_lookup
 
 
 class DonchianBreakoutStrategy(Strategy):
@@ -109,18 +110,7 @@ class DonchianBreakoutStrategy(Strategy):
 
     @staticmethod
     def _pip_size(symbol: str) -> float:
-        upper = symbol.upper()
-        if upper in {"US100", "US500", "US30", "DE40", "UK100", "FRA40", "JP225", "EU50"}:
-            return 0.1
-        if upper.startswith(("US", "DE", "UK", "FRA", "JP", "EU")) and any(ch.isdigit() for ch in upper):
-            return 0.1
-        if upper.endswith("JPY"):
-            return 0.01
-        if upper.startswith("XAU") or upper.startswith("XAG"):
-            return 0.1
-        if upper in {"WTI", "BRENT"}:
-            return 0.1
-        return 0.0001
+        return _pip_size_lookup(symbol)
 
     @staticmethod
     def _parse_spread_limits(raw: object) -> dict[str, float]:
