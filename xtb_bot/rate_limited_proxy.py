@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from xtb_bot.client import BaseBrokerClient, BrokerError
@@ -44,6 +44,7 @@ class TokenBucketRateLimiter:
 
     ``capacity`` tokens, refilling at ``refill_per_sec`` tokens/second.
     ``acquire()`` blocks until a token is available or *timeout_sec* elapses.
+    ``try_acquire()`` is non-blocking: returns True if a token was consumed.
     """
 
     def __init__(self, capacity: int, refill_per_sec: float) -> None:
@@ -75,6 +76,15 @@ class TokenBucketRateLimiter:
                     raise BrokerError("IG rate limit exceeded (token bucket timeout)")
                 self._cond.wait(timeout=min(wait_for_token + 0.01, remaining))
 
+    def try_acquire(self) -> bool:
+        """Try to consume a token without blocking.  Returns True on success."""
+        with self._cond:
+            self._refill()
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return True
+            return False
+
     @property
     def tokens(self) -> float:
         with self._cond:
@@ -92,12 +102,11 @@ class CacheEntry:
     value: Any = None
     fetched_at: float = 0.0
     ttl_sec: float = 10.0
-    error: Exception | None = None
 
     def is_fresh(self) -> bool:
         return self.value is not None and (time.time() - self.fetched_at) < self.ttl_sec
 
-    def is_usable(self, max_stale_sec: float = 60.0) -> bool:
+    def is_usable(self, max_stale_sec: float = 120.0) -> bool:
         """Return True if the value exists and is not too stale."""
         return self.value is not None and (time.time() - self.fetched_at) < (self.ttl_sec + max_stale_sec)
 
@@ -119,6 +128,12 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         Shared stop event; when set, pollers shut down.
     """
 
+    # Default TTLs for per-symbol price REST cache.
+    # With 30 req/min budget, N symbols can each be refreshed every
+    # ceil(N * 2) seconds.  E.g. 6 symbols → one REST per 12s per symbol.
+    _PRICE_REST_TTL_BASE_SEC = 4.0  # minimum TTL per symbol
+    _PRICE_REST_TTL_PER_SYMBOL_SEC = 2.0  # added per additional symbol
+
     def __init__(
         self,
         real_broker: BaseBrokerClient,
@@ -129,30 +144,35 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         self._symbols = list(symbols or [])
         self._stop = stop_event or threading.Event()
 
-        # ---- Rate limiters (one per IG category) ----
-        self._app_non_trading = TokenBucketRateLimiter(capacity=60, refill_per_sec=60.0 / 60.0)
-        self._account_non_trading = TokenBucketRateLimiter(capacity=15, refill_per_sec=15.0 / 60.0)
+        # ---- Rate limiters ----
+        # We use a SINGLE bucket for all account non-trading requests
+        # (get_price REST, get_account_snapshot, get_symbol_spec, etc.)
+        # because IG counts them all against the same 30/min limit.
+        # Capacity is set below the limit to leave headroom.
+        self._app_non_trading = TokenBucketRateLimiter(capacity=50, refill_per_sec=50.0 / 60.0)
+        self._account_non_trading = TokenBucketRateLimiter(capacity=25, refill_per_sec=25.0 / 60.0)
         self._account_trading = TokenBucketRateLimiter(capacity=100, refill_per_sec=100.0 / 60.0)
         self._historical = TokenBucketRateLimiter(capacity=100, refill_per_sec=10_000.0 / (7 * 24 * 3600))
-        # Price REST fallback shares the IG account non-trading limit (30/min)
-        # but gets its own bucket so it doesn't starve account_snapshot/positions.
-        self._price_rest = TokenBucketRateLimiter(capacity=15, refill_per_sec=15.0 / 60.0)
 
         # ---- Caches ----
         self._cache_lock = threading.Lock()
 
         # App non-trading
-        self._connectivity_cache: dict[str, CacheEntry] = {}  # key = f"{max_latency_ms}:{pong_timeout_sec}"
-        self._stream_health_cache: dict[str, CacheEntry] = {}  # key = f"{symbol}:{max_tick_age_sec}"
+        self._connectivity_cache: dict[str, CacheEntry] = {}
+        self._stream_health_cache: dict[str, CacheEntry] = {}
 
         # Account non-trading
         self._account_snapshot_cache = CacheEntry(ttl_sec=10.0)
-        self._symbol_spec_cache: dict[str, CacheEntry] = {}  # key = symbol
+        self._symbol_spec_cache: dict[str, CacheEntry] = {}
         self._managed_positions_cache = CacheEntry(ttl_sec=15.0)
-        self._managed_positions_args: tuple[Any, ...] | None = None
+
+        # Price REST cache — per-symbol, shared by workers and passive history
+        n = max(len(self._symbols), 1)
+        self._price_rest_ttl = self._PRICE_REST_TTL_BASE_SEC + self._PRICE_REST_TTL_PER_SYMBOL_SEC * n
+        self._price_cache: dict[str, CacheEntry] = {}
 
         # Historical
-        self._session_close_cache: dict[str, CacheEntry] = {}  # key = symbol
+        self._session_close_cache: dict[str, CacheEntry] = {}
         self._news_events_cache = CacheEntry(ttl_sec=300.0)
 
         # ---- Poller threads ----
@@ -199,7 +219,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
             entry = self._connectivity_cache.get(key)
             if entry and entry.is_fresh():
                 return entry.value
-        # Cache miss or stale — fetch inline with rate limiter
         self._app_non_trading.acquire(timeout_sec=10.0)
         result = self._broker.get_connectivity_status(max_latency_ms, pong_timeout_sec)
         with self._cache_lock:
@@ -257,7 +276,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         pending_opens: list[PendingOpen] | None = None,
         include_unmatched_preferred: bool = False,
     ) -> dict[str, Position]:
-        # This is called infrequently (every 30s from bot.py) — pass through with rate limiter
         self._account_non_trading.acquire(timeout_sec=15.0)
         return self._broker.get_managed_open_positions(
             magic_prefix,
@@ -323,27 +341,53 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         self._broker.modify_position(position, stop_loss, take_profit)
 
     # -----------------------------------------------------------------------
-    # Historical / market data (10,000 points/week) — cached or pass-through
+    # Price data — stream-first with REST fallback + per-symbol cache
     # -----------------------------------------------------------------------
 
     def get_price(self, symbol: str) -> PriceTick:
-        # get_price primarily uses Lightstreamer streaming (no REST rate limit).
-        # The IG client internally falls back to REST GET /markets/{epic} only
-        # when stream is stale.  That REST call counts against account
-        # non-trading (30/min) and app non-trading (60/min) — NOT historical.
-        #
-        # We peek at the IG client's stream tick cache.  If a fresh tick
-        # exists, return it without spending a rate-limiter token.  Only when
-        # a REST fallback is needed do we acquire from the account_non_trading
-        # bucket (30/min).
+        # 1. Try the Lightstreamer stream cache (free, no REST call)
         cached = self._peek_stream_tick(symbol)
         if cached is not None:
             return cached
-        # Stream miss — will hit REST.  Rate-limit via dedicated price bucket
-        # (15/min) to leave headroom for account snapshot/positions (15/min).
-        # Together they stay within the IG 30/min account non-trading limit.
-        self._price_rest.acquire(timeout_sec=15.0)
-        return self._broker.get_price(symbol)
+
+        # 2. Check per-symbol REST price cache
+        upper = symbol.upper()
+        with self._cache_lock:
+            entry = self._price_cache.get(upper)
+            if entry and entry.is_fresh():
+                return entry.value
+
+        # 3. Try to acquire a token for REST call
+        if self._account_non_trading.try_acquire():
+            try:
+                result = self._broker.get_price(symbol)
+                with self._cache_lock:
+                    self._price_cache[upper] = CacheEntry(
+                        value=result, fetched_at=time.time(), ttl_sec=self._price_rest_ttl,
+                    )
+                return result
+            except Exception:
+                # If REST fails, fall through to stale cache
+                pass
+
+        # 4. No tokens available — return stale cached price if any
+        with self._cache_lock:
+            entry = self._price_cache.get(upper)
+            if entry and entry.is_usable(max_stale_sec=120.0):
+                return entry.value
+
+        # 5. Last resort: block and wait for a token
+        self._account_non_trading.acquire(timeout_sec=30.0)
+        result = self._broker.get_price(symbol)
+        with self._cache_lock:
+            self._price_cache[upper] = CacheEntry(
+                value=result, fetched_at=time.time(), ttl_sec=self._price_rest_ttl,
+            )
+        return result
+
+    # -----------------------------------------------------------------------
+    # Historical / market data (10,000 points/week) — cached
+    # -----------------------------------------------------------------------
 
     def get_session_close_utc(self, symbol: str, now_ts: float) -> float | None:
         key = symbol
@@ -406,7 +450,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         """Periodically refreshes app non-trading caches."""
         while not self._stop.is_set():
             try:
-                # Refresh connectivity status for common args
                 try:
                     self._app_non_trading.acquire(timeout_sec=5.0)
                     result = self._broker.get_connectivity_status(500.0, 5.0)
@@ -417,7 +460,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
                 except Exception:
                     logger.debug("app_poller: connectivity_status fetch failed", exc_info=True)
 
-                # Refresh stream health per symbol
                 for symbol in self._symbols:
                     if self._stop.is_set():
                         return
@@ -455,7 +497,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
 
         while not self._stop.is_set():
             try:
-                # Account snapshot
                 try:
                     self._account_non_trading.acquire(timeout_sec=15.0)
                     result = self._broker.get_account_snapshot()
@@ -475,7 +516,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         """Periodically refreshes historical/market data caches."""
         while not self._stop.is_set():
             try:
-                # News events
                 try:
                     self._historical.acquire(timeout_sec=10.0)
                     now = time.time()
@@ -487,7 +527,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
                 except Exception:
                     logger.debug("historical_poller: news_events fetch failed", exc_info=True)
 
-                # Session close times per symbol (infrequent)
                 for symbol in self._symbols:
                     if self._stop.is_set():
                         return
