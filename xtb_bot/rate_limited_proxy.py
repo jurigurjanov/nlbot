@@ -131,9 +131,12 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
 
         # ---- Rate limiters (one per IG category) ----
         self._app_non_trading = TokenBucketRateLimiter(capacity=60, refill_per_sec=60.0 / 60.0)
-        self._account_non_trading = TokenBucketRateLimiter(capacity=30, refill_per_sec=30.0 / 60.0)
+        self._account_non_trading = TokenBucketRateLimiter(capacity=15, refill_per_sec=15.0 / 60.0)
         self._account_trading = TokenBucketRateLimiter(capacity=100, refill_per_sec=100.0 / 60.0)
         self._historical = TokenBucketRateLimiter(capacity=100, refill_per_sec=10_000.0 / (7 * 24 * 3600))
+        # Price REST fallback shares the IG account non-trading limit (30/min)
+        # but gets its own bucket so it doesn't starve account_snapshot/positions.
+        self._price_rest = TokenBucketRateLimiter(capacity=15, refill_per_sec=15.0 / 60.0)
 
         # ---- Caches ----
         self._cache_lock = threading.Lock()
@@ -325,9 +328,21 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
 
     def get_price(self, symbol: str) -> PriceTick:
         # get_price primarily uses Lightstreamer streaming (no REST rate limit).
-        # The IG client internally falls back to REST only when stream is stale.
-        # We rate-limit at the proxy level to protect the historical budget.
-        self._historical.acquire(timeout_sec=10.0)
+        # The IG client internally falls back to REST GET /markets/{epic} only
+        # when stream is stale.  That REST call counts against account
+        # non-trading (30/min) and app non-trading (60/min) — NOT historical.
+        #
+        # We peek at the IG client's stream tick cache.  If a fresh tick
+        # exists, return it without spending a rate-limiter token.  Only when
+        # a REST fallback is needed do we acquire from the account_non_trading
+        # bucket (30/min).
+        cached = self._peek_stream_tick(symbol)
+        if cached is not None:
+            return cached
+        # Stream miss — will hit REST.  Rate-limit via dedicated price bucket
+        # (15/min) to leave headroom for account snapshot/positions (15/min).
+        # Together they stay within the IG 30/min account non-trading limit.
+        self._price_rest.acquire(timeout_sec=15.0)
         return self._broker.get_price(symbol)
 
     def get_session_close_utc(self, symbol: str, now_ts: float) -> float | None:
@@ -351,6 +366,28 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         with self._cache_lock:
             self._news_events_cache = CacheEntry(value=result, fetched_at=time.time(), ttl_sec=300.0)
         return result
+
+    # -----------------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------------
+
+    def _peek_stream_tick(self, symbol: str) -> PriceTick | None:
+        """Try to read a fresh tick from the IG client's stream cache.
+
+        Returns ``None`` if the broker has no stream cache (e.g. XTB) or if
+        the cached tick is stale.  This avoids spending a rate-limiter token
+        when the Lightstreamer stream is healthy.
+        """
+        get_cached = getattr(self._broker, "_get_cached_tick_locked", None)
+        lock = getattr(self._broker, "_lock", None)
+        if get_cached is None or lock is None:
+            return None
+        max_age = getattr(self._broker, "stream_tick_max_age_sec", 15.0)
+        try:
+            with lock:
+                return get_cached(symbol.upper(), max_age)
+        except Exception:
+            return None
 
     # -----------------------------------------------------------------------
     # Attribute proxy — forward any attribute access to the real broker
