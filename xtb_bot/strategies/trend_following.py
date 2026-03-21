@@ -456,7 +456,15 @@ class TrendFollowingStrategy(Strategy):
 
         if is_crypto:
             if atr_pct is None:
-                return self._hold("crypto_atr_unavailable")
+                return self._hold(
+                    "crypto_atr_unavailable",
+                    {
+                        "atr_raw": atr,
+                        "atr_window": self.atr_window,
+                        "prices_len": len(prices),
+                        "prices_needed": self.atr_window + 1,
+                    },
+                )
             if atr_pct < self.crypto_min_atr_pct:
                 return self._hold(
                     "crypto_atr_below_threshold",
