@@ -446,10 +446,10 @@ class TrendFollowingStrategy(Strategy):
         atr = atr_wilder(prices, self.atr_window)
         pullback_distance_atr = (
             abs(last_price - fast_now) / max(atr, 1e-9)
-            if atr is not None and atr > 0
+            if atr is not None
             else None
         )
-        atr_pct = (atr / max(abs(last_price), 1e-9) * 100.0) if atr is not None and atr > 0 else None
+        atr_pct = (atr / max(abs(last_price), 1e-9) * 100.0) if atr is not None else None
         is_crypto = self._is_crypto_symbol(ctx.symbol)
         max_pullback_distance_atr = self.pullback_max_distance_atr
         if is_crypto and self.crypto_max_pullback_distance_atr > 0:
