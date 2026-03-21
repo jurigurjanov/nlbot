@@ -375,6 +375,13 @@ class TrendFollowingStrategy(Strategy):
         )
 
     def generate_signal(self, ctx: StrategyContext) -> Signal:
+        signal = self._generate_signal_impl(ctx)
+        if signal.side == Side.HOLD and getattr(self, "_last_fast_ema", None) is not None:
+            signal.metadata.setdefault("fast_ema", self._last_fast_ema)
+            signal.metadata.setdefault("slow_ema", self._last_slow_ema)
+        return signal
+
+    def _generate_signal_impl(self, ctx: StrategyContext) -> Signal:
         prices: list[float] = []
         invalid_prices = 0
         for raw in ctx.prices:
@@ -415,6 +422,8 @@ class TrendFollowingStrategy(Strategy):
 
         fast_now = self._ema(prices, self.fast_ema_window)
         slow_now = self._ema(prices, self.slow_ema_window)
+        self._last_fast_ema = fast_now
+        self._last_slow_ema = slow_now
         fast_prev = self._ema(prices[:-1], self.fast_ema_window)
         slow_prev = self._ema(prices[:-1], self.slow_ema_window)
         fast_slope_ratio = self._slope_ratio(fast_now, fast_prev)

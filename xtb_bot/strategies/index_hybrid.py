@@ -519,6 +519,13 @@ class IndexHybridStrategy(Strategy):
         )
 
     def generate_signal(self, ctx: StrategyContext) -> Signal:
+        signal = self._generate_signal_impl(ctx)
+        if signal.side == Side.HOLD and getattr(self, "_last_fast_ema", None) is not None:
+            signal.metadata.setdefault("fast_ema", self._last_fast_ema)
+            signal.metadata.setdefault("slow_ema", self._last_slow_ema)
+        return signal
+
+    def _generate_signal_impl(self, ctx: StrategyContext) -> Signal:
         if not self._is_index_symbol(ctx.symbol):
             return self._hold("not_index_symbol", self.stop_loss_pips, self.take_profit_pips)
         if self.require_context_tick_size and ctx.tick_size in (None, 0.0):
@@ -540,6 +547,8 @@ class IndexHybridStrategy(Strategy):
 
         fast_now = self._ema(prices, self.fast_ema_window)
         slow_now = self._ema(prices, self.slow_ema_window)
+        self._last_fast_ema = fast_now
+        self._last_slow_ema = slow_now
         ema_gap_ratio = abs(fast_now - slow_now) / max(abs(slow_now), 1e-9)
         breakout_up, breakout_down, channel_upper, channel_lower = self._donchian_breakout(prices)
         last = float(prices[-1])

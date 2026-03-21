@@ -608,7 +608,11 @@ class G1Strategy(Strategy):
 
     def generate_signal(self, ctx: StrategyContext) -> Signal:
         with self._signal_lock:
-            return self._generate_signal_locked(ctx)
+            signal = self._generate_signal_locked(ctx)
+        if signal.side == Side.HOLD and getattr(self, "_last_fast_ema", None) is not None:
+            signal.metadata.setdefault("fast_ema", self._last_fast_ema)
+            signal.metadata.setdefault("slow_ema", self._last_slow_ema)
+        return signal
 
     def _generate_signal_locked(self, ctx: StrategyContext) -> Signal:
         raw_prices = [float(value) for value in ctx.prices]
@@ -639,6 +643,8 @@ class G1Strategy(Strategy):
 
         fast_prev, fast_now = self._ema_last_two(prices, profile.fast_ema_window)
         slow_prev, slow_now = self._ema_last_two(prices, profile.slow_ema_window)
+        self._last_fast_ema = fast_now
+        self._last_slow_ema = slow_now
         fast_slope_ratio = self._slope_ratio(fast_now, fast_prev)
         slow_slope_ratio = self._slope_ratio(slow_now, slow_prev)
         ema_gap_ratio = abs(fast_now - slow_now) / max(abs(slow_now), 1e-9)

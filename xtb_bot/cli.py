@@ -481,7 +481,7 @@ def _show_trades(storage_path: Path, limit: int, open_only: bool = False, strate
             f"""
             SELECT
                 position_id, symbol, side, volume, open_price, stop_loss, take_profit,
-                opened_at{confidence_select}, status, close_price, closed_at, pnl, thread_name, strategy, mode
+                opened_at{confidence_select}, status, close_price, closed_at, pnl, thread_name, strategy, mode, updated_at
             FROM trades
             {where_clause}
             ORDER BY updated_at DESC
@@ -512,12 +512,25 @@ def _show_trades(storage_path: Path, limit: int, open_only: bool = False, strate
         strategy = str(item.get("strategy") or "-")
         mode = str(item.get("mode") or "-")
         position_id = str(item.get("position_id") or "-")
+        updated_at_ts = float(item.get("updated_at") or 0.0)
+        now_ts = time.time()
+        age_suffix = ""
+        if updated_at_ts > 0:
+            age_sec = now_ts - updated_at_ts
+            if age_sec < 60:
+                age_suffix = f" (updated {age_sec:.0f}s ago)"
+            elif age_sec < 3600:
+                age_suffix = f" (updated {age_sec / 60:.0f}m ago)"
+            else:
+                age_suffix = f" (updated {age_sec / 3600:.1f}h ago)"
+            if status == "OPEN" and age_sec > 30:
+                age_suffix += " STALE"
         confidence_gate, confidence_threshold = _confidence_gate_status(strategy, mode, entry_confidence)
         print(
             f"[{opened_at}] {status} {symbol} {side} | "
             f"volume={volume:.4f} open={open_price:.5f} sl={stop_loss:.5f} tp={take_profit:.5f} "
             f"conf={entry_confidence:.3f} conf_gate={confidence_gate}@{confidence_threshold:.3f} "
-            f"pnl={pnl:.2f} strategy={strategy} mode={mode} id={position_id}"
+            f"pnl={pnl:.2f} strategy={strategy} mode={mode} id={position_id}{age_suffix}"
         )
         closed_at_ts = item.get("closed_at")
         if closed_at_ts is not None:
