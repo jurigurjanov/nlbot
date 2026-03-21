@@ -2797,6 +2797,10 @@ class SymbolWorker(threading.Thread):
                     return
                 if not self._is_broker_position_missing_error(error_text):
                     raise
+                # Position was already closed by broker (e.g. SL/TP hit).
+                # Try to fetch close sync so we get the real close_price and
+                # realized_pnl from the broker instead of inferring locally.
+                broker_sync = self._get_broker_close_sync(position)
                 inferred_price, inferred_reason = self._infer_missing_position_close(
                     position,
                     close_price,
@@ -3034,6 +3038,19 @@ class SymbolWorker(threading.Thread):
             return None
         metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
 
+        # ------------------------------------------------------------------
+        # Global trend invalidation: if the strategy exposes fast/slow MA
+        # values in metadata, close when the MA relationship has inverted
+        # relative to the position side.  Works for ALL strategies.
+        # ------------------------------------------------------------------
+        fast_ma = self._metadata_number(metadata, "fast_ema") or self._metadata_number(metadata, "fast_ma")
+        slow_ma = self._metadata_number(metadata, "slow_ema") or self._metadata_number(metadata, "slow_ma")
+        if fast_ma is not None and slow_ma is not None:
+            if position.side == Side.BUY and fast_ma <= slow_ma:
+                return f"strategy_exit:{self.strategy_name}:trend_invalidated"
+            if position.side == Side.SELL and fast_ma >= slow_ma:
+                return f"strategy_exit:{self.strategy_name}:trend_invalidated"
+
         if self.strategy_name == "mean_reversion":
             if metadata.get("indicator") == "mean_reversion" and metadata.get("exit_hint") == "close_on_mean_reversion":
                 return "strategy_exit:mean_reversion:mean_reverted"
@@ -3064,14 +3081,6 @@ class SymbolWorker(threading.Thread):
                 return None
 
             reason = str(metadata.get("reason") or "").strip().lower()
-            fast_ema = self._metadata_number(metadata, "fast_ema")
-            slow_ema = self._metadata_number(metadata, "slow_ema")
-            if fast_ema is not None and slow_ema is not None:
-                if position.side == Side.BUY and fast_ema <= slow_ema:
-                    return "strategy_exit:g1:loss_guard_ema_invalidated"
-                if position.side == Side.SELL and fast_ema >= slow_ema:
-                    return "strategy_exit:g1:loss_guard_ema_invalidated"
-
             if self.g1_protective_exit_allow_adx_regime_loss and reason == "adx_below_threshold":
                 adx_regime_active_after = self._metadata_bool(metadata, "adx_regime_active_after")
                 if adx_regime_active_after is False:

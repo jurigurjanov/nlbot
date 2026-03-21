@@ -791,13 +791,13 @@ def test_g1_dynamic_exit_reason_triggers_on_ema_invalidation_near_stop(tmp_path)
         )
         signal = worker._strategy_exit_signal()
         reason = worker._strategy_dynamic_exit_reason(position, bid=1.09918, ask=1.09920, signal=signal)
-        assert reason == "strategy_exit:g1:loss_guard_ema_invalidated"
+        assert reason == "strategy_exit:g1:trend_invalidated"
     finally:
         worker.broker.close()
         worker.store.close()
 
 
-def test_g1_dynamic_exit_reason_does_not_trigger_when_loss_is_not_large_enough(tmp_path):
+def test_g1_dynamic_exit_reason_triggers_on_ema_invalidation_small_loss(tmp_path):
     worker = _make_worker(
         tmp_path,
         strategy_name="g1",
@@ -836,13 +836,13 @@ def test_g1_dynamic_exit_reason_does_not_trigger_when_loss_is_not_large_enough(t
         )
         signal = worker._strategy_exit_signal()
         reason = worker._strategy_dynamic_exit_reason(position, bid=1.09925, ask=1.09927, signal=signal)
-        assert reason is None
+        assert reason == "strategy_exit:g1:trend_invalidated"
     finally:
         worker.broker.close()
         worker.store.close()
 
 
-def test_g1_dynamic_exit_reason_does_not_trigger_while_position_is_in_profit(tmp_path):
+def test_g1_dynamic_exit_reason_triggers_on_ema_invalidation_while_in_profit(tmp_path):
     worker = _make_worker(
         tmp_path,
         strategy_name="g1",
@@ -881,7 +881,7 @@ def test_g1_dynamic_exit_reason_does_not_trigger_while_position_is_in_profit(tmp
         )
         signal = worker._strategy_exit_signal()
         reason = worker._strategy_dynamic_exit_reason(position, bid=1.1002, ask=1.1004, signal=signal)
-        assert reason is None
+        assert reason == "strategy_exit:g1:trend_invalidated"
     finally:
         worker.broker.close()
         worker.store.close()

@@ -389,6 +389,13 @@ class MomentumStrategy(Strategy):
         return current_volume >= threshold, payload
 
     def generate_signal(self, ctx: StrategyContext) -> Signal:
+        signal = self._generate_signal_impl(ctx)
+        if signal.side == Side.HOLD and getattr(self, "_last_fast_ma", None) is not None:
+            signal.metadata.setdefault("fast_ma", self._last_fast_ma)
+            signal.metadata.setdefault("slow_ma", self._last_slow_ma)
+        return signal
+
+    def _generate_signal_impl(self, ctx: StrategyContext) -> Signal:
         prices = ctx.prices
         timeframe_sec = self._resolve_timeframe_sec(ctx)
         effective_confirm_bars = self._effective_confirm_bars(timeframe_sec)
@@ -443,6 +450,8 @@ class MomentumStrategy(Strategy):
             fast_now, slow_now, fast_prev, slow_prev, diffs = self._ma_snapshot_sma(
                 prices, effective_confirm_bars + 1
             )
+        self._last_fast_ma = fast_now
+        self._last_slow_ma = slow_now
         confirmation_tail = diffs[-max(1, effective_confirm_bars) :]
         end = diffs[-1]
         current_price = float(prices[-1])

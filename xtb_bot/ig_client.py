@@ -244,6 +244,10 @@ def _as_float(value: Any, default: float = 0.0) -> float:
             elif "," in text:
                 text = text.replace(",", ".")
             filtered = "".join(ch for ch in text if ch.isdigit() or ch in {".", "-", "+", "e", "E"})
+            # Strip leading 'e'/'E' that is a currency prefix (e.g. "E-56.81"
+            # from IG's profitAndLoss), not part of scientific notation.
+            if filtered and filtered[0] in {"e", "E"}:
+                filtered = filtered.lstrip("eE")
             if filtered in {"", "-", "+", ".", "-.", "+."}:
                 return default
             try:
