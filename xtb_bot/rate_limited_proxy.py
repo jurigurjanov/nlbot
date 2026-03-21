@@ -129,10 +129,10 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
     """
 
     # Default TTLs for per-symbol price REST cache.
-    # With 30 req/min budget, N symbols can each be refreshed every
-    # ceil(N * 2) seconds.  E.g. 6 symbols → one REST per 12s per symbol.
-    _PRICE_REST_TTL_BASE_SEC = 4.0  # minimum TTL per symbol
-    _PRICE_REST_TTL_PER_SYMBOL_SEC = 2.0  # added per additional symbol
+    # With ~20 req/min available for prices (25/min minus account overhead),
+    # N symbols can each be refreshed every ceil(N * 3) seconds.
+    _PRICE_REST_TTL_BASE_SEC = 5.0  # minimum TTL per symbol
+    _PRICE_REST_TTL_PER_SYMBOL_SEC = 3.0  # added per additional symbol
 
     def __init__(
         self,
@@ -148,11 +148,14 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         # We use a SINGLE bucket for all account non-trading requests
         # (get_price REST, get_account_snapshot, get_symbol_spec, etc.)
         # because IG counts them all against the same 30/min limit.
-        # Capacity is set below the limit to leave headroom.
-        self._app_non_trading = TokenBucketRateLimiter(capacity=50, refill_per_sec=50.0 / 60.0)
-        self._account_non_trading = TokenBucketRateLimiter(capacity=25, refill_per_sec=25.0 / 60.0)
-        self._account_trading = TokenBucketRateLimiter(capacity=100, refill_per_sec=100.0 / 60.0)
-        self._historical = TokenBucketRateLimiter(capacity=100, refill_per_sec=10_000.0 / (7 * 24 * 3600))
+        #
+        # Capacity (burst) is kept LOW to prevent startup burst from
+        # tripping IG's sliding-window rate limit.  Refill gives the
+        # sustained rate (well below 30/min to leave headroom).
+        self._app_non_trading = TokenBucketRateLimiter(capacity=5, refill_per_sec=50.0 / 60.0)
+        self._account_non_trading = TokenBucketRateLimiter(capacity=5, refill_per_sec=25.0 / 60.0)
+        self._account_trading = TokenBucketRateLimiter(capacity=10, refill_per_sec=100.0 / 60.0)
+        self._historical = TokenBucketRateLimiter(capacity=10, refill_per_sec=10_000.0 / (7 * 24 * 3600))
 
         # ---- Caches ----
         self._cache_lock = threading.Lock()
