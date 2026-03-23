@@ -128,12 +128,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         Shared stop event; when set, pollers shut down.
     """
 
-    # Default TTLs for per-symbol price REST cache.
-    # With ~20 req/min available for prices (25/min minus account overhead),
-    # N symbols can each be refreshed every ceil(N * 3) seconds.
-    _PRICE_REST_TTL_BASE_SEC = 5.0  # minimum TTL per symbol
-    _PRICE_REST_TTL_PER_SYMBOL_SEC = 3.0  # added per additional symbol
-
     def __init__(
         self,
         real_broker: BaseBrokerClient,
@@ -168,11 +162,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         self._account_snapshot_cache = CacheEntry(ttl_sec=10.0)
         self._symbol_spec_cache: dict[str, CacheEntry] = {}
         self._managed_positions_cache = CacheEntry(ttl_sec=15.0)
-
-        # Price REST cache — per-symbol, shared by workers and passive history
-        n = max(len(self._symbols), 1)
-        self._price_rest_ttl = self._PRICE_REST_TTL_BASE_SEC + self._PRICE_REST_TTL_PER_SYMBOL_SEC * n
-        self._price_cache: dict[str, CacheEntry] = {}
 
         # Historical
         self._session_close_cache: dict[str, CacheEntry] = {}
@@ -348,45 +337,14 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
     # -----------------------------------------------------------------------
 
     def get_price(self, symbol: str) -> PriceTick:
-        # 1. Try the Lightstreamer stream cache (free, no REST call)
-        cached = self._peek_stream_tick(symbol)
-        if cached is not None:
-            return cached
-
-        # 2. Check per-symbol REST price cache
-        upper = symbol.upper()
-        with self._cache_lock:
-            entry = self._price_cache.get(upper)
-            if entry and entry.is_fresh():
-                return entry.value
-
-        # 3. Try to acquire a token for REST call
-        if self._account_non_trading.try_acquire():
-            try:
-                result = self._broker.get_price(symbol)
-                with self._cache_lock:
-                    self._price_cache[upper] = CacheEntry(
-                        value=result, fetched_at=time.time(), ttl_sec=self._price_rest_ttl,
-                    )
-                return result
-            except Exception:
-                # If REST fails, fall through to stale cache
-                pass
-
-        # 4. No tokens available — return stale cached price if any
-        with self._cache_lock:
-            entry = self._price_cache.get(upper)
-            if entry and entry.is_usable(max_stale_sec=120.0):
-                return entry.value
-
-        # 5. Last resort: block and wait for a token
-        self._account_non_trading.acquire(timeout_sec=30.0)
-        result = self._broker.get_price(symbol)
-        with self._cache_lock:
-            self._price_cache[upper] = CacheEntry(
-                value=result, fetched_at=time.time(), ttl_sec=self._price_rest_ttl,
-            )
-        return result
+        # Let the IG client handle stream-vs-REST logic internally.
+        # It checks Lightstreamer first, waits for fresh tick, falls back
+        # to REST only when needed.  The IG client already has its own
+        # rest_market_min_interval_sec throttle for REST calls.
+        #
+        # The proxy does NOT intercept the stream cache — the IG client's
+        # get_price() is the single source of truth for tick freshness.
+        return self._broker.get_price(symbol)
 
     # -----------------------------------------------------------------------
     # Historical / market data (10,000 points/week) — cached
@@ -417,24 +375,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
     # -----------------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------------
-
-    def _peek_stream_tick(self, symbol: str) -> PriceTick | None:
-        """Try to read a fresh tick from the IG client's stream cache.
-
-        Returns ``None`` if the broker has no stream cache (e.g. XTB) or if
-        the cached tick is stale.  This avoids spending a rate-limiter token
-        when the Lightstreamer stream is healthy.
-        """
-        get_cached = getattr(self._broker, "_get_cached_tick_locked", None)
-        lock = getattr(self._broker, "_lock", None)
-        if get_cached is None or lock is None:
-            return None
-        max_age = getattr(self._broker, "stream_tick_max_age_sec", 15.0)
-        try:
-            with lock:
-                return get_cached(symbol.upper(), max_age)
-        except Exception:
-            return None
 
     # -----------------------------------------------------------------------
     # Attribute proxy — forward any attribute access to the real broker
