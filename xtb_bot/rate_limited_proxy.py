@@ -146,17 +146,12 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         # Capacity (burst) is kept LOW to prevent startup burst from
         # tripping IG's sliding-window rate limit.  Refill gives the
         # sustained rate (well below 30/min to leave headroom).
-        self._app_non_trading = TokenBucketRateLimiter(capacity=5, refill_per_sec=50.0 / 60.0)
         self._account_non_trading = TokenBucketRateLimiter(capacity=5, refill_per_sec=25.0 / 60.0)
         self._account_trading = TokenBucketRateLimiter(capacity=10, refill_per_sec=100.0 / 60.0)
         self._historical = TokenBucketRateLimiter(capacity=10, refill_per_sec=10_000.0 / (7 * 24 * 3600))
 
         # ---- Caches ----
         self._cache_lock = threading.Lock()
-
-        # App non-trading
-        self._connectivity_cache: dict[str, CacheEntry] = {}
-        self._stream_health_cache: dict[str, CacheEntry] = {}
 
         # Account non-trading
         self._account_snapshot_cache = CacheEntry(ttl_sec=10.0)
@@ -187,7 +182,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
 
     def _start_pollers(self) -> None:
         poller_specs = [
-            ("app_poller", self._app_poller_loop),
             ("account_poller", self._account_poller_loop),
             ("historical_poller", self._historical_poller_loop),
         ]
@@ -206,32 +200,16 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         max_latency_ms: float,
         pong_timeout_sec: float,
     ) -> ConnectivityStatus:
-        key = f"{max_latency_ms}:{pong_timeout_sec}"
-        with self._cache_lock:
-            entry = self._connectivity_cache.get(key)
-            if entry and entry.is_fresh():
-                return entry.value
-        self._app_non_trading.acquire(timeout_sec=10.0)
-        result = self._broker.get_connectivity_status(max_latency_ms, pong_timeout_sec)
-        with self._cache_lock:
-            self._connectivity_cache[key] = CacheEntry(value=result, fetched_at=time.time(), ttl_sec=5.0)
-        return result
+        # No rate limiting — this is a Lightstreamer ping/pong, NOT a REST call.
+        return self._broker.get_connectivity_status(max_latency_ms, pong_timeout_sec)
 
     def get_stream_health_status(
         self,
         symbol: str | None,
         max_tick_age_sec: float,
     ) -> StreamHealthStatus:
-        key = f"{symbol}:{max_tick_age_sec}"
-        with self._cache_lock:
-            entry = self._stream_health_cache.get(key)
-            if entry and entry.is_fresh():
-                return entry.value
-        self._app_non_trading.acquire(timeout_sec=10.0)
-        result = self._broker.get_stream_health_status(symbol, max_tick_age_sec)
-        with self._cache_lock:
-            self._stream_health_cache[key] = CacheEntry(value=result, fetched_at=time.time(), ttl_sec=5.0)
-        return result
+        # No rate limiting — this checks internal stream state, NOT a REST call.
+        return self._broker.get_stream_health_status(symbol, max_tick_age_sec)
 
     # -----------------------------------------------------------------------
     # Account non-trading (30/min) — cached or pass-through
@@ -373,10 +351,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
         return result
 
     # -----------------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------------
-
-    # -----------------------------------------------------------------------
     # Attribute proxy — forward any attribute access to the real broker
     # so that code accessing IG-specific attrs (e.g. ig_client internals
     # used by worker/bot) still works.
@@ -388,39 +362,6 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
     # -----------------------------------------------------------------------
     # Background pollers
     # -----------------------------------------------------------------------
-
-    def _app_poller_loop(self) -> None:
-        """Periodically refreshes app non-trading caches."""
-        while not self._stop.is_set():
-            try:
-                try:
-                    self._app_non_trading.acquire(timeout_sec=5.0)
-                    result = self._broker.get_connectivity_status(500.0, 5.0)
-                    with self._cache_lock:
-                        self._connectivity_cache["500.0:5.0"] = CacheEntry(
-                            value=result, fetched_at=time.time(), ttl_sec=5.0,
-                        )
-                except Exception:
-                    logger.debug("app_poller: connectivity_status fetch failed", exc_info=True)
-
-                for symbol in self._symbols:
-                    if self._stop.is_set():
-                        return
-                    try:
-                        self._app_non_trading.acquire(timeout_sec=5.0)
-                        result = self._broker.get_stream_health_status(symbol, 30.0)
-                        key = f"{symbol}:30.0"
-                        with self._cache_lock:
-                            self._stream_health_cache[key] = CacheEntry(
-                                value=result, fetched_at=time.time(), ttl_sec=5.0,
-                            )
-                    except Exception:
-                        logger.debug("app_poller: stream_health fetch failed for %s", symbol, exc_info=True)
-
-            except Exception:
-                logger.warning("app_poller: unexpected error", exc_info=True)
-
-            self._stop.wait(timeout=5.0)
 
     def _account_poller_loop(self) -> None:
         """Periodically refreshes account non-trading caches."""
