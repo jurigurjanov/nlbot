@@ -61,7 +61,9 @@ class SymbolSpec:
             return 0.0
         step = self.lot_step if self.lot_step > 0 else 0.01
         normalized = round(raw / step) * step
-        clamped = min(max(normalized, self.lot_min), self.lot_max)
+        clamped = max(normalized, self.lot_min)
+        if self.lot_max > 0:
+            clamped = min(clamped, self.lot_max)
         return round(clamped, self.lot_precision)
 
 

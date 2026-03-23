@@ -364,23 +364,16 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
     # -----------------------------------------------------------------------
 
     def _account_poller_loop(self) -> None:
-        """Periodically refreshes account non-trading caches."""
-        # Pre-fetch symbol specs on startup
-        for symbol in self._symbols:
-            if self._stop.is_set():
-                return
-            try:
-                self._account_non_trading.acquire(timeout_sec=15.0)
-                result = self._broker.get_symbol_spec(symbol)
-                with self._cache_lock:
-                    self._symbol_spec_cache[symbol] = CacheEntry(
-                        value=result, fetched_at=time.time(), ttl_sec=600.0,
-                    )
-            except Exception:
-                logger.warning("account_poller: symbol_spec fetch failed for %s", symbol, exc_info=True)
+        """Periodically refreshes account non-trading caches.
 
+        Symbol specs are NOT pre-fetched here — workers fetch them on
+        demand via ``get_symbol_spec()`` which caches for 600 s.
+        This avoids burning through the IG rate limit at startup when
+        many symbols are configured.
+        """
         while not self._stop.is_set():
             try:
+                # Account snapshot — main payload of this poller
                 try:
                     self._account_non_trading.acquire(timeout_sec=15.0)
                     result = self._broker.get_account_snapshot()
@@ -397,7 +390,11 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
             self._stop.wait(timeout=10.0)
 
     def _historical_poller_loop(self) -> None:
-        """Periodically refreshes historical/market data caches."""
+        """Periodically refreshes news events cache.
+
+        Session close times and symbol specs are fetched lazily (on demand)
+        and cached with long TTLs, so they don't need a poller.
+        """
         while not self._stop.is_set():
             try:
                 try:
@@ -411,25 +408,7 @@ class RateLimitedBrokerProxy(BaseBrokerClient):
                 except Exception:
                     logger.debug("historical_poller: news_events fetch failed", exc_info=True)
 
-                for symbol in self._symbols:
-                    if self._stop.is_set():
-                        return
-                    with self._cache_lock:
-                        entry = self._session_close_cache.get(symbol)
-                        if entry and entry.is_fresh():
-                            continue
-                    try:
-                        self._historical.acquire(timeout_sec=10.0)
-                        now = time.time()
-                        result = self._broker.get_session_close_utc(symbol, now)
-                        with self._cache_lock:
-                            self._session_close_cache[symbol] = CacheEntry(
-                                value=result, fetched_at=time.time(), ttl_sec=3600.0,
-                            )
-                    except Exception:
-                        logger.debug("historical_poller: session_close fetch failed for %s", symbol, exc_info=True)
-
             except Exception:
                 logger.warning("historical_poller: unexpected error", exc_info=True)
 
-            self._stop.wait(timeout=60.0)
+            self._stop.wait(timeout=300.0)
