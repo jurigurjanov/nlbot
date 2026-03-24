@@ -2202,6 +2202,27 @@ class IgApiClient(BaseBrokerClient):
         )
         if cache_symbol:
             with self._lock:
+                old_spec = self._symbol_spec_cache.get(upper)
+                if old_spec is not None:
+                    old_meta = old_spec.metadata if isinstance(old_spec.metadata, dict) else {}
+                    # Preserve adaptive lot_step learned from broker rejections.
+                    if old_meta.get("lot_step_source") == "adaptive_increment_reject":
+                        adaptive_step = float(old_spec.lot_step)
+                        if adaptive_step > float(spec.lot_step):
+                            spec.lot_step = adaptive_step
+                            spec.lot_precision = max(0, _precision_from_step(adaptive_step))
+                            new_meta = spec.metadata if isinstance(spec.metadata, dict) else {}
+                            new_meta["lot_step_source"] = "adaptive_increment_reject"
+                            new_meta["lot_step_adaptive_preserved"] = True
+                    # Preserve adaptive lot_min learned from broker rejections.
+                    old_lot_min_source = str(old_meta.get("lot_min_source") or "")
+                    if old_lot_min_source.startswith("adaptive_reject_"):
+                        adaptive_min = float(old_spec.lot_min)
+                        if adaptive_min > float(spec.lot_min):
+                            spec.lot_min = adaptive_min
+                            new_meta = spec.metadata if isinstance(spec.metadata, dict) else {}
+                            new_meta["lot_min_source"] = old_lot_min_source
+                            new_meta["lot_min_adaptive_preserved"] = True
                 self._symbol_spec_cache[upper] = spec
         return spec
 
