@@ -1564,7 +1564,7 @@ def test_ig_request_allows_trade_critical_delete_during_parallel_critical_trade(
         )
         assert body == {}
         assert calls
-        assert calls[0][0] == "DELETE"
+        assert calls[0][0] == "POST"  # DELETE with body → POST + _method:DELETE header
     finally:
         release_guard.set()
         holder.join(timeout=2.0)

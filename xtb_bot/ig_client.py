@@ -936,9 +936,14 @@ class IgApiClient(BaseBrokerClient):
         if payload is not None:
             data_bytes = json.dumps(payload).encode("utf-8")
 
+        actual_method = method.upper()
+        if actual_method == "DELETE" and data_bytes is not None:
+            actual_method = "POST"
+            headers["_method"] = "DELETE"
+
         req = request.Request(
             url=base,
-            method=method.upper(),
+            method=actual_method,
             data=data_bytes,
             headers=headers,
         )

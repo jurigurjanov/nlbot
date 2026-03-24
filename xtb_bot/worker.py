@@ -2054,6 +2054,16 @@ class SymbolWorker(threading.Thread):
             position.stop_loss = old_stop
             raise
         self.store.upsert_trade(position, self.name, self.strategy_name, self.mode.value)
+        self.store.record_position_audit(
+            position_id=position.position_id,
+            symbol=position.symbol,
+            operation="modify_sl",
+            side=position.side.value,
+            volume=position.volume,
+            stop_loss=new_stop_loss,
+            take_profit=position.take_profit,
+            detail={"old_stop_loss": old_stop, "progress_to_tp": round(progress, 4)},
+        )
         trailing_settings = self._effective_trailing_settings(position)
         self.store.record_event(
             "WARN",
@@ -2421,6 +2431,16 @@ class SymbolWorker(threading.Thread):
             position.stop_loss = old_stop
             raise
         self.store.upsert_trade(position, self.name, self.strategy_name, self.mode.value)
+        self.store.record_position_audit(
+            position_id=position.position_id,
+            symbol=position.symbol,
+            operation="modify_sl_breakeven",
+            side=position.side.value,
+            volume=position.volume,
+            stop_loss=new_stop_loss,
+            take_profit=position.take_profit,
+            detail={"old_stop_loss": old_stop, "trigger": trigger},
+        )
         self.store.record_event(
             "WARN",
             self.symbol,
@@ -2612,6 +2632,18 @@ class SymbolWorker(threading.Thread):
             )
             self.position_book.upsert(position)
             self.store.upsert_trade(position, self.name, self.strategy_name, self.mode.value)
+            self.store.record_position_audit(
+                position_id=position_id,
+                symbol=self.symbol,
+                operation="open",
+                side=side.value,
+                volume=volume,
+                price=entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                deal_reference=deal_reference,
+                detail={"confidence": confidence, "strategy": self.strategy_name, "mode": self.mode.value},
+            )
             if self.mode == RunMode.EXECUTION and deal_reference:
                 conflicting_position_id = self.store.bind_trade_deal_reference(position_id, deal_reference)
                 if conflicting_position_id:
@@ -2700,6 +2732,18 @@ class SymbolWorker(threading.Thread):
             self._pending_close_retry_until_ts = 0.0
         self.position_book.remove_by_id(position.position_id)
         self.store.upsert_trade(position, self.name, self.strategy_name, self.mode.value)
+        self.store.record_position_audit(
+            position_id=position.position_id,
+            symbol=position.symbol,
+            operation="close",
+            side=position.side.value,
+            volume=position.volume,
+            price=final_close_price,
+            stop_loss=position.stop_loss,
+            take_profit=position.take_profit,
+            pnl=position.pnl,
+            detail={"reason": reason, "broker_sync": broker_sync},
+        )
         payload: dict[str, object] = {
             "position_id": position.position_id,
             "reason": reason,
