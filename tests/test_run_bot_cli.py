@@ -249,10 +249,11 @@ def test_main_show_active_schedule_passes_symbols_and_force_symbols(monkeypatch)
 def test_main_show_trade_reasons_calls_helper(monkeypatch):
     captured: dict[str, object] = {}
 
-    def fake_show_trade_reasons(storage_path, limit, window):
+    def fake_show_trade_reasons(storage_path, limit, window, **kwargs):
         captured["storage_path"] = storage_path
         captured["limit"] = limit
         captured["window"] = window
+        captured.update(kwargs)
         return 1
 
     monkeypatch.setattr(run_bot, "_load_dotenv", lambda path: None)

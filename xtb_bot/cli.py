@@ -190,9 +190,30 @@ def parse_args() -> argparse.Namespace:
         help=(
             "SQLite state path override for "
             "--show-alerts/--show-balance/--show-status/--show-active-schedule/--show-trades/--show-ig-allowance/"
-            "--show-trade-confidence/--show-trade-reasons/--reset-risk-anchor/"
+            "--show-trade-confidence/--show-trade-reasons/--show-position-audit/--reset-risk-anchor/"
             "--cleanup-incompatible-open-trades/--sync-open-positions"
         ),
+    )
+    parser.add_argument(
+        "--show-position-audit",
+        action="store_true",
+        help="Show position audit log (lifecycle events for open/close/update operations)",
+    )
+    parser.add_argument(
+        "--audit-limit",
+        type=int,
+        default=50,
+        help="Max audit rows to print (default: 50)",
+    )
+    parser.add_argument(
+        "--audit-symbol",
+        default=None,
+        help="Filter audit log by symbol (e.g. USDCHF)",
+    )
+    parser.add_argument(
+        "--audit-position-id",
+        default=None,
+        help="Filter audit log by position ID (e.g. DIAAAAA123)",
     )
     parser.add_argument("--dotenv", default=".env", help="Path to .env file")
     return parser.parse_args()
@@ -207,6 +228,70 @@ def _resolve_storage_path(storage_path_override: str | None) -> Path:
         return Path(env_storage).expanduser()
 
     return Path("./state/xtb_bot.db")
+
+
+def _show_audit(
+    storage_path: Path,
+    limit: int,
+    symbol: str | None = None,
+    position_id: str | None = None,
+) -> int:
+    if not storage_path.exists():
+        print(f"No state DB found: {storage_path}")
+        return 0
+
+    store = StateStore(storage_path)
+    try:
+        rows = store.get_position_audit(
+            limit=max(1, limit), symbol=symbol, position_id=position_id
+        )
+    finally:
+        store.close()
+
+    if not rows:
+        print("No audit records found.")
+        return 0
+
+    # Print newest-last for chronological readability.
+    for row in reversed(rows):
+        ts = float(row.get("ts") or 0.0)
+        ts_text = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        sym = row.get("symbol") or "-"
+        op = row.get("operation") or "?"
+        side = row.get("side") or ""
+        vol = row.get("volume")
+        price = row.get("price")
+        sl = row.get("stop_loss")
+        tp = row.get("take_profit")
+        pnl = row.get("pnl")
+        deal_ref = row.get("deal_reference") or ""
+        pos_id = row.get("position_id") or ""
+
+        parts = [f"[{ts_text}] {sym} | {op}"]
+        if side:
+            parts.append(f"side={side}")
+        if vol is not None:
+            parts.append(f"vol={vol}")
+        if price is not None:
+            parts.append(f"price={price}")
+        if sl is not None:
+            parts.append(f"sl={sl}")
+        if tp is not None:
+            parts.append(f"tp={tp}")
+        if pnl is not None:
+            parts.append(f"pnl={pnl}")
+        if deal_ref:
+            parts.append(f"ref={deal_ref}")
+        if pos_id:
+            parts.append(f"pos={pos_id}")
+        print("  ".join(parts))
+
+        detail = row.get("detail_json")
+        if detail:
+            print(f"  detail: {detail}")
+
+    print(f"\n({len(rows)} rows)")
+    return len(rows)
 
 
 def _show_alerts(storage_path: Path, limit: int) -> int:
@@ -1255,6 +1340,19 @@ def main() -> None:
     if args.list_strategies:
         for name in available_strategies():
             print(name)
+        return
+
+    if args.show_position_audit:
+        try:
+            storage_path = _resolve_storage_path(args.storage_path)
+        except (ConfigError, ValueError) as exc:
+            raise SystemExit(f"Configuration error: {exc}")
+        _show_audit(
+            storage_path,
+            args.audit_limit,
+            symbol=args.audit_symbol,
+            position_id=args.audit_position_id,
+        )
         return
 
     if args.show_alerts:

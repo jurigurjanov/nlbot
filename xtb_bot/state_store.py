@@ -1137,6 +1137,31 @@ class StateStore:
 
         self._run_write_tx(_insert)
 
+    def get_position_audit(
+        self,
+        limit: int = 100,
+        symbol: str | None = None,
+        position_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recent position audit rows, newest first."""
+        with self._lock:
+            clauses: list[str] = []
+            params: list[object] = []
+            if symbol:
+                clauses.append("symbol = ?")
+                params.append(symbol.upper())
+            if position_id:
+                clauses.append("position_id = ?")
+                params.append(position_id)
+            where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+            params.append(limit)
+            cur = self._conn.execute(
+                f"SELECT * FROM position_audit_log{where} ORDER BY ts DESC LIMIT ?",
+                params,
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
     def purge_position_audit(self, max_age_sec: float = 7 * 86400) -> int:
         cutoff = time.time() - max_age_sec
 
