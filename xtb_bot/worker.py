@@ -1529,6 +1529,12 @@ class SymbolWorker(threading.Thread):
             return True
         if "positions/otc/" in lowered and "404" in lowered:
             return True
+        # IG returns this when position is already closed by SL/TP —
+        # internal null reference instead of a clear "position not found".
+        if "validation.null-not-allowed" in lowered and "positions/otc" in lowered:
+            return True
+        if "error.position.notfound" in lowered:
+            return True
         return False
 
     def _infer_missing_position_close(
