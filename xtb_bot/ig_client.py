@@ -334,6 +334,26 @@ def _first_positive_float(mapping: dict[str, Any], *keys: str) -> float:
     return 0.0
 
 
+def _step_from_min(lot_min: float) -> float:
+    """Derive a deal-size step from the minDealSize precision.
+
+    IG does not expose an explicit size-increment field.  We use the
+    precision of ``minDealSize`` as a hint, but cap at 0.01 because IG
+    typically accepts 0.01-lot increments for most instruments.
+    E.g. lot_min=0.001 → step 0.001; lot_min=0.5 → step 0.01;
+    lot_min=1.0 → step 0.01.
+    We clamp the result to [0.001, 0.01].
+    """
+    if lot_min <= 0:
+        return 0.01
+    text = f"{lot_min:.10f}".rstrip("0")
+    if "." not in text:
+        return 0.01  # integer lot_min → default 0.01
+    decimals = len(text.split(".", 1)[1])
+    step = 10 ** (-decimals)
+    return max(0.001, min(step, 0.01))
+
+
 def _precision_from_step(step: float) -> int:
     text = f"{step:.10f}".rstrip("0")
     if "." not in text:
@@ -2083,9 +2103,11 @@ class IgApiClient(BaseBrokerClient):
             lot_min, lot_min_source = self._default_lot_min_fallback(symbol, epic)
         max_deal = _as_mapping(dealing_rules.get("maxDealSize"))
         lot_max = _as_float(max_deal.get("value"), 100.0)
+        # NOTE: minStepDistance is about stop/limit ORDER distance (in points),
+        # NOT about deal SIZE increments.  Derive lot_step from lot_min precision.
         min_step = _as_mapping(dealing_rules.get("minStepDistance"))
-        step = _as_float(min_step.get("value"), 0.0)
-        lot_step = 0.01 if step <= 0 else min(1.0, step)
+        _min_step_distance_value = _as_float(min_step.get("value"), 0.0)  # kept for metadata
+        lot_step = _step_from_min(lot_min)
         min_stop = _as_mapping(dealing_rules.get("minNormalStopOrLimitDistance"))
         min_stop_value = _as_float(min_stop.get("value"), 0.0)
         min_stop_unit = str(min_stop.get("unit") or "").upper()
@@ -2149,6 +2171,7 @@ class IgApiClient(BaseBrokerClient):
                 "deal_currencies": deal_currencies,
                 "default_currency_code": default_currency,
                 "lot_min_source": lot_min_source,
+                "min_step_distance_raw": _min_step_distance_value,
                 "min_stop_distance_value": min_stop_value,
                 "min_stop_distance_unit": min_stop_unit,
                 "min_stop_distance_price": min_stop_distance_price,
