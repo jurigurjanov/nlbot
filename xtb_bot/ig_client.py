@@ -5880,13 +5880,23 @@ class IgApiClient(BaseBrokerClient):
                 raise BrokerError(
                     f"close volume exceeds open position volume (requested={close_volume:g}, open={float(position.volume):g})"
                 )
+            deal_id = str(position.position_id or "").strip()
+            if not deal_id:
+                raise BrokerError(
+                    f"cannot close position: dealId is empty (symbol={symbol}, side={position.side})"
+                )
             payload = {
-                "dealId": position.position_id,
+                "dealId": deal_id,
                 "direction": direction,
                 "size": close_volume,
                 "orderType": "MARKET",
                 "timeInForce": "EXECUTE_AND_ELIMINATE",
             }
+            logger.info(
+                "IG close_position request | symbol=%s payload=%s",
+                symbol,
+                json.dumps(payload),
+            )
             body, _ = self._request(
                 "DELETE",
                 "/positions/otc",
