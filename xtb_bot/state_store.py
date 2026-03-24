@@ -158,6 +158,27 @@ class StateStore:
                     ON events(ts DESC);
                 CREATE INDEX IF NOT EXISTS idx_events_level_ts
                     ON events(level, ts DESC);
+
+                CREATE TABLE IF NOT EXISTS position_audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    position_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    side TEXT,
+                    volume REAL,
+                    price REAL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    pnl REAL,
+                    deal_reference TEXT,
+                    detail_json TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_position_audit_ts
+                    ON position_audit_log(ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_position_audit_position_id
+                    ON position_audit_log(position_id, ts DESC);
                 """
             )
             self._ensure_column_exists(cur, "trades", "deal_reference", "TEXT")
@@ -1023,6 +1044,14 @@ class StateStore:
                 )
             events_deleted = max(0, self._conn.total_changes - deleted_before)
 
+            audit_deleted_before = self._conn.total_changes
+            with self._conn:
+                self._conn.execute(
+                    "DELETE FROM position_audit_log WHERE ts < ?",
+                    (now - 7 * 86400,),
+                )
+            audit_deleted = max(0, self._conn.total_changes - audit_deleted_before)
+
             checkpoint_payload: dict[str, int] | None = None
             try:
                 checkpoint_row = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
@@ -1048,6 +1077,7 @@ class StateStore:
                 "ts": now,
                 "events_deleted": events_deleted,
                 "events_kept": keep_events,
+                "audit_log_purged": audit_deleted,
                 "checkpoint": checkpoint_payload,
             }
             with self._conn:
@@ -1058,6 +1088,65 @@ class StateStore:
                 self._upsert_kv_in_txn("db.housekeeping.last_ts", f"{now}")
             self._last_housekeeping_ts = now
             return summary
+
+    def record_position_audit(
+        self,
+        position_id: str,
+        symbol: str,
+        operation: str,
+        *,
+        side: str | None = None,
+        volume: float | None = None,
+        price: float | None = None,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        pnl: float | None = None,
+        deal_reference: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        now = time.time()
+        detail_json = (
+            json.dumps(detail, separators=(",", ":"), ensure_ascii=False, default=str)
+            if detail
+            else None
+        )
+
+        def _insert() -> None:
+            self._conn.execute(
+                """
+                INSERT INTO position_audit_log
+                    (ts, position_id, symbol, operation, side, volume,
+                     price, stop_loss, take_profit, pnl, deal_reference, detail_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now,
+                    str(position_id),
+                    str(symbol),
+                    str(operation),
+                    side,
+                    volume,
+                    price,
+                    stop_loss,
+                    take_profit,
+                    pnl,
+                    deal_reference,
+                    detail_json,
+                ),
+            )
+
+        self._run_write_tx(_insert)
+
+    def purge_position_audit(self, max_age_sec: float = 7 * 86400) -> int:
+        cutoff = time.time() - max_age_sec
+
+        def _purge() -> int:
+            cur = self._conn.execute(
+                "DELETE FROM position_audit_log WHERE ts < ?", (cutoff,)
+            )
+            return cur.rowcount
+
+        return self._run_write_tx(_purge)
 
     def close(self) -> None:
         with self._lock:

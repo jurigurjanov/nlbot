@@ -145,6 +145,27 @@ def parse_args() -> argparse.Namespace:
         help="Show only open trades (works with --show-trades)",
     )
     parser.add_argument(
+        "--show-position-audit",
+        action="store_true",
+        help="Show position audit log (lifecycle events for open/close/modify operations)",
+    )
+    parser.add_argument(
+        "--audit-limit",
+        type=int,
+        default=50,
+        help="Max audit rows to print (default: 50)",
+    )
+    parser.add_argument(
+        "--audit-position-id",
+        default=None,
+        help="Filter audit log by position ID (substring match)",
+    )
+    parser.add_argument(
+        "--audit-symbol",
+        default=None,
+        help="Filter audit log by symbol",
+    )
+    parser.add_argument(
         "--reset-risk-anchor",
         action="store_true",
         help="Reset risk.start_equity in state DB using latest account equity (or provided value)",
@@ -513,6 +534,111 @@ def _show_trades(storage_path: Path, limit: int, open_only: bool = False, strate
             closed_at = datetime.fromtimestamp(float(closed_at_ts)).strftime("%Y-%m-%d %H:%M:%S")
             close_price = float(item.get("close_price") or 0.0)
             print(f"  closed_at: {closed_at} close_price={close_price:.5f}")
+
+    return len(rows)
+
+
+def _show_position_audit(
+    storage_path: Path,
+    limit: int,
+    position_id_filter: str | None = None,
+    symbol_filter: str | None = None,
+) -> int:
+    max_items = max(1, int(limit))
+    if not storage_path.exists():
+        print(f"No state DB found: {storage_path}")
+        return 0
+
+    con = sqlite3.connect(str(storage_path))
+    try:
+        con.row_factory = sqlite3.Row
+        tables = {
+            row[0]
+            for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "position_audit_log" not in tables:
+            print("No position_audit_log table found (bot has not written audit data yet).")
+            return 0
+
+        where_parts: list[str] = []
+        query_params: list[object] = []
+        if position_id_filter:
+            where_parts.append("position_id LIKE ?")
+            query_params.append(f"%{position_id_filter}%")
+        if symbol_filter:
+            where_parts.append("UPPER(symbol) = UPPER(?)")
+            query_params.append(str(symbol_filter))
+        where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        query_params.append(max_items)
+        rows = con.execute(
+            f"""
+            SELECT ts, position_id, symbol, operation, side, volume,
+                   price, stop_loss, take_profit, pnl, deal_reference, detail_json
+            FROM position_audit_log
+            {where_clause}
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            tuple(query_params),
+        ).fetchall()
+    finally:
+        con.close()
+
+    if not rows:
+        print("No audit entries found.")
+        return 0
+
+    for row in reversed(rows):
+        item = dict(row)
+        ts = float(item.get("ts") or 0.0)
+        ts_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        op = str(item.get("operation") or "-")
+        symbol = str(item.get("symbol") or "-")
+        pos_id = str(item.get("position_id") or "-")
+        side = str(item.get("side") or "-").upper()
+
+        parts = [f"[{ts_str}] {op.upper():20s} {symbol:10s} {side:4s}"]
+
+        vol = item.get("volume")
+        if vol is not None:
+            parts.append(f"vol={float(vol):.4f}")
+
+        price = item.get("price")
+        if price is not None:
+            parts.append(f"price={float(price):.5f}")
+
+        sl = item.get("stop_loss")
+        if sl is not None:
+            parts.append(f"sl={float(sl):.5f}")
+
+        tp = item.get("take_profit")
+        if tp is not None:
+            parts.append(f"tp={float(tp):.5f}")
+
+        pnl = item.get("pnl")
+        if pnl is not None:
+            parts.append(f"pnl={float(pnl):.2f}")
+
+        deal_ref = item.get("deal_reference")
+        if deal_ref:
+            parts.append(f"ref={deal_ref}")
+
+        parts.append(f"id={pos_id}")
+
+        print(" | ".join(parts))
+
+        detail_raw = item.get("detail_json")
+        if detail_raw:
+            try:
+                detail = json.loads(detail_raw)
+                if isinstance(detail, dict):
+                    detail_items = [f"{k}={v}" for k, v in detail.items() if v is not None]
+                    if detail_items:
+                        print(f"  detail: {', '.join(detail_items)}")
+            except (json.JSONDecodeError, TypeError):
+                pass
 
     return len(rows)
 
@@ -1281,6 +1407,19 @@ def main() -> None:
         except (ConfigError, ValueError) as exc:
             raise SystemExit(f"Configuration error: {exc}")
         _show_trades(storage_path, args.trades_limit, args.trades_open_only, args.strategy)
+        return
+
+    if args.show_position_audit:
+        try:
+            storage_path = _resolve_storage_path(args.storage_path)
+        except (ConfigError, ValueError) as exc:
+            raise SystemExit(f"Configuration error: {exc}")
+        _show_position_audit(
+            storage_path,
+            args.audit_limit,
+            args.audit_position_id,
+            args.audit_symbol,
+        )
         return
 
     if args.show_trade_confidence:
