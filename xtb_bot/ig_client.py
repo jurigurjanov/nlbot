@@ -50,6 +50,7 @@ DEFAULT_IG_EPICS: dict[str, str] = {
     "EU50": "IX.D.EUSTX50.CASH.IP",
     "UK100": "IX.D.FTSE.CASH.IP",
     "AUS200": "IX.D.ASX.CASH.IP",
+    "JPN225": "IX.D.NIKKEI.CASH.IP",
     "XAUUSD": "CS.D.GOLD.CFD.IP",
     "GOLD": "CS.D.GOLD.CFD.IP",
     "WTI": "CC.D.CL.UNC.IP",
@@ -125,6 +126,12 @@ DEFAULT_IG_EPIC_CANDIDATES: dict[str, list[str]] = {
         "IX.D.ASX.DAILY.IP",
         "IX.D.ASX.IFS.IP",
     ],
+    "JPN225": [
+        "IX.D.NIKKEI.CASH.IP",
+        "IX.D.NIKKEI.DAILY.IP",
+        "IX.D.NIKKEI.IFS.IP",
+        "IX.D.NIKKEI.CFD.IP",
+    ],
     "XAUUSD": [
         "CS.D.GOLD.CFD.IP",
         "CS.D.XAUUSD.CFD.IP",
@@ -183,6 +190,7 @@ IG_EPIC_SEARCH_TERMS: dict[str, list[str]] = {
     "FR40": ["CAC 40", "FRANCE 40", "FR40"],
     "EU50": ["EURO STOXX 50", "EU50", "STOXX 50"],
     "AUS200": ["AUSTRALIA 200", "AUS200", "ASX 200"],
+    "JPN225": ["JAPAN 225", "NIKKEI 225", "NIKKEI", "JPN225"],
     "GOLD": ["GOLD", "XAUUSD", "SPOT GOLD"],
     "XAUUSD": ["XAUUSD", "GOLD", "SPOT GOLD"],
     "BRENT": ["BRENT", "UK CRUDE"],
@@ -496,7 +504,7 @@ def _is_plausible_epic_for_symbol(symbol: str, epic: str) -> bool:
 
 def _is_index_symbol(symbol: str, epic: str | None = None) -> bool:
     upper = str(symbol).upper()
-    if upper in {"US100", "US500", "US30", "DE40", "UK100", "FR40", "FRA40", "JP225", "EU50", "AUS200"}:
+    if upper in {"US100", "US500", "US30", "DE40", "UK100", "FR40", "FRA40", "JP225", "JPN225", "EU50", "AUS200"}:
         return True
     if upper.startswith(("US", "DE", "UK", "FR", "FRA", "JP", "EU", "AUS", "AU")) and any(ch.isdigit() for ch in upper):
         return True
