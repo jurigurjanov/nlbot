@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
@@ -60,7 +61,7 @@ class SymbolSpec:
         if raw <= 0:
             return 0.0
         step = self.lot_step if self.lot_step > 0 else 0.01
-        normalized = round(raw / step) * step
+        normalized = math.ceil(raw / step - 1e-9) * step
         clamped = max(normalized, self.lot_min)
         if self.lot_max > 0:
             clamped = min(clamped, self.lot_max)

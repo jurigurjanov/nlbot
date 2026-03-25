@@ -1835,7 +1835,7 @@ class IgApiClient(BaseBrokerClient):
     # Adaptive lot_step correction after "set increments" rejection.
     # ------------------------------------------------------------------
 
-    _COMMON_LOT_STEPS: tuple[float, ...] = (0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
+    _COMMON_LOT_STEPS: tuple[float, ...] = (0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
 
     def _adapt_lot_step_after_increment_reject(
         self,
@@ -5318,6 +5318,11 @@ class IgApiClient(BaseBrokerClient):
                             candidate_spec=candidate_spec,
                             attempted_volume=float(volume),
                         )
+                        raise BrokerError(
+                            f"{error_text} | epic={epic} direction={direction} "
+                            f"size={float(volume):g} currency={currency_code} "
+                            f"(lot_step adapted, will retry next cycle)"
+                        )
                     self._maybe_start_allowance_cooldown(error_text, "trade open")
                     contextual_error = BrokerError(
                         f"{error_text} | epic={epic} direction={direction} "
@@ -5668,6 +5673,11 @@ class IgApiClient(BaseBrokerClient):
                             epic=epic,
                             candidate_spec=candidate_spec,
                             attempted_volume=float(volume),
+                        )
+                        raise BrokerError(
+                            f"{error_text} | epic={epic} direction={direction} "
+                            f"size={float(volume):g} currency={currency_code} "
+                            f"(lot_step adapted, will retry next cycle)"
                         )
                     self._maybe_start_allowance_cooldown(error_text, "trade open")
                     contextual_error = BrokerError(
