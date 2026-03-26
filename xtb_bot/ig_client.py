@@ -14,6 +14,18 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib import error, parse, request
 
+try:
+    from lightstreamer.client import (
+        LightstreamerClient as _LsClient,
+        Subscription as _LsSubscription,
+        SubscriptionListener as _LsSubscriptionListener,
+        ClientListener as _LsClientListener,
+        ItemUpdate as _LsItemUpdate,
+    )
+    _HAS_LIGHTSTREAMER = True
+except ImportError:
+    _HAS_LIGHTSTREAMER = False
+
 from xtb_bot.client import BaseBrokerClient, BrokerError
 from xtb_bot.models import (
     AccountType,
@@ -230,10 +242,7 @@ _FX_MARGIN_CURRENCIES = {
 }
 
 
-LIGHTSTREAMER_CID = "mgQkwtwdysogQz2BJ4Ji kOj2Bg"
-LIGHTSTREAMER_ADAPTER_SET = "DEFAULT"
-LIGHTSTREAMER_PRICE_ADAPTER = "Pricing"
-LIGHTSTREAMER_PRICE_FIELDS = ("BIDPRICE1", "ASKPRICE1", "TIMESTAMP")
+IG_LS_PRICE_FIELDS = ("BID", "OFFER", "UPDATE_TIME")
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -562,6 +571,109 @@ def _infer_margin_price_scale_divisor(symbol: str, pip_size: float, one_pip_mean
     return float(divisor)
 
 
+class _IgClientListener:
+    """Receives connection lifecycle events from LightstreamerClient."""
+
+    def __init__(self, client: "IgApiClient") -> None:
+        self._client = client
+
+    def onStatusChange(self, status: str) -> None:  # noqa: N802
+        ig = self._client
+        logger.debug("IG Lightstreamer status: %s", status)
+        with ig._lock:
+            if status.startswith("CONNECTED:"):
+                was_disconnected = ig._stream_last_disconnect_ts is not None
+                ig._stream_connected = True
+                ig._stream_last_error = None
+                ig._stream_reconnect_attempts = 0
+                ig._stream_last_reconnect_ts = time.time()
+                if was_disconnected:
+                    ig._stream_total_reconnects += 1
+                    logger.warning(
+                        "IG Lightstreamer reconnected | total_reconnects=%s status=%s",
+                        ig._stream_total_reconnects,
+                        status,
+                    )
+            elif status == "DISCONNECTED:WILL-RETRY":
+                ig._stream_connected = False
+                ig._stream_reconnect_attempts += 1
+                ig._stream_last_disconnect_ts = time.time()
+            elif status == "DISCONNECTED":
+                ig._stream_connected = False
+                ig._stream_last_disconnect_ts = time.time()
+        # Re-subscribe desired symbols after reconnection
+        if status.startswith("CONNECTED:"):
+            ig._resubscribe_desired_symbols()
+
+    def onServerError(self, code: int, message: str) -> None:  # noqa: N802
+        ig = self._client
+        error_text = f"ls_server_error:{code}:{message}"
+        logger.warning("IG Lightstreamer server error: code=%s message=%s", code, message)
+        with ig._lock:
+            ig._stream_last_error = error_text
+        # Auth errors (code 1, 2) - try to refresh tokens
+        if code in (1, 2):
+            threading.Thread(
+                target=ig._refresh_stream_auth,
+                name="ig-ls-auth-refresh",
+                daemon=True,
+            ).start()
+
+    def onPropertyChange(self, prop: str) -> None:  # noqa: N802
+        pass
+
+
+class _IgSubscriptionListener:
+    """Receives price updates for a single Lightstreamer subscription."""
+
+    def __init__(self, client: "IgApiClient", symbol: str) -> None:
+        self._client = client
+        self._symbol = symbol
+
+    def onItemUpdate(self, update: "_LsItemUpdate") -> None:  # noqa: N802
+        bid_raw = update.getValue("BID")
+        ask_raw = update.getValue("OFFER")
+        ts_raw = update.getValue("UPDATE_TIME")
+        self._client._update_tick_from_stream_update(self._symbol, bid_raw, ask_raw, ts_raw)
+
+    def onSubscription(self) -> None:  # noqa: N802
+        logger.debug("IG Lightstreamer subscribed: %s", self._symbol)
+
+    def onUnsubscription(self) -> None:  # noqa: N802
+        logger.debug("IG Lightstreamer unsubscribed: %s", self._symbol)
+
+    def onSubscriptionError(self, code: int, message: str) -> None:  # noqa: N802
+        ig = self._client
+        error_text = f"subscription_error:{self._symbol}:{code}:{message}"
+        logger.warning("IG Lightstreamer subscription error for %s: code=%s message=%s", self._symbol, code, message)
+        with ig._lock:
+            ig._stream_last_error = error_text
+
+    def onEndOfSnapshot(self, item_name: str, item_pos: int) -> None:  # noqa: N802
+        pass
+
+    def onItemLostUpdates(self, item_name: str, item_pos: int, lost: int) -> None:  # noqa: N802
+        logger.warning("IG Lightstreamer lost %d updates for %s (item=%s)", lost, self._symbol, item_name)
+
+    def onListenEnd(self) -> None:  # noqa: N802
+        pass
+
+    def onListenStart(self) -> None:  # noqa: N802
+        pass
+
+    def onRealMaxFrequency(self, freq: str | None) -> None:  # noqa: N802
+        pass
+
+    def onCommandSecondLevelItemLostUpdates(self, lost: int, key: str) -> None:  # noqa: N802
+        pass
+
+    def onCommandSecondLevelSubscriptionError(self, code: int, message: str, key: str) -> None:  # noqa: N802
+        pass
+
+    def onClearSnapshot(self, item_name: str, item_pos: int) -> None:  # noqa: N802
+        pass
+
+
 @dataclass(slots=True)
 class IgApiClient(BaseBrokerClient):
     identifier: str
@@ -623,25 +735,16 @@ class IgApiClient(BaseBrokerClient):
         self._rest_fallback_hits_total = 0
 
         self._stream_endpoint: str | None = None
-        self._stream_session_id: str | None = None
-        self._stream_control_url: str | None = None
-        self._stream_keepalive_ms: int | None = None
-        self._stream_thread: threading.Thread | None = None
-        self._stream_stop_event = threading.Event()
-        self._stream_http_response: Any | None = None
+        self._ls_client: "_LsClient | None" = None
+        self._ls_client_listener: _IgClientListener | None = None
+        self._stream_connected: bool = False
         self._stream_desired_subscriptions: set[str] = set()
-        self._stream_symbol_to_table: dict[str, int] = {}
-        self._stream_table_to_symbol: dict[int, str] = {}
-        self._stream_table_field_values: dict[int, list[str | None]] = {}
-        self._stream_next_table_id = 1
+        self._stream_subscriptions: dict[str, "_LsSubscription"] = {}
         self._stream_last_error: str | None = None
         self._stream_reconnect_attempts = 0
         self._stream_total_reconnects = 0
         self._stream_last_disconnect_ts: float | None = None
         self._stream_last_reconnect_ts: float | None = None
-        self._stream_next_retry_at: float | None = None
-        self._stream_backoff_base_sec = 0.5
-        self._stream_backoff_max_sec = 30.0
         raw_stream_stale_tick_max_age = (
             os.getenv("IG_STREAM_STALE_TICK_MAX_AGE_SEC")
             or os.getenv("XTB_IG_STREAM_STALE_TICK_MAX_AGE_SEC")
@@ -806,14 +909,11 @@ class IgApiClient(BaseBrokerClient):
     def _normalize_lightstreamer_endpoint(endpoint: str | None) -> str | None:
         if endpoint is None:
             return None
-        value = str(endpoint).strip()
+        value = str(endpoint).strip().rstrip("/")
         if not value:
             return None
         if not value.startswith(("http://", "https://")):
-            value = f"https://{value.lstrip('/')}"
-        value = value.rstrip("/")
-        if not value.endswith("/lightstreamer"):
-            value = f"{value}/lightstreamer"
+            value = f"https://{value}"
         return value
 
     def _default_endpoint(self) -> str:
@@ -1383,10 +1483,12 @@ class IgApiClient(BaseBrokerClient):
                 self._symbol_spec_cache.pop(upper, None)
 
                 # Force re-subscribe only when epic mapping actually changed.
-                table_id = self._stream_symbol_to_table.pop(upper, None)
-                if table_id is not None:
-                    self._stream_table_to_symbol.pop(table_id, None)
-                    self._stream_table_field_values.pop(table_id, None)
+                old_sub = self._stream_subscriptions.pop(upper, None)
+                if old_sub is not None and self._ls_client is not None:
+                    try:
+                        self._ls_client.unsubscribe(old_sub)
+                    except Exception:
+                        pass
 
         if previous and previous != normalized:
             logger.warning("IG epic remapped for %s: %s -> %s", upper, previous, normalized)
@@ -3934,184 +4036,68 @@ class IgApiClient(BaseBrokerClient):
 
         return candidate_entry, stop_loss, take_profit
 
-    @staticmethod
-    def _decode_stream_field(encoded: str, previous: str | None) -> str | None:
-        if encoded == "":
-            return previous
-        if encoded == "$":
-            return ""
-        if encoded == "#":
-            return None
-        if encoded.startswith("$$") or encoded.startswith("##"):
-            return encoded[1:]
-        if encoded[0] in {"$", "#"}:
-            return encoded[1:]
-        return encoded
-
-    @staticmethod
-    def _read_stream_line(stream_response: Any) -> str | None:
-        raw = stream_response.readline()
-        if raw is None:
-            return None
-        if isinstance(raw, bytes):
-            text = raw.decode("utf-8", errors="replace")
-        else:
-            text = str(raw)
-        if text == "":
-            return None
-        return text.rstrip("\r\n")
-
-    def _stream_backoff_delay(self, attempt: int) -> float:
-        if attempt <= 0:
-            return self._stream_backoff_base_sec
-        return min(self._stream_backoff_max_sec, self._stream_backoff_base_sec * (2 ** (attempt - 1)))
-
-    def _resolve_stream_control_url(self, control_address: str | None) -> str | None:
-        stream_endpoint = self._stream_endpoint
-        if not stream_endpoint:
-            return None
-        if not control_address:
-            return f"{stream_endpoint}/control.txt"
-
-        raw = control_address.strip().rstrip("/")
-        if not raw:
-            return f"{stream_endpoint}/control.txt"
-
-        parsed_addr = parse.urlparse(raw)
-        if parsed_addr.scheme:
-            base = raw
-        else:
-            stream_scheme = parse.urlparse(stream_endpoint).scheme or "https"
-            base = f"{stream_scheme}://{raw}"
-
-        base = base.rstrip("/")
-        if not base.endswith("/lightstreamer"):
-            base = f"{base}/lightstreamer"
-        return f"{base}/control.txt"
-
-    def _mark_stream_disconnected_locked(self, error_text: str | None, schedule_retry: bool = True) -> None:
-        response = self._stream_http_response
-        self._stream_http_response = None
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
-
-        self._stream_session_id = None
-        self._stream_control_url = None
-        self._stream_keepalive_ms = None
-        self._stream_symbol_to_table.clear()
-        self._stream_table_to_symbol.clear()
-        self._stream_table_field_values.clear()
-        self._stream_last_disconnect_ts = time.time()
-
-        if error_text:
-            self._stream_last_error = error_text
-
-        if schedule_retry:
-            self._stream_reconnect_attempts += 1
-            delay = self._stream_backoff_delay(self._stream_reconnect_attempts)
-            self._stream_next_retry_at = time.time() + delay
-        else:
-            self._stream_reconnect_attempts = 0
-            self._stream_next_retry_at = None
-
-    def _mark_stream_connected_locked(
-        self,
-        session_id: str,
-        control_url: str | None,
-        keepalive_ms: int | None,
-    ) -> None:
-        was_reconnect = self._stream_last_disconnect_ts is not None
-        self._stream_session_id = session_id
-        self._stream_control_url = control_url
-        self._stream_keepalive_ms = keepalive_ms
-        self._stream_last_error = None
-        self._stream_reconnect_attempts = 0
-        self._stream_next_retry_at = None
-        self._stream_last_reconnect_ts = time.time()
-
-        if was_reconnect:
-            self._stream_total_reconnects += 1
-            logger.warning(
-                "IG Lightstreamer reconnected | total_reconnects=%s",
-                self._stream_total_reconnects,
-            )
+    # ------------------------------------------------------------------
+    # Lightstreamer streaming (official library)
+    # ------------------------------------------------------------------
 
     def _start_stream_thread_locked(self) -> None:
         if not self._stream_enabled:
             self._stream_last_error = "stream_disabled_by_config"
             return
-        thread = self._stream_thread
-        if thread is not None and thread.is_alive():
+        if not _HAS_LIGHTSTREAMER:
+            self._stream_last_error = "lightstreamer_client_lib_not_installed"
+            logger.warning("lightstreamer-client-lib not installed; streaming disabled")
             return
-        if not self._stream_endpoint:
+        if self._ls_client is not None:
+            return
+        endpoint = self._stream_endpoint
+        if not endpoint:
             self._stream_last_error = "lightstreamer_endpoint_missing"
             return
+        account_id = self.account_id
+        cst = self._cst
+        security_token = self._security_token
+        if not account_id or not cst or not security_token:
+            self._stream_last_error = "lightstreamer_auth_tokens_missing"
+            return
 
-        self._stream_stop_event.clear()
-        self._stream_thread = threading.Thread(
-            target=self._stream_loop,
-            name="ig-lightstreamer-stream",
-            daemon=True,
+        client = _LsClient(endpoint, "")
+        client.connectionDetails.setUser(account_id)
+        client.connectionDetails.setPassword(f"CST-{cst}|XST-{security_token}")
+        client.connectionOptions.setRetryDelay(5000)
+        client.connectionOptions.setFirstRetryMaxDelay(2000)
+
+        listener = _IgClientListener(self)
+        client.addListener(listener)
+        self._ls_client = client
+        self._ls_client_listener = listener
+        client.connect()
+        logger.info(
+            "IG Lightstreamer connecting | endpoint=%s account=%s",
+            endpoint,
+            account_id,
         )
-        self._stream_thread.start()
 
-    def _stop_stream_thread_locked(self) -> threading.Thread | None:
-        self._stream_stop_event.set()
-        self._mark_stream_disconnected_locked(None, schedule_retry=False)
-        thread = self._stream_thread
-        self._stream_thread = None
-        if thread is threading.current_thread():
-            return None
-        return thread
-
-    def _send_stream_control(self, control_url: str, params: dict[str, Any]) -> tuple[bool, str]:
-        req = request.Request(
-            url=control_url,
-            method="POST",
-            data=self._form_body(params),
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Accept": "text/plain",
-            },
-        )
-        try:
-            with request.urlopen(req, timeout=self.timeout_sec) as resp:
-                payload = resp.read().decode("utf-8", errors="replace")
-        except Exception as exc:
-            return False, str(exc)
-
-        lines = [line.strip() for line in payload.replace("\r", "\n").split("\n") if line.strip()]
-        if not lines:
-            return False, "empty_control_response"
-
-        first = lines[0]
-        if first == "OK":
-            return True, "ok"
-        if first == "SYNC ERROR":
-            return False, "sync_error"
-        if first == "ERROR":
-            code = lines[1] if len(lines) > 1 else "unknown"
-            message = lines[2] if len(lines) > 2 else "unknown"
-            return False, f"error:{code}:{message}"
-        return False, first
+    def _stop_stream_thread_locked(self) -> None:
+        client = self._ls_client
+        self._ls_client = None
+        self._ls_client_listener = None
+        self._stream_connected = False
+        self._stream_subscriptions.clear()
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
 
     def _subscribe_symbol(self, symbol: str) -> bool:
         upper = symbol.upper()
-
         with self._lock:
-            if upper in self._stream_symbol_to_table:
+            if upper in self._stream_subscriptions:
                 return True
-            session_id = self._stream_session_id
-            control_url = self._stream_control_url
-            account_id = self.account_id
-            if not session_id or not control_url or not account_id:
+            client = self._ls_client
+            if client is None or not self._stream_connected:
                 return False
-            table_id = self._stream_next_table_id
-            self._stream_next_table_id += 1
-
         try:
             epic = self._epic_for_symbol(upper)
         except Exception as exc:
@@ -4119,35 +4105,19 @@ class IgApiClient(BaseBrokerClient):
                 self._stream_last_error = f"epic_resolution_failed:{upper}:{exc}"
             return False
 
-        item = f"PRICE:{account_id}:{epic}"
-        schema = "|".join(LIGHTSTREAMER_PRICE_FIELDS)
-        ok, reason = self._send_stream_control(
-            control_url,
-            {
-                "LS_session": session_id,
-                "LS_table": table_id,
-                "LS_op": "add",
-                "LS_data_adapter": LIGHTSTREAMER_PRICE_ADAPTER,
-                "LS_id": item,
-                "LS_schema": schema,
-                "LS_mode": "MERGE",
-                "LS_snapshot": "true",
-            },
-        )
-        if not ok:
+        sub = _LsSubscription("MERGE", [f"MARKET:{epic}"], list(IG_LS_PRICE_FIELDS))
+        sub.setRequestedSnapshot("yes")
+        listener = _IgSubscriptionListener(self, upper)
+        sub.addListener(listener)
+        try:
+            client.subscribe(sub)
+        except Exception as exc:
             with self._lock:
-                self._stream_last_error = f"subscription_failed:{upper}:{reason}"
-            if reason == "sync_error":
-                with self._lock:
-                    self._mark_stream_disconnected_locked("stream_sync_error", schedule_retry=True)
+                self._stream_last_error = f"subscription_failed:{upper}:{exc}"
             return False
 
         with self._lock:
-            if session_id != self._stream_session_id:
-                return False
-            self._stream_symbol_to_table[upper] = table_id
-            self._stream_table_to_symbol[table_id] = upper
-            self._stream_table_field_values[table_id] = [None] * len(LIGHTSTREAMER_PRICE_FIELDS)
+            self._stream_subscriptions[upper] = sub
         return True
 
     def _ensure_stream_subscription(self, symbol: str) -> bool:
@@ -4156,8 +4126,8 @@ class IgApiClient(BaseBrokerClient):
         upper = symbol.upper()
         with self._lock:
             self._stream_desired_subscriptions.add(upper)
-            already_subscribed = upper in self._stream_symbol_to_table
-            stream_ready = bool(self._stream_session_id and self._stream_control_url)
+            already_subscribed = upper in self._stream_subscriptions
+            stream_ready = self._stream_connected
         if already_subscribed:
             return True
         if not stream_ready:
@@ -4168,12 +4138,16 @@ class IgApiClient(BaseBrokerClient):
         with self._lock:
             desired = sorted(self._stream_desired_subscriptions)
         for symbol in desired:
-            self._subscribe_symbol(symbol)
+            try:
+                self._subscribe_symbol(symbol)
+            except Exception as exc:
+                logger.warning("IG Lightstreamer re-subscribe failed for %s: %s", symbol, exc)
 
-    def _update_tick_from_stream_fields(self, symbol: str, field_values: list[str | None]) -> None:
-        bid = _as_float(field_values[0] if len(field_values) > 0 else None, 0.0)
-        ask = _as_float(field_values[1] if len(field_values) > 1 else None, 0.0)
-        timestamp_raw = field_values[2] if len(field_values) > 2 else None
+    def _update_tick_from_stream_update(
+        self, symbol: str, bid_raw: str | None, ask_raw: str | None, ts_raw: str | None,
+    ) -> None:
+        bid = _as_float(bid_raw, 0.0)
+        ask = _as_float(ask_raw, 0.0)
 
         if bid <= 0 and ask <= 0:
             return
@@ -4183,190 +4157,31 @@ class IgApiClient(BaseBrokerClient):
             ask = bid
 
         now_ts = time.time()
-        tick_ts = self._parse_ts({"updateTimeUTC": timestamp_raw}, now_ts)
+        tick_ts = self._parse_ts({"updateTimeUTC": ts_raw}, now_ts)
 
         tick = PriceTick(symbol=symbol, bid=bid, ask=ask, timestamp=tick_ts)
         with self._lock:
             self._tick_cache[symbol] = tick
             self._last_tick_by_symbol[symbol] = tick_ts
 
-    def _handle_lightstreamer_table_update(self, table_id: int, raw_values: str) -> bool:
-        with self._lock:
-            symbol = self._stream_table_to_symbol.get(table_id)
-            previous_values = list(
-                self._stream_table_field_values.get(table_id, [None] * len(LIGHTSTREAMER_PRICE_FIELDS))
+    def _refresh_stream_auth(self) -> None:
+        """Refresh IG auth tokens and update LightstreamerClient credentials."""
+        try:
+            self._maybe_refresh_auth_session_after_failure(
+                method="STREAM", path="/lightstreamer", error_text="stream_auth_rejected",
             )
-
-        if symbol is None:
-            return True
-
-        encoded_values = raw_values.split("|")
-        decoded: list[str | None] = []
-        for idx in range(len(LIGHTSTREAMER_PRICE_FIELDS)):
-            prev = previous_values[idx] if idx < len(previous_values) else None
-            encoded = encoded_values[idx] if idx < len(encoded_values) else ""
-            decoded.append(self._decode_stream_field(encoded, prev))
-
+        except Exception as exc:
+            logger.warning("IG stream auth refresh failed: %s", exc)
+            return
         with self._lock:
-            self._stream_table_field_values[table_id] = decoded
-
-        self._update_tick_from_stream_fields(symbol, decoded)
-        return True
-
-    def _handle_stream_line(self, line: str) -> bool:
-        if line == "" or line == "PROBE":
-            return True
-
-        if line.startswith("Preamble"):
-            return True
-
-        if line.startswith(("ERROR", "END", "LOOP", "SYNC ERROR")):
-            logger.warning("IG Lightstreamer control event: %s", line)
-            return False
-
-        if line.startswith("U,"):
-            # Some servers may emit TLCP-style updates; try to read table id and pipe payload.
-            parts = line.split(",", 3)
-            if len(parts) >= 4:
-                try:
-                    table_id = int(parts[1])
-                except ValueError:
-                    return True
-                return self._handle_lightstreamer_table_update(table_id, parts[3])
-            return True
-
-        if "|" in line and "," in line:
-            prefix, values = line.split("|", 1)
-            prefix_parts = prefix.split(",")
-            if len(prefix_parts) >= 2 and prefix_parts[0].isdigit() and prefix_parts[1].isdigit():
-                return self._handle_lightstreamer_table_update(int(prefix_parts[0]), values)
-
-        if ",EOS" in line or ",OV" in line:
-            return True
-
-        return True
-
-    def _open_stream_session(self) -> Any:
-        with self._lock:
-            stream_endpoint = self._stream_endpoint
-            account_id = self.account_id
+            client = self._ls_client
             cst = self._cst
             security_token = self._security_token
-
-        if not stream_endpoint:
-            raise BrokerError("lightstreamer_endpoint_missing")
-        if not account_id:
-            raise BrokerError("lightstreamer_account_id_missing")
-        if not cst or not security_token:
-            raise BrokerError("lightstreamer_auth_tokens_missing")
-
-        create_url = f"{stream_endpoint}/create_session.txt"
-        body = self._form_body(
-            {
-                "LS_op2": "create",
-                "LS_cid": LIGHTSTREAMER_CID,
-                "LS_adapter_set": LIGHTSTREAMER_ADAPTER_SET,
-                "LS_user": account_id,
-                "LS_password": f"CST-{cst}|XST-{security_token}",
-                "LS_keepalive_millis": 5000,
-                "LS_content_length": 50000000,
-            }
-        )
-
-        req = request.Request(
-            url=create_url,
-            method="POST",
-            data=body,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Accept": "text/plain",
-            },
-        )
-
-        timeout = max(self.stream_read_timeout_sec, self.timeout_sec)
-        return request.urlopen(req, timeout=timeout)
-
-    def _stream_loop(self) -> None:
-        while not self._stream_stop_event.is_set():
-            with self._lock:
-                if not self._connected:
-                    return
-                retry_at = self._stream_next_retry_at
-
-            now = time.time()
-            if retry_at is not None and now < retry_at:
-                self._stream_stop_event.wait(max(0.1, retry_at - now))
-                continue
-
-            stream_response: Any | None = None
+        if client and cst and security_token:
             try:
-                stream_response = self._open_stream_session()
-                first_line = self._read_stream_line(stream_response)
-                if first_line != "OK":
-                    raise BrokerError(f"stream_create_failed:{first_line}")
-
-                session_id: str | None = None
-                control_address: str | None = None
-                keepalive_ms: int | None = None
-
-                while not self._stream_stop_event.is_set():
-                    header_line = self._read_stream_line(stream_response)
-                    if header_line is None:
-                        raise BrokerError("stream_header_unexpected_eof")
-                    if header_line == "":
-                        break
-                    if ":" not in header_line:
-                        continue
-                    key, value = header_line.split(":", 1)
-                    key = key.strip()
-                    value = value.strip()
-                    if key == "SessionId":
-                        session_id = value
-                    elif key == "ControlAddress":
-                        control_address = value
-                    elif key == "KeepaliveMillis":
-                        try:
-                            keepalive_ms = int(value)
-                        except ValueError:
-                            keepalive_ms = None
-
-                if not session_id:
-                    raise BrokerError("stream_session_id_missing")
-
-                control_url = self._resolve_stream_control_url(control_address)
-                with self._lock:
-                    self._stream_http_response = stream_response
-                    self._mark_stream_connected_locked(session_id, control_url, keepalive_ms)
-
-                self._resubscribe_desired_symbols()
-
-                while not self._stream_stop_event.is_set():
-                    line = self._read_stream_line(stream_response)
-                    if line is None:
-                        raise BrokerError("stream_eof")
-                    handled = self._handle_stream_line(line)
-                    if handled:
-                        continue
-                    raise BrokerError(f"stream_control_message:{line}")
-
+                client.connectionDetails.setPassword(f"CST-{cst}|XST-{security_token}")
             except Exception as exc:
-                if self._stream_stop_event.is_set():
-                    break
-                with self._lock:
-                    self._mark_stream_disconnected_locked(str(exc), schedule_retry=True)
-                    retry_in = (
-                        max(0.1, (self._stream_next_retry_at or time.time()) - time.time())
-                        if self._stream_next_retry_at is not None
-                        else self._stream_backoff_base_sec
-                    )
-                logger.warning("IG Lightstreamer degraded, switching to REST fallback: %s", exc)
-                self._stream_stop_event.wait(retry_in)
-            finally:
-                if stream_response is not None:
-                    try:
-                        stream_response.close()
-                    except Exception:
-                        pass
+                logger.warning("IG stream auth credential update failed: %s", exc)
 
     def _get_cached_tick_locked(self, symbol: str, max_age_sec: float) -> PriceTick | None:
         tick = self._tick_cache.get(symbol)
@@ -4662,12 +4477,8 @@ class IgApiClient(BaseBrokerClient):
                 time.sleep(max(0.1, delay_sec))
 
     def close(self) -> None:
-        stream_thread_to_join: threading.Thread | None = None
         with self._lock:
-            stream_thread_to_join = self._stop_stream_thread_locked()
-
-        if stream_thread_to_join is not None and stream_thread_to_join.is_alive():
-            stream_thread_to_join.join(timeout=2.0)
+            self._stop_stream_thread_locked()
 
         with self._lock:
             was_connected = self._connected
@@ -4684,6 +4495,7 @@ class IgApiClient(BaseBrokerClient):
                 self._tick_cache.clear()
                 self._last_tick_by_symbol.clear()
                 self._stream_desired_subscriptions.clear()
+                self._stream_subscriptions.clear()
                 self._stream_last_error = None
                 self._stream_endpoint = None
                 self._account_snapshot_cache = None
@@ -4773,7 +4585,7 @@ class IgApiClient(BaseBrokerClient):
             while time.time() < deadline:
                 with self._lock:
                     cached = self._get_cached_tick_locked(upper, self.stream_tick_max_age_sec)
-                    stream_alive = bool(self._stream_session_id)
+                    stream_alive = self._stream_connected
                 if cached is not None:
                     with self._lock:
                         self._stream_price_hits_total += 1
@@ -4802,7 +4614,7 @@ class IgApiClient(BaseBrokerClient):
 
         if stream_enabled:
             with self._lock:
-                stream_alive = bool(self._stream_session_id)
+                stream_alive = self._stream_connected
                 throttle_sec = float(self._stream_rest_fallback_min_interval_sec)
                 last_stream_rest_ts = float(self._last_stream_rest_fallback_ts_by_symbol.get(upper, 0.0))
             if stream_alive and throttle_sec > 0:
@@ -5047,13 +4859,8 @@ class IgApiClient(BaseBrokerClient):
         upper = symbol.upper() if symbol else None
 
         with self._lock:
-            stream_thread = self._stream_thread
             stream_enabled = self._stream_enabled
-            stream_connected = (
-                self._stream_session_id is not None
-                and stream_thread is not None
-                and stream_thread.is_alive()
-            )
+            stream_connected = self._stream_connected
 
             last_tick_age_sec: float | None = None
             if upper:
@@ -5065,12 +4872,10 @@ class IgApiClient(BaseBrokerClient):
                 last_tick_age_sec = max(0.0, now - freshest_ts)
 
             next_retry_in_sec = None
-            if self._stream_next_retry_at is not None:
-                next_retry_in_sec = max(0.0, self._stream_next_retry_at - now)
 
             desired_subscriptions_snapshot = frozenset(self._stream_desired_subscriptions)
             desired_subscriptions = len(desired_subscriptions_snapshot)
-            active_subscriptions = len(self._stream_symbol_to_table)
+            active_subscriptions = len(self._stream_subscriptions)
             last_error = self._stream_last_error
             reconnect_attempts = self._stream_reconnect_attempts
             total_reconnects = self._stream_total_reconnects
