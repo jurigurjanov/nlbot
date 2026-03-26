@@ -99,7 +99,7 @@ def test_bot_switches_strategy_by_schedule_without_process_restart(monkeypatch, 
         strategy_params={"fast_window": 3, "slow_window": 5},
         strategy_params_map={
             "momentum": {"fast_window": 3, "slow_window": 5},
-            "mean_reversion": {"mean_reversion_zscore_window": 20, "mean_reversion_zscore_threshold": 1.8},
+            "mean_reversion_bb": {"mean_reversion_bb_window": 20, "mean_reversion_bb_std_dev": 2.2},
         },
         strategy_schedule=[
             StrategyScheduleEntry(
@@ -112,7 +112,7 @@ def test_bot_switches_strategy_by_schedule_without_process_restart(monkeypatch, 
                 end_minute=10 * 60,
             ),
             StrategyScheduleEntry(
-                strategy="mean_reversion",
+                strategy="mean_reversion_bb",
                 symbols=["EURUSD"],
                 start_time="19:00",
                 end_time="23:00",
@@ -148,7 +148,7 @@ def test_bot_switches_strategy_by_schedule_without_process_restart(monkeypatch, 
         lambda self: datetime(2026, 3, 12, 19, 30, tzinfo=timezone.utc),
     )
     bot._reconcile_workers()
-    assert bot._worker_assignments["EURUSD"].strategy_name == "mean_reversion"
+    assert bot._worker_assignments["EURUSD"].strategy_name == "mean_reversion_bb"
 
     bot.stop()
 
@@ -166,11 +166,11 @@ def test_bot_force_strategy_ignores_schedule(monkeypatch, tmp_path):
         strategy_params={"fast_window": 3, "slow_window": 5},
         strategy_params_map={
             "momentum": {"fast_window": 3, "slow_window": 5},
-            "mean_reversion": {"mean_reversion_zscore_window": 20, "mean_reversion_zscore_threshold": 1.8},
+            "mean_reversion_bb": {"mean_reversion_bb_window": 20, "mean_reversion_bb_std_dev": 2.2},
         },
         strategy_schedule=[
             StrategyScheduleEntry(
-                strategy="mean_reversion",
+                strategy="mean_reversion_bb",
                 symbols=["EURUSD"],
                 start_time="19:00",
                 end_time="23:00",
@@ -212,11 +212,11 @@ def test_bot_force_symbols_ignores_schedule_symbol_sets(monkeypatch, tmp_path):
         strategy_params={"fast_ema_window": 20, "slow_ema_window": 80},
         strategy_params_map={
             "trend_following": {"fast_ema_window": 20, "slow_ema_window": 80},
-            "mean_reversion": {"mean_reversion_zscore_window": 20, "mean_reversion_zscore_threshold": 1.8},
+            "mean_reversion_bb": {"mean_reversion_bb_window": 20, "mean_reversion_bb_std_dev": 2.2},
         },
         strategy_schedule=[
             StrategyScheduleEntry(
-                strategy="mean_reversion",
+                strategy="mean_reversion_bb",
                 symbols=["EURUSD"],
                 start_time="19:00",
                 end_time="23:00",
@@ -260,11 +260,11 @@ def test_bot_defers_schedule_switch_while_position_is_open(monkeypatch, tmp_path
         strategy_params={"fast_window": 3, "slow_window": 5},
         strategy_params_map={
             "momentum": {"fast_window": 3, "slow_window": 5},
-            "mean_reversion": {"mean_reversion_zscore_window": 20, "mean_reversion_zscore_threshold": 1.8},
+            "mean_reversion_bb": {"mean_reversion_bb_window": 20, "mean_reversion_bb_std_dev": 2.2},
         },
         strategy_schedule=[
             StrategyScheduleEntry(
-                strategy="mean_reversion",
+                strategy="mean_reversion_bb",
                 symbols=["EURUSD"],
                 start_time="19:00",
                 end_time="23:00",
@@ -331,7 +331,7 @@ def test_bot_defers_schedule_switch_while_position_is_open(monkeypatch, tmp_path
     bot.position_book.remove("EURUSD")
     bot.store.update_trade_status("paper-open-1", status="closed", close_price=1.105, closed_at=20.0, pnl=50.0)
     bot._reconcile_workers()
-    assert bot._worker_assignments["EURUSD"].strategy_name == "mean_reversion"
+    assert bot._worker_assignments["EURUSD"].strategy_name == "mean_reversion_bb"
 
     bot.stop()
 
@@ -543,7 +543,7 @@ def test_bot_passively_warms_history_for_inactive_scheduled_symbols(monkeypatch,
         strategy_params={"fast_window": 3, "slow_window": 5},
         strategy_params_map={
             "momentum": {"fast_window": 3, "slow_window": 5},
-            "mean_reversion": {"mean_reversion_zscore_window": 20, "mean_reversion_zscore_threshold": 1.8},
+            "mean_reversion_bb": {"mean_reversion_bb_window": 20, "mean_reversion_bb_std_dev": 2.2},
         },
         strategy_schedule=[
             StrategyScheduleEntry(
@@ -556,7 +556,7 @@ def test_bot_passively_warms_history_for_inactive_scheduled_symbols(monkeypatch,
                 end_minute=10 * 60,
             ),
             StrategyScheduleEntry(
-                strategy="mean_reversion",
+                strategy="mean_reversion_bb",
                 symbols=["GBPUSD"],
                 start_time="19:00",
                 end_time="23:00",

@@ -674,45 +674,6 @@ def test_dynamic_exit_reason_ignored_for_non_index_hybrid_strategy(tmp_path):
         worker.store.close()
 
 
-def test_mean_reversion_dynamic_exit_reason_on_exit_hint(tmp_path):
-    worker = _make_worker(tmp_path)
-    try:
-        worker.strategy_name = "mean_reversion"
-        worker.strategy = _FixedSignalStrategy(
-            Signal(
-                side=Side.HOLD,
-                confidence=0.0,
-                stop_loss_pips=10.0,
-                take_profit_pips=20.0,
-                metadata={
-                    "indicator": "mean_reversion",
-                    "reason": "mean_reversion_target_reached",
-                    "exit_hint": "close_on_mean_reversion",
-                    "zscore": 0.03,
-                },
-            )
-        )
-        worker.prices.append(1.1000)
-
-        position = Position(
-            position_id="paper-mr-1",
-            symbol="EURUSD",
-            side=Side.BUY,
-            volume=0.1,
-            open_price=1.1,
-            stop_loss=1.09,
-            take_profit=1.12,
-            opened_at=1.0,
-            status="open",
-        )
-        signal = worker._strategy_exit_signal()
-        reason = worker._strategy_dynamic_exit_reason(position, bid=1.1, ask=1.1002, signal=signal)
-        assert reason == "strategy_exit:mean_reversion:mean_reverted"
-    finally:
-        worker.broker.close()
-        worker.store.close()
-
-
 def test_mean_reversion_bb_dynamic_exit_reason_on_exit_hint(tmp_path):
     worker = _make_worker(tmp_path)
     try:

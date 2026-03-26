@@ -577,9 +577,8 @@ class MomentumStrategy(Strategy):
                 "suggested_order_type": "limit",
             }
             if self.price_gap_mode == "wait_pullback":
-                if price_slow_gap_atr > max_price_slow_gap_atr_effective:
-                    return self._hold_with_reason("wait_pullback_entry", extra_payload)
-                if price_slow_gap_atr > pullback_entry_max_gap_atr_effective:
+                effective_gap_limit = min(max_price_slow_gap_atr_effective, pullback_entry_max_gap_atr_effective)
+                if price_slow_gap_atr > effective_gap_limit:
                     return self._hold_with_reason("wait_pullback_entry", extra_payload)
             elif price_slow_gap_atr > max_price_slow_gap_atr_effective:
                 return self._hold_with_reason(
