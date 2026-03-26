@@ -5,6 +5,7 @@ import threading
 from zoneinfo import ZoneInfo
 
 from xtb_bot.models import Side, Signal
+from xtb_bot.strategies.pip_size import pip_size as _pip_size_lookup
 from xtb_bot.strategies.base import Strategy, StrategyContext
 
 
@@ -49,6 +50,8 @@ class MeanBreakoutSessionStrategy(Strategy):
                 params.get("mean_breakout_take_profit_pips", params.get("take_profit_pips", 75.0)),
             )
         )
+        self.risk_reward_ratio = max(1.0, float(params.get("mean_breakout_session_risk_reward_ratio", 2.5)))
+        self.box_sl_multiplier = max(0.1, float(params.get("mean_breakout_session_box_sl_multiplier", 0.5)))
 
         self._tz = self._resolve_timezone(self.session_timezone)
         self._session_start_hour, self._session_start_minute = self._parse_hhmm(self.session_start)
@@ -217,6 +220,12 @@ class MeanBreakoutSessionStrategy(Strategy):
         box_range = max(1e-9, box_high - box_low)
         confidence = min(1.0, (max(0.0, breakout_distance) / box_range) * 2.5 + 0.25)
 
+        # Adaptive SL/TP: scale to opening box range
+        pip_size = float(ctx.tick_size) if ctx.tick_size is not None and ctx.tick_size > 0 else _pip_size_lookup(ctx.symbol)
+        box_range_pips = box_range / max(pip_size, 1e-9)
+        stop_loss_pips = max(self.stop_loss_pips, box_range_pips * self.box_sl_multiplier)
+        take_profit_pips = max(self.take_profit_pips, stop_loss_pips * self.risk_reward_ratio)
+
         self._last_traded_session_key = session_key
         symbol_upper = str(ctx.symbol).upper()
         preferred_symbol = symbol_upper in self._PREFERRED_SYMBOLS
@@ -224,8 +233,8 @@ class MeanBreakoutSessionStrategy(Strategy):
         return Signal(
             side=side,
             confidence=confidence,
-            stop_loss_pips=self.stop_loss_pips,
-            take_profit_pips=self.take_profit_pips,
+            stop_loss_pips=stop_loss_pips,
+            take_profit_pips=take_profit_pips,
             metadata={
                 "indicator": "mean_breakout_session",
                 "direction": direction,
@@ -239,6 +248,9 @@ class MeanBreakoutSessionStrategy(Strategy):
                 "box_range": box_range,
                 "box_samples": box_samples,
                 "breakout_distance": breakout_distance,
+                "box_range_pips": box_range_pips,
+                "adaptive_stop_loss_pips": stop_loss_pips,
+                "adaptive_take_profit_pips": take_profit_pips,
                 "preferred_symbol": preferred_symbol,
             },
         )

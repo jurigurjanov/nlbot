@@ -532,7 +532,11 @@ class TrendFollowingStrategy(Strategy):
 
             structure_stop_pips = (last_price - channel_lower) / max(pip_size, 1e-9)
             if structure_stop_pips <= 0:
-                return self._hold("invalid_structure_stop", {"trend": "up"})
+                # Price at/below channel lower — use ATR-based stop as fallback.
+                if atr is not None and atr > 0:
+                    structure_stop_pips = (atr * 2.0) / max(pip_size, 1e-9)
+                else:
+                    return self._hold("invalid_structure_stop", {"trend": "up"})
 
             stop_floor_pips = self.min_stop_loss_pips
             if self._is_index_symbol(ctx.symbol) and self.index_min_stop_pct > 0:
@@ -707,7 +711,11 @@ class TrendFollowingStrategy(Strategy):
 
             structure_stop_pips = (channel_upper - last_price) / max(pip_size, 1e-9)
             if structure_stop_pips <= 0:
-                return self._hold("invalid_structure_stop", {"trend": "down"})
+                # Price at/above channel upper — use ATR-based stop as fallback.
+                if atr is not None and atr > 0:
+                    structure_stop_pips = (atr * 2.0) / max(pip_size, 1e-9)
+                else:
+                    return self._hold("invalid_structure_stop", {"trend": "down"})
 
             stop_floor_pips = self.min_stop_loss_pips
             if self._is_index_symbol(ctx.symbol) and self.index_min_stop_pct > 0:
