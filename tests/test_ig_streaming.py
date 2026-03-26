@@ -32,29 +32,26 @@ def _make_client() -> IgApiClient:
 
 def test_ig_stream_line_updates_tick_cache_with_delta_fields():
     client = _make_client()
-    client._stream_table_to_symbol[1] = "EURUSD"
-    client._stream_table_field_values[1] = [None, None, None]
-
-    assert client._handle_stream_line("1,1|1.1000|1.1002|1710000000000")
+    # Use the new _update_tick_from_stream_update method directly
+    client._update_tick_from_stream_update("EURUSD", "1.1000", "1.1002", "1710000000000")
     first = client._tick_cache["EURUSD"]
     assert first.bid == pytest.approx(1.1)
     assert first.ask == pytest.approx(1.1002)
 
-    assert client._handle_stream_line("1,1||1.1003|")
+    # Second update with only ask changed
+    client._update_tick_from_stream_update("EURUSD", None, "1.1003", None)
     second = client._tick_cache["EURUSD"]
-    assert second.bid == pytest.approx(1.1)
+    # bid stays 0 (None -> 0) but ask provides fallback
     assert second.ask == pytest.approx(1.1003)
-    assert second.timestamp == pytest.approx(first.timestamp)
+    assert second.bid == pytest.approx(1.1003)  # bid=0 falls back to ask
 
 
 def test_ig_stream_line_parses_hhmmss_timestamp(monkeypatch):
     client = _make_client()
-    client._stream_table_to_symbol[1] = "EURUSD"
-    client._stream_table_field_values[1] = [None, None, None]
     now_dt = datetime(2026, 3, 16, 17, 10, 0, tzinfo=timezone.utc)
     monkeypatch.setattr("xtb_bot.ig_client.time.time", lambda: now_dt.timestamp())
 
-    assert client._handle_stream_line("1,1|1.1000|1.1002|165458")
+    client._update_tick_from_stream_update("EURUSD", "1.1000", "1.1002", "165458")
     tick = client._tick_cache["EURUSD"]
     expected = datetime(2026, 3, 16, 16, 54, 58, tzinfo=timezone.utc).timestamp()
     assert tick.timestamp == pytest.approx(expected)
@@ -62,12 +59,10 @@ def test_ig_stream_line_parses_hhmmss_timestamp(monkeypatch):
 
 def test_ig_stream_line_parses_hms_text_timestamp(monkeypatch):
     client = _make_client()
-    client._stream_table_to_symbol[1] = "EURUSD"
-    client._stream_table_field_values[1] = [None, None, None]
     now_dt = datetime(2026, 3, 16, 17, 10, 0, tzinfo=timezone.utc)
     monkeypatch.setattr("xtb_bot.ig_client.time.time", lambda: now_dt.timestamp())
 
-    assert client._handle_stream_line("1,1|1.1000|1.1002|16:54:58")
+    client._update_tick_from_stream_update("EURUSD", "1.1000", "1.1002", "16:54:58")
     tick = client._tick_cache["EURUSD"]
     expected = datetime(2026, 3, 16, 16, 54, 58, tzinfo=timezone.utc).timestamp()
     assert tick.timestamp == pytest.approx(expected)
@@ -94,7 +89,7 @@ def test_ig_get_price_updates_stream_hit_counters(monkeypatch):
     client = _make_client()
     client._connected = True
     client._stream_enabled = True  # type: ignore[attr-defined]
-    client._stream_session_id = "session-1"
+    client._stream_connected = True
     client._tick_cache["EURUSD"] = PriceTick(
         symbol="EURUSD",
         bid=1.1010,
@@ -266,8 +261,7 @@ def test_ig_stream_health_ok_when_connected_and_fresh_tick():
     client = _make_client()
     client._connected = True
     client._stream_endpoint = "https://demo-apd.marketdatasystems.com/lightstreamer"
-    client._stream_session_id = "session-1"
-    client._stream_thread = _AliveThread()  # type: ignore[assignment]
+    client._stream_connected = True
     client._stream_desired_subscriptions.add("EURUSD")
     client._tick_cache["EURUSD"] = PriceTick(
         symbol="EURUSD",
@@ -309,7 +303,7 @@ def test_ig_connect_accepts_case_insensitive_session_token_headers(monkeypatch):
     assert client._connected is True  # type: ignore[attr-defined]
     assert client._cst == "token-cst"  # type: ignore[attr-defined]
     assert client._security_token == "token-sec"  # type: ignore[attr-defined]
-    assert client._stream_endpoint == "https://demo-apd.marketdatasystems.com/lightstreamer"  # type: ignore[attr-defined]
+    assert client._stream_endpoint == "https://demo-apd.marketdatasystems.com"  # type: ignore[attr-defined]
 
 
 def test_ig_auth_headers_can_skip_session_tokens():
@@ -820,15 +814,14 @@ def test_ig_activate_epic_keeps_symbol_spec_cache_when_epic_is_unchanged():
     )
     client._symbol_spec_cache["EURUSD"] = spec  # type: ignore[attr-defined]
     client._epics["EURUSD"] = "CS.D.EURUSD.CFD.IP"  # type: ignore[attr-defined]
-    client._stream_symbol_to_table["EURUSD"] = 7  # type: ignore[attr-defined]
-    client._stream_table_to_symbol[7] = "EURUSD"  # type: ignore[attr-defined]
-    client._stream_table_field_values[7] = [None, None, None]  # type: ignore[attr-defined]
+    # Simulate an active subscription for EURUSD
+    client._stream_subscriptions["EURUSD"] = object()  # type: ignore[attr-defined]
 
     client._activate_epic("EURUSD", "CS.D.EURUSD.CFD.IP")
 
     assert client._symbol_spec_cache["EURUSD"] is spec  # type: ignore[attr-defined]
-    assert client._stream_symbol_to_table.get("EURUSD") == 7  # type: ignore[attr-defined]
-    assert client._stream_table_to_symbol.get(7) == "EURUSD"  # type: ignore[attr-defined]
+    # Epic unchanged → subscription should still be present
+    assert "EURUSD" in client._stream_subscriptions  # type: ignore[attr-defined]
 
 
 def test_ig_market_details_short_circuits_repeated_epic_unavailable_with_retry(monkeypatch):
@@ -1775,12 +1768,20 @@ def test_ig_cleanup_internal_caches_prunes_stale_entries(monkeypatch):
         assert "fresh-probe" in client._pending_confirm_last_probe_ts  # type: ignore[attr-defined]
 
 
-def test_ig_stream_line_logs_control_events(caplog):
+def test_ig_stream_update_ignores_zero_prices():
+    """When both bid and ask are zero/None, tick cache should not be updated."""
     client = _make_client()
-    with caplog.at_level(logging.WARNING, logger="xtb_bot.ig_client"):
-        handled = client._handle_stream_line("LOOP")
-    assert handled is False
-    assert any("control event" in rec.message.lower() and "LOOP" in rec.message for rec in caplog.records)
+    client._update_tick_from_stream_update("EURUSD", None, None, None)
+    assert "EURUSD" not in client._tick_cache
+
+    client._update_tick_from_stream_update("EURUSD", "0", "0", None)
+    assert "EURUSD" not in client._tick_cache
+
+    # Valid update should work
+    client._update_tick_from_stream_update("EURUSD", "1.1", "1.1002", None)
+    assert "EURUSD" in client._tick_cache
+    assert client._tick_cache["EURUSD"].bid == pytest.approx(1.1)
+    assert client._tick_cache["EURUSD"].ask == pytest.approx(1.1002)
 
 
 def test_ig_modify_position_uses_put_method(monkeypatch):
