@@ -41,9 +41,7 @@ def test_available_strategies_contains_trend_following():
     assert "crypto_trend_following" in available_strategies()
     assert "donchian_breakout" in available_strategies()
     assert "index_hybrid" in available_strategies()
-    assert "mean_breakout" in available_strategies()
     assert "mean_breakout_v2" in available_strategies()
-    assert "mean_breakout_session" in available_strategies()
     assert "mean_reversion_bb" in available_strategies()
     assert "momentum_index" in available_strategies()
     assert "momentum_fx" in available_strategies()
@@ -1209,53 +1207,6 @@ def test_index_hybrid_blocks_mean_reversion_inside_trend_session():
     assert signal.metadata.get("reason") == "mean_reversion_blocked_by_session"
 
 
-def test_mean_breakout_buy_signal():
-    strategy = create_strategy(
-        "mean_breakout",
-        {
-            "mean_breakout_window": 5,
-            "mean_breakout_breakout_window": 3,
-            "mean_breakout_zscore_threshold": 1.0,
-        },
-    )
-    prices = [100.0, 100.0, 100.0, 100.0, 100.0, 101.0, 102.0]
-    signal = strategy.generate_signal(_ctx(prices, symbol="DE40"))
-    assert signal.side == Side.BUY
-    assert signal.metadata.get("indicator") == "mean_breakout"
-    assert signal.metadata.get("direction") == "up"
-
-
-def test_mean_breakout_sell_signal():
-    strategy = create_strategy(
-        "mean_breakout",
-        {
-            "mean_breakout_window": 5,
-            "mean_breakout_breakout_window": 3,
-            "mean_breakout_zscore_threshold": 1.0,
-        },
-    )
-    prices = [102.0, 102.0, 102.0, 102.0, 102.0, 101.0, 100.0]
-    signal = strategy.generate_signal(_ctx(prices, symbol="WTI"))
-    assert signal.side == Side.SELL
-    assert signal.metadata.get("indicator") == "mean_breakout"
-    assert signal.metadata.get("direction") == "down"
-
-
-def test_mean_breakout_holds_without_breakout():
-    strategy = create_strategy(
-        "mean_breakout",
-        {
-            "mean_breakout_window": 5,
-            "mean_breakout_breakout_window": 3,
-            "mean_breakout_zscore_threshold": 1.0,
-        },
-    )
-    prices = [100.0, 100.0, 100.0, 100.0, 101.0, 100.5, 100.7]
-    signal = strategy.generate_signal(_ctx(prices, symbol="DE40"))
-    assert signal.side == Side.HOLD
-    assert signal.metadata.get("reason") == "no_breakout"
-
-
 def test_mean_breakout_v2_buy_signal():
     strategy = create_strategy(
         "mean_breakout_v2",
@@ -1607,92 +1558,6 @@ def test_mean_breakout_v2_volume_spike_boosts_confidence():
     assert boosted_signal.side == Side.BUY
     assert boosted_signal.confidence > base_signal.confidence
     assert boosted_signal.metadata.get("volume_spike") is True
-
-
-def test_mean_breakout_session_buy_signal():
-    strategy = create_strategy(
-        "mean_breakout_session",
-        {
-            "mean_breakout_session_timezone": "UTC",
-            "mean_breakout_session_start": "09:00",
-            "mean_breakout_session_box_minutes": 15,
-            "mean_breakout_session_trade_window_minutes": 120,
-            "mean_breakout_session_one_trade_per_session": True,
-        },
-    )
-    prices = [99.5, 100.0, 101.0, 100.8, 101.4, 101.2, 102.0]
-    timestamps = [_ts("08:59"), _ts("09:00"), _ts("09:05"), _ts("09:10"), _ts("09:14"), _ts("09:15"), _ts("09:16")]
-    signal = strategy.generate_signal(_ctx(prices, symbol="DE40", timestamps=timestamps))
-    assert signal.side == Side.BUY
-    assert signal.metadata.get("indicator") == "mean_breakout_session"
-    assert signal.metadata.get("direction") == "up"
-
-
-def test_mean_breakout_session_sell_signal():
-    strategy = create_strategy(
-        "mean_breakout_session",
-        {
-            "mean_breakout_session_timezone": "UTC",
-            "mean_breakout_session_start": "09:00",
-            "mean_breakout_session_box_minutes": 15,
-            "mean_breakout_session_trade_window_minutes": 120,
-            "mean_breakout_session_one_trade_per_session": True,
-        },
-    )
-    prices = [102.0, 101.5, 101.0, 101.2, 100.8, 101.0, 100.4]
-    timestamps = [_ts("08:59"), _ts("09:00"), _ts("09:05"), _ts("09:10"), _ts("09:14"), _ts("09:15"), _ts("09:16")]
-    signal = strategy.generate_signal(_ctx(prices, symbol="WTI", timestamps=timestamps))
-    assert signal.side == Side.SELL
-    assert signal.metadata.get("indicator") == "mean_breakout_session"
-    assert signal.metadata.get("direction") == "down"
-
-
-def test_mean_breakout_session_holds_while_box_is_building():
-    strategy = create_strategy(
-        "mean_breakout_session",
-        {
-            "mean_breakout_session_timezone": "UTC",
-            "mean_breakout_session_start": "09:00",
-            "mean_breakout_session_box_minutes": 15,
-        },
-    )
-    prices = [99.5, 100.0, 101.0, 100.8]
-    timestamps = [_ts("08:59"), _ts("09:00"), _ts("09:05"), _ts("09:10")]
-    signal = strategy.generate_signal(_ctx(prices, symbol="DE40", timestamps=timestamps))
-    assert signal.side == Side.HOLD
-
-
-def test_mean_breakout_session_allows_only_one_trade_per_session():
-    strategy = create_strategy(
-        "mean_breakout_session",
-        {
-            "mean_breakout_session_timezone": "UTC",
-            "mean_breakout_session_start": "09:00",
-            "mean_breakout_session_box_minutes": 15,
-            "mean_breakout_session_one_trade_per_session": True,
-        },
-    )
-
-    prices_first = [99.5, 100.0, 101.0, 100.8, 101.4, 101.2, 102.0]
-    timestamps_first = [_ts("08:59"), _ts("09:00"), _ts("09:05"), _ts("09:10"), _ts("09:14"), _ts("09:15"), _ts("09:16")]
-    first_signal = strategy.generate_signal(_ctx(prices_first, symbol="DE40", timestamps=timestamps_first))
-    assert first_signal.side == Side.BUY
-
-    prices_second = [99.5, 100.0, 101.0, 100.8, 101.4, 101.2, 102.0, 101.3, 102.2]
-    timestamps_second = [
-        _ts("08:59"),
-        _ts("09:00"),
-        _ts("09:05"),
-        _ts("09:10"),
-        _ts("09:14"),
-        _ts("09:15"),
-        _ts("09:16"),
-        _ts("09:20"),
-        _ts("09:21"),
-    ]
-    second_signal = strategy.generate_signal(_ctx(prices_second, symbol="DE40", timestamps=timestamps_second))
-    assert second_signal.side == Side.HOLD
-    assert second_signal.metadata.get("reason") == "session_trade_already_taken"
 
 
 def test_g1_buy_signal_with_dynamic_atr_stop_and_tp():
@@ -2549,71 +2414,6 @@ def test_g1_adx_hysteresis_state_allows_between_entry_and_exit_thresholds():
     assert third.metadata.get("reason") == "adx_below_threshold"
     assert third.metadata.get("adx_regime_active_before") is True
     assert third.metadata.get("adx_regime_active_after") is False
-
-
-def test_mean_reversion_buy_signal_with_trend_filter_and_atr_sl_tp():
-    strategy = create_strategy(
-        "mean_reversion",
-        {
-            "mean_reversion_zscore_window": 5,
-            "mean_reversion_zscore_threshold": 1.0,
-            "mean_reversion_trend_filter_enabled": True,
-            "mean_reversion_trend_ma_window": 10,
-            "mean_reversion_use_atr_sl_tp": True,
-            "mean_reversion_atr_window": 3,
-            "mean_reversion_atr_multiplier": 2.0,
-            "mean_reversion_risk_reward_ratio": 1.8,
-            "mean_reversion_min_stop_loss_pips": 1.0,
-            "mean_reversion_min_take_profit_pips": 1.0,
-        },
-    )
-    prices = [99.0, 100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 106.0, 104.0]
-    signal = strategy.generate_signal(_ctx(prices, symbol="US100", tick_size=1.0))
-
-    assert signal.side == Side.BUY
-    assert signal.stop_loss_pips == pytest.approx(2.6666666666666665)
-    assert signal.take_profit_pips == pytest.approx(4.8)
-    assert signal.metadata.get("indicator") == "mean_reversion"
-    assert signal.metadata.get("zscore") is not None
-
-
-def test_mean_reversion_blocks_counter_trend_entries():
-    strategy = create_strategy(
-        "mean_reversion",
-        {
-            "mean_reversion_zscore_window": 5,
-            "mean_reversion_zscore_threshold": 1.0,
-            "mean_reversion_trend_filter_enabled": True,
-            "mean_reversion_trend_ma_window": 10,
-            "mean_reversion_use_atr_sl_tp": False,
-        },
-    )
-    prices = [111.0, 110.0, 109.0, 108.0, 107.0, 106.0, 105.0, 104.0, 103.0, 102.0, 101.0]
-    signal = strategy.generate_signal(_ctx(prices, symbol="EURUSD", tick_size=0.0001))
-
-    assert signal.side == Side.HOLD
-    assert signal.metadata.get("reason") == "blocked_by_trend_filter"
-    assert signal.metadata.get("indicator") == "mean_reversion"
-
-
-def test_mean_reversion_emits_exit_hint_when_price_reverts_to_mean():
-    strategy = create_strategy(
-        "mean_reversion",
-        {
-            "mean_reversion_zscore_window": 5,
-            "mean_reversion_zscore_threshold": 1.0,
-            "mean_reversion_exit_zscore": 0.2,
-            "mean_reversion_trend_filter_enabled": False,
-            "mean_reversion_use_atr_sl_tp": False,
-        },
-    )
-    prices = [99.0, 100.0, 101.0, 99.0, 100.0, 100.0]
-    signal = strategy.generate_signal(_ctx(prices, symbol="EURUSD", tick_size=0.0001))
-
-    assert signal.side == Side.HOLD
-    assert signal.metadata.get("reason") == "mean_reversion_target_reached"
-    assert signal.metadata.get("exit_hint") == "close_on_mean_reversion"
-    assert abs(float(signal.metadata.get("zscore", 1.0))) <= 0.2
 
 
 def test_mean_reversion_bb_sell_on_upper_band_and_rsi():

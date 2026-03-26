@@ -3101,11 +3101,6 @@ class SymbolWorker(threading.Thread):
             if position.side == Side.SELL and fast_ma >= slow_ma:
                 return f"strategy_exit:{self.strategy_name}:trend_invalidated"
 
-        if self.strategy_name == "mean_reversion":
-            if metadata.get("indicator") == "mean_reversion" and metadata.get("exit_hint") == "close_on_mean_reversion":
-                return "strategy_exit:mean_reversion:mean_reverted"
-            return None
-
         if self.strategy_name == "mean_reversion_bb":
             if metadata.get("indicator") == "bollinger_bands" and metadata.get("exit_hint") == "close_on_bb_midline":
                 return "strategy_exit:mean_reversion_bb:midline_reverted"
