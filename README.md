@@ -42,14 +42,12 @@
   - `g1` (EMA cross + ADX/ATR + динамический SL/TP, с отдельными авто-профилями для FX и индексов)
   - `donchian_breakout` (breakout-only по каналу Дончиана)
   - `index_hybrid` (гибрид для индексов: trend-following + mean-reversion + dynamic exit по каналу; неиндексные символы автоматически пропускаются)
-  - `mean_breakout` (z-score + breakout уровней: подтвержденный пробой после отклонения от среднего)
   - `mean_breakout_v2` (EMA-based z-score + Donchian breakout + slope filter + exit hints)
-  - `mean_breakout_session` (пробой opening range: коробка первых 15-30 минут сессии)
   - `mean_reversion_bb` (Bollinger Bands mean-reversion, опционально с RSI-фильтром)
   - `momentum`
   - `momentum_index` (alias `momentum` для отдельного пресета индексов в одном процессе)
   - `momentum_fx` (alias `momentum` для отдельного пресета FX в одном процессе)
-  - `mean_reversion`
+  - `multi` (мета-стратегия: запускает все стратегии одновременно, выбирает лучший сигнал голосованием + confidence; фильтр: `multi_strategies=momentum,g1,...`)
   - `trend_following` (EMA 20/80 + trend-filter по Donchian breakout и вход по pullback к EMA/середине канала)
   - `crypto_trend_following` (наследник `trend_following` с crypto-ориентированными дефолтами; поддерживает только crypto-symbols)
 - Рекомендуемое соответствие стратегий и классов инструментов:
@@ -608,30 +606,6 @@ XTB_STRATEGY_PARAMS_MEAN_BREAKOUT_V2={
 
 `mb_volume_*`:
 - опциональное подтверждение breakout по объему. При spike confidence повышается на `mb_volume_confidence_boost`; при `mb_volume_require_spike=true` без spike вход блокируется (`reason=volume_not_confirmed`).
-
-Тюнинг `mean_reversion` (анти-тренд фильтр + ATR SL/TP + выход к среднему):
-
-```bash
-XTB_STRATEGY_PARAMS_MEAN_REVERSION={
-  "mean_reversion_zscore_window":20,
-  "mean_reversion_zscore_threshold":1.8,
-  "mean_reversion_exit_zscore":0.15,
-  "mean_reversion_trend_filter_enabled":true,
-  "mean_reversion_trend_ma_window":200,
-  "mean_reversion_use_atr_sl_tp":true,
-  "mean_reversion_atr_window":14,
-  "mean_reversion_atr_multiplier":2.0,
-  "mean_reversion_risk_reward_ratio":1.8,
-  "mean_reversion_min_stop_loss_pips":20.0,
-  "mean_reversion_min_take_profit_pips":30.0
-}
-```
-
-Логика:
-- входы по Z-Score (`<= -threshold` для BUY, `>= threshold` для SELL);
-- вход разрешается только по направлению long-term SMA (`mean_reversion_trend_ma_window`);
-- `SL/TP` считаются от ATR (если включен `mean_reversion_use_atr_sl_tp`);
-- для открытой позиции бот закрывает сделку по `exit_hint=close_on_mean_reversion`, когда Z-Score возвращается к зоне `abs(z) <= mean_reversion_exit_zscore`.
 
 Тюнинг `mean_reversion_bb` (Bollinger re-entry + strict trend slope filter + volume spike confirmation):
 

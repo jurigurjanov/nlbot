@@ -6,6 +6,7 @@ from xtb_bot.strategies.donchian_breakout import DonchianBreakoutStrategy
 from xtb_bot.strategies.g1 import G1Strategy
 from xtb_bot.strategies.index_hybrid import IndexHybridStrategy
 from xtb_bot.strategies.mean_breakout_v2 import MeanBreakoutStrategyV2
+from xtb_bot.strategies.multi import MultiStrategy
 from xtb_bot.strategies.mean_reversion_bb import MeanReversionBbStrategy
 from xtb_bot.strategies.momentum import MomentumStrategy
 from xtb_bot.strategies.trend_following import TrendFollowingStrategy
@@ -18,6 +19,7 @@ _STRATEGIES: dict[str, type[Strategy]] = {
     MeanBreakoutStrategyV2.name: MeanBreakoutStrategyV2,
     MeanReversionBbStrategy.name: MeanReversionBbStrategy,
     MomentumStrategy.name: MomentumStrategy,
+    MultiStrategy.name: MultiStrategy,
     TrendFollowingStrategy.name: TrendFollowingStrategy,
     # Momentum aliases for separate presets/schedules by market regime.
     "momentum_index": MomentumStrategy,
