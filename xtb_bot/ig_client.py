@@ -46,12 +46,236 @@ from xtb_bot.models import (
     SymbolSpec,
 )
 from xtb_bot.symbols import is_index_symbol as _shared_is_index_symbol
+from xtb_bot.ig_auth_mixin import IgAuthMixin
+from xtb_bot.ig_stream_mixin import IgStreamMixin
+from xtb_bot.ig_epic_mixin import IgEpicMixin
+from xtb_bot.ig_rate_limit_mixin import IgRateLimitMixin
 
 
 logger = logging.getLogger(__name__)
 
 _RETRYABLE_HTTP_STATUS_CODES = frozenset({500, 502, 503, 504})
 _FLOAT_TEXT_PATTERN = re.compile(r"^[0-9,.\-+eE]+$")
+
+
+@dataclass(slots=True, frozen=True)
+class IgClientConfig:
+    """Consolidated environment-variable configuration for IgApiClient.
+
+    All IG-specific env-var parsing is centralised here so that
+    ``__post_init__`` only reads ``self.ig_config.<field>``.
+    """
+
+    runtime_reconnect_min_interval_sec: float = 2.0
+    stream_sdk_enabled: bool = True
+    stream_sdk_forced_transport: str | None = None
+    epic_search_enabled: bool = True
+    epic_failover_enabled: bool = True
+    stream_stale_tick_max_age_sec: float = 180.0
+    stream_rest_fallback_min_interval_sec: float = 30.0
+    stream_stagnant_quote_max_age_sec: float = 120.0
+    rest_market_min_interval_max_sec: float = 8.0
+    epic_unavailable_retry_sec: float = 45.0
+    invalid_epic_retry_sec: float = 900.0
+    index_pip_fallback_one_point: bool = True
+    guaranteed_stop_mode: str = "auto"
+    open_level_tolerance_pips: float = 0.0
+    open_use_quote_id: bool = False
+    open_force_open: bool = True
+    trade_submit_min_interval_sec: float = 0.75
+    rate_limit_enabled: bool = True
+    rate_limit_app_non_trading_per_min: int = 60
+    rate_limit_account_non_trading_per_min: int = 30
+    rate_limit_account_trading_per_min: int = 100
+    rate_limit_historical_points_per_week: int = 10000
+    request_dispatch_enabled: bool = True
+    request_dispatch_timeout_sec: float = 45.0
+    historical_http_cache_enabled: bool = True
+    historical_http_cache_ttl_sec: float = 600.0
+    historical_http_cache_max_entries: int = 256
+    connectivity_status_cache_ttl_sec: float = 10.0
+    connectivity_status_unhealthy_cache_ttl_sec: float = 2.0
+    sync_cache_max_age_sec: float = 86400.0
+    cache_cleanup_interval_sec: float = 60.0
+
+    @classmethod
+    def from_env(cls) -> "IgClientConfig":
+        """Build config by reading ``IG_*`` / ``XTB_IG_*`` environment variables."""
+
+        def _env_float(primary: str, alt: str, default: float) -> float:
+            raw = os.getenv(primary) or os.getenv(alt) or ""
+            if not raw.strip():
+                return default
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return default
+
+        def _env_bool(primary: str, alt: str, default: bool) -> bool:
+            raw = os.getenv(primary) or os.getenv(alt) or ""
+            if not raw.strip():
+                return default
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+        def _env_int(primary: str, alt: str, default: int) -> int:
+            raw = os.getenv(primary) or os.getenv(alt) or ""
+            if not raw.strip():
+                return default
+            try:
+                return int(float(raw))
+            except (TypeError, ValueError):
+                return default
+
+        def _env_str(primary: str, alt: str, default: str | None) -> str | None:
+            raw = os.getenv(primary) or os.getenv(alt)
+            if raw is None:
+                return default
+            stripped = raw.strip()
+            return stripped if stripped else default
+
+        return cls(
+            runtime_reconnect_min_interval_sec=max(
+                0.5,
+                _env_float("IG_RUNTIME_RECONNECT_MIN_INTERVAL_SEC", "XTB_IG_RUNTIME_RECONNECT_MIN_INTERVAL_SEC", 2.0),
+            ),
+            stream_sdk_enabled=_env_bool("IG_STREAM_SDK_ENABLED", "XTB_IG_STREAM_SDK_ENABLED", True),
+            stream_sdk_forced_transport=_env_str(
+                "IG_STREAM_SDK_FORCED_TRANSPORT", "XTB_IG_STREAM_SDK_FORCED_TRANSPORT", None
+            ),
+            epic_search_enabled=_env_bool("IG_EPIC_SEARCH_ENABLED", "XTB_IG_EPIC_SEARCH_ENABLED", True),
+            epic_failover_enabled=_env_bool("IG_EPIC_FAILOVER_ENABLED", "XTB_IG_EPIC_FAILOVER_ENABLED", True),
+            stream_stale_tick_max_age_sec=_env_float(
+                "IG_STREAM_STALE_TICK_MAX_AGE_SEC", "XTB_IG_STREAM_STALE_TICK_MAX_AGE_SEC", 180.0
+            ),
+            stream_rest_fallback_min_interval_sec=max(
+                0.0,
+                _env_float(
+                    "IG_STREAM_REST_FALLBACK_MIN_INTERVAL_SEC",
+                    "XTB_IG_STREAM_REST_FALLBACK_MIN_INTERVAL_SEC",
+                    30.0,
+                ),
+            ),
+            stream_stagnant_quote_max_age_sec=max(
+                0.0,
+                _env_float(
+                    "IG_STREAM_STAGNANT_QUOTE_MAX_AGE_SEC",
+                    "XTB_IG_STREAM_STAGNANT_QUOTE_MAX_AGE_SEC",
+                    120.0,
+                ),
+            ),
+            rest_market_min_interval_max_sec=_env_float(
+                "IG_REST_MARKET_MIN_INTERVAL_MAX_SEC", "XTB_IG_REST_MARKET_MIN_INTERVAL_MAX_SEC", 8.0
+            ),
+            epic_unavailable_retry_sec=max(
+                5.0,
+                _env_float("IG_EPIC_UNAVAILABLE_RETRY_SEC", "XTB_IG_EPIC_UNAVAILABLE_RETRY_SEC", 45.0),
+            ),
+            invalid_epic_retry_sec=max(
+                30.0,
+                _env_float("IG_INVALID_EPIC_RETRY_SEC", "XTB_IG_INVALID_EPIC_RETRY_SEC", 900.0),
+            ),
+            index_pip_fallback_one_point=_env_bool(
+                "IG_INDEX_PIP_FALLBACK_ONE_POINT", "XTB_IG_INDEX_PIP_FALLBACK_ONE_POINT", True
+            ),
+            guaranteed_stop_mode=_env_str("IG_GUARANTEED_STOP_MODE", "XTB_IG_GUARANTEED_STOP_MODE", "auto") or "auto",
+            open_level_tolerance_pips=max(
+                0.0,
+                _env_float("IG_OPEN_LEVEL_TOLERANCE_PIPS", "XTB_IG_OPEN_LEVEL_TOLERANCE_PIPS", 0.0),
+            ),
+            open_use_quote_id=_env_bool("IG_OPEN_USE_QUOTE_ID", "XTB_IG_OPEN_USE_QUOTE_ID", False),
+            open_force_open=_env_bool("IG_OPEN_FORCE_OPEN", "XTB_IG_OPEN_FORCE_OPEN", True),
+            trade_submit_min_interval_sec=max(
+                0.0,
+                _env_float(
+                    "IG_TRADE_SUBMIT_MIN_INTERVAL_SEC", "XTB_IG_TRADE_SUBMIT_MIN_INTERVAL_SEC", 0.75
+                ),
+            ),
+            rate_limit_enabled=_env_bool("IG_RATE_LIMIT_ENABLED", "XTB_IG_RATE_LIMIT_ENABLED", True),
+            rate_limit_app_non_trading_per_min=max(
+                0,
+                _env_int(
+                    "IG_RATE_LIMIT_APP_NON_TRADING_PER_MIN",
+                    "XTB_IG_RATE_LIMIT_APP_NON_TRADING_PER_MIN",
+                    60,
+                ),
+            ),
+            rate_limit_account_non_trading_per_min=max(
+                0,
+                _env_int(
+                    "IG_RATE_LIMIT_ACCOUNT_NON_TRADING_PER_MIN",
+                    "XTB_IG_RATE_LIMIT_ACCOUNT_NON_TRADING_PER_MIN",
+                    30,
+                ),
+            ),
+            rate_limit_account_trading_per_min=max(
+                0,
+                _env_int(
+                    "IG_RATE_LIMIT_ACCOUNT_TRADING_PER_MIN",
+                    "XTB_IG_RATE_LIMIT_ACCOUNT_TRADING_PER_MIN",
+                    100,
+                ),
+            ),
+            rate_limit_historical_points_per_week=max(
+                0,
+                _env_int(
+                    "IG_RATE_LIMIT_HISTORICAL_POINTS_PER_WEEK",
+                    "XTB_IG_RATE_LIMIT_HISTORICAL_POINTS_PER_WEEK",
+                    10000,
+                ),
+            ),
+            request_dispatch_enabled=_env_bool(
+                "IG_REQUEST_DISPATCH_ENABLED", "XTB_IG_REQUEST_DISPATCH_ENABLED", True
+            ),
+            request_dispatch_timeout_sec=max(
+                5.0,
+                _env_float(
+                    "IG_REQUEST_DISPATCH_TIMEOUT_SEC", "XTB_IG_REQUEST_DISPATCH_TIMEOUT_SEC", 45.0
+                ),
+            ),
+            historical_http_cache_enabled=_env_bool(
+                "IG_HISTORICAL_HTTP_CACHE_ENABLED", "XTB_IG_HISTORICAL_HTTP_CACHE_ENABLED", True
+            ),
+            historical_http_cache_ttl_sec=max(
+                1.0,
+                _env_float(
+                    "IG_HISTORICAL_HTTP_CACHE_TTL_SEC", "XTB_IG_HISTORICAL_HTTP_CACHE_TTL_SEC", 600.0
+                ),
+            ),
+            historical_http_cache_max_entries=max(
+                8,
+                _env_int(
+                    "IG_HISTORICAL_HTTP_CACHE_MAX_ENTRIES",
+                    "XTB_IG_HISTORICAL_HTTP_CACHE_MAX_ENTRIES",
+                    256,
+                ),
+            ),
+            connectivity_status_cache_ttl_sec=max(
+                0.0,
+                _env_float(
+                    "IG_CONNECTIVITY_STATUS_CACHE_TTL_SEC",
+                    "XTB_IG_CONNECTIVITY_STATUS_CACHE_TTL_SEC",
+                    10.0,
+                ),
+            ),
+            connectivity_status_unhealthy_cache_ttl_sec=max(
+                0.0,
+                _env_float(
+                    "IG_CONNECTIVITY_STATUS_UNHEALTHY_CACHE_TTL_SEC",
+                    "XTB_IG_CONNECTIVITY_STATUS_UNHEALTHY_CACHE_TTL_SEC",
+                    2.0,
+                ),
+            ),
+            sync_cache_max_age_sec=max(
+                300.0,
+                _env_float("IG_SYNC_CACHE_MAX_AGE_SEC", "XTB_IG_SYNC_CACHE_MAX_AGE_SEC", 86400.0),
+            ),
+            cache_cleanup_interval_sec=max(
+                5.0,
+                _env_float(
+                    "IG_CACHE_CLEANUP_INTERVAL_SEC", "XTB_IG_CACHE_CLEANUP_INTERVAL_SEC", 60.0
+                ),
+            ),
+        )
 
 
 @dataclass(slots=True)
@@ -818,7 +1042,7 @@ def _infer_margin_price_scale_divisor(
 
 
 @dataclass(slots=True)
-class IgApiClient(BaseBrokerClient):
+class IgApiClient(IgAuthMixin, IgStreamMixin, IgEpicMixin, IgRateLimitMixin, BaseBrokerClient):
     identifier: str
     password: str
     api_key: str
@@ -836,10 +1060,26 @@ class IgApiClient(BaseBrokerClient):
     connect_retry_base_sec: float = 2.0
     connect_retry_max_sec: float = 30.0
     position_update_callback: Callable[[dict[str, Any]], None] | None = None
+    ig_config: IgClientConfig = field(default_factory=IgClientConfig.from_env)
 
     def __post_init__(self) -> None:
         self.identifier = str(self.identifier).strip()
         self.api_key = str(self.api_key).strip().strip('"').strip("'")
+        # ──────────────────────────────────────────────────────────────
+        # Lock ordering (acquire in this order to avoid deadlocks):
+        #   1. _trade_submit_lock   – trade submission rate-limiting
+        #   2. _connectivity_probe_lock – connectivity health checks
+        #   3. _account_currency_code_lock – one-shot currency init
+        #   4. _runtime_reconnect_lock – reconnection attempts
+        #   5. _auth_refresh_lock      – session token refresh
+        #   6. _lock                   – general state (always last)
+        # Observed nesting:
+        #   _trade_submit_lock → _lock
+        #   _connectivity_probe_lock → _lock
+        #   _account_currency_code_lock → _lock
+        #   _runtime_reconnect_lock → _lock
+        # Rule: never acquire a higher-numbered lock while holding a lower-numbered one.
+        # ──────────────────────────────────────────────────────────────
         self._lock = threading.RLock()
         self._connectivity_probe_lock = threading.Lock()
         self._auth_refresh_lock = threading.Lock()
@@ -848,15 +1088,7 @@ class IgApiClient(BaseBrokerClient):
         self._auth_refresh_min_interval_sec = 2.0
         self._runtime_reconnect_lock = threading.Lock()
         self._runtime_reconnect_last_attempt_ts = 0.0
-        raw_runtime_reconnect_min_interval = (
-            os.getenv("IG_RUNTIME_RECONNECT_MIN_INTERVAL_SEC")
-            or os.getenv("XTB_IG_RUNTIME_RECONNECT_MIN_INTERVAL_SEC")
-            or "2.0"
-        )
-        try:
-            self._runtime_reconnect_min_interval_sec = max(0.5, float(raw_runtime_reconnect_min_interval))
-        except (TypeError, ValueError):
-            self._runtime_reconnect_min_interval_sec = 2.0
+        self._runtime_reconnect_min_interval_sec = self.ig_config.runtime_reconnect_min_interval_sec
         self._connected = False
         self._cst: str | None = None
         self._security_token: str | None = None
@@ -878,22 +1110,8 @@ class IgApiClient(BaseBrokerClient):
         self._tick_cache: dict[str, PriceTick] = {}
         self._stream_tick_handler: Callable[[PriceTick], None] | None = None
         self._stream_enabled = bool(self.stream_enabled)
-        raw_stream_sdk_enabled = (
-            os.getenv("IG_STREAM_SDK_ENABLED")
-            or os.getenv("XTB_IG_STREAM_SDK_ENABLED")
-            or "true"
-        )
-        self._stream_sdk_enabled = str(raw_stream_sdk_enabled).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        self._stream_sdk_forced_transport = (
-            os.getenv("IG_STREAM_SDK_FORCED_TRANSPORT")
-            or os.getenv("XTB_IG_STREAM_SDK_FORCED_TRANSPORT")
-            or None
-        )
+        self._stream_sdk_enabled = self.ig_config.stream_sdk_enabled
+        self._stream_sdk_forced_transport = self.ig_config.stream_sdk_forced_transport
         self._stream_sdk_available = _LightstreamerClient is not None and _LightstreamerSubscription is not None
         self._stream_use_sdk = bool(self._stream_enabled and self._stream_sdk_enabled and self._stream_sdk_available)
         self._stream_sdk_client: Any | None = None
@@ -907,28 +1125,8 @@ class IgApiClient(BaseBrokerClient):
             logger.debug(
                 "IG stream SDK is not installed; using legacy Lightstreamer transport fallback"
             )
-        raw_epic_search_enabled = (
-            os.getenv("IG_EPIC_SEARCH_ENABLED")
-            or os.getenv("XTB_IG_EPIC_SEARCH_ENABLED")
-            or "true"
-        )
-        self._epic_search_enabled = str(raw_epic_search_enabled).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        raw_epic_failover_enabled = (
-            os.getenv("IG_EPIC_FAILOVER_ENABLED")
-            or os.getenv("XTB_IG_EPIC_FAILOVER_ENABLED")
-            or "true"
-        )
-        self._epic_failover_enabled = str(raw_epic_failover_enabled).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        self._epic_search_enabled = self.ig_config.epic_search_enabled
+        self._epic_failover_enabled = self.ig_config.epic_failover_enabled
         self._price_requests_total = 0
         self._stream_price_hits_total = 0
         self._rest_fallback_hits_total = 0
@@ -953,37 +1151,13 @@ class IgApiClient(BaseBrokerClient):
         self._stream_next_retry_at: float | None = None
         self._stream_backoff_base_sec = 0.5
         self._stream_backoff_max_sec = 30.0
-        raw_stream_stale_tick_max_age = (
-            os.getenv("IG_STREAM_STALE_TICK_MAX_AGE_SEC")
-            or os.getenv("XTB_IG_STREAM_STALE_TICK_MAX_AGE_SEC")
-            or "180.0"
+        self._stream_stale_tick_max_age_sec = max(
+            float(self.stream_tick_max_age_sec),
+            self.ig_config.stream_stale_tick_max_age_sec,
         )
-        try:
-            self._stream_stale_tick_max_age_sec = max(
-                float(self.stream_tick_max_age_sec),
-                float(raw_stream_stale_tick_max_age),
-            )
-        except (TypeError, ValueError):
-            self._stream_stale_tick_max_age_sec = max(float(self.stream_tick_max_age_sec), 180.0)
-        raw_stream_rest_fallback_min_interval = (
-            os.getenv("IG_STREAM_REST_FALLBACK_MIN_INTERVAL_SEC")
-            or os.getenv("XTB_IG_STREAM_REST_FALLBACK_MIN_INTERVAL_SEC")
-            or "30.0"
-        )
-        try:
-            self._stream_rest_fallback_min_interval_sec = max(0.0, float(raw_stream_rest_fallback_min_interval))
-        except (TypeError, ValueError):
-            self._stream_rest_fallback_min_interval_sec = 30.0
+        self._stream_rest_fallback_min_interval_sec = self.ig_config.stream_rest_fallback_min_interval_sec
         self._last_stream_rest_fallback_ts_by_symbol: dict[str, float] = {}
-        raw_stream_stagnant_quote_max_age = (
-            os.getenv("IG_STREAM_STAGNANT_QUOTE_MAX_AGE_SEC")
-            or os.getenv("XTB_IG_STREAM_STAGNANT_QUOTE_MAX_AGE_SEC")
-            or "120.0"
-        )
-        try:
-            self._stream_stagnant_quote_max_age_sec = max(0.0, float(raw_stream_stagnant_quote_max_age))
-        except (TypeError, ValueError):
-            self._stream_stagnant_quote_max_age_sec = 120.0
+        self._stream_stagnant_quote_max_age_sec = self.ig_config.stream_stagnant_quote_max_age_sec
         self._stream_last_quote_change_ts_by_symbol: dict[str, float] = {}
 
         self._allowance_cooldown_until_ts = 0.0
@@ -997,40 +1171,13 @@ class IgApiClient(BaseBrokerClient):
         if not math.isfinite(rest_interval_floor) or rest_interval_floor <= 0:
             rest_interval_floor = 0.2
         self._rest_market_min_interval_floor_sec = max(0.2, rest_interval_floor)
-        raw_rest_market_max_interval = (
-            os.getenv("IG_REST_MARKET_MIN_INTERVAL_MAX_SEC")
-            or os.getenv("XTB_IG_REST_MARKET_MIN_INTERVAL_MAX_SEC")
-            or "8.0"
+        self._rest_market_min_interval_max_sec = max(
+            self._rest_market_min_interval_floor_sec,
+            self.ig_config.rest_market_min_interval_max_sec,
         )
-        try:
-            self._rest_market_min_interval_max_sec = max(
-                self._rest_market_min_interval_floor_sec,
-                float(raw_rest_market_max_interval),
-            )
-        except (TypeError, ValueError):
-            self._rest_market_min_interval_max_sec = max(
-                self._rest_market_min_interval_floor_sec,
-                8.0,
-            )
-        raw_epic_unavailable_retry_sec = (
-            os.getenv("IG_EPIC_UNAVAILABLE_RETRY_SEC")
-            or os.getenv("XTB_IG_EPIC_UNAVAILABLE_RETRY_SEC")
-            or "45.0"
-        )
-        try:
-            self._epic_unavailable_retry_sec = max(5.0, float(raw_epic_unavailable_retry_sec))
-        except (TypeError, ValueError):
-            self._epic_unavailable_retry_sec = 45.0
+        self._epic_unavailable_retry_sec = self.ig_config.epic_unavailable_retry_sec
         self._epic_unavailable_until_ts_by_symbol: dict[str, float] = {}
-        raw_invalid_epic_retry_sec = (
-            os.getenv("IG_INVALID_EPIC_RETRY_SEC")
-            or os.getenv("XTB_IG_INVALID_EPIC_RETRY_SEC")
-            or "900.0"
-        )
-        try:
-            self._invalid_epic_retry_sec = max(30.0, float(raw_invalid_epic_retry_sec))
-        except (TypeError, ValueError):
-            self._invalid_epic_retry_sec = 900.0
+        self._invalid_epic_retry_sec = self.ig_config.invalid_epic_retry_sec
         self._invalid_epic_until_ts_by_symbol: dict[str, dict[str, float]] = {}
         self._invalid_epic_warn_last_ts_by_key: dict[tuple[str, str, str], float] = {}
         self._epic_remap_warn_last_ts_by_symbol: dict[str, float] = {}
@@ -1039,121 +1186,31 @@ class IgApiClient(BaseBrokerClient):
         self._stream_subscription_retry_gap_sec = 1.0
         self._stream_rest_fallback_block_until_ts_by_symbol: dict[str, float] = {}
         self._stream_rest_fallback_block_reason_by_symbol: dict[str, str] = {}
-        raw_index_pip_fallback_one_point = (
-            os.getenv("IG_INDEX_PIP_FALLBACK_ONE_POINT")
-            or os.getenv("XTB_IG_INDEX_PIP_FALLBACK_ONE_POINT")
-            or "true"
-        )
-        self._index_pip_fallback_one_point = str(raw_index_pip_fallback_one_point).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        raw_guaranteed_stop_mode = (
-            os.getenv("IG_GUARANTEED_STOP_MODE")
-            or os.getenv("XTB_IG_GUARANTEED_STOP_MODE")
-            or "auto"
-        )
-        normalized_guaranteed_stop_mode = str(raw_guaranteed_stop_mode).strip().lower()
+        self._index_pip_fallback_one_point = self.ig_config.index_pip_fallback_one_point
+        normalized_guaranteed_stop_mode = str(self.ig_config.guaranteed_stop_mode).strip().lower()
         if normalized_guaranteed_stop_mode not in {"off", "auto", "required"}:
             logger.warning(
                 "Invalid IG_GUARANTEED_STOP_MODE=%s, fallback to auto",
-                raw_guaranteed_stop_mode,
+                self.ig_config.guaranteed_stop_mode,
             )
             normalized_guaranteed_stop_mode = "auto"
         self._guaranteed_stop_mode = normalized_guaranteed_stop_mode
         self._guaranteed_stop_required_symbols: set[str] = set()
-        raw_open_level_tolerance_pips = (
-            os.getenv("IG_OPEN_LEVEL_TOLERANCE_PIPS")
-            or os.getenv("XTB_IG_OPEN_LEVEL_TOLERANCE_PIPS")
-            or "0.0"
-        )
-        try:
-            self._open_level_tolerance_pips = max(0.0, float(raw_open_level_tolerance_pips))
-        except (TypeError, ValueError):
-            self._open_level_tolerance_pips = 0.0
-        raw_open_use_quote_id = (
-            os.getenv("IG_OPEN_USE_QUOTE_ID")
-            or os.getenv("XTB_IG_OPEN_USE_QUOTE_ID")
-            or "false"
-        )
-        self._open_use_quote_id = _as_bool(raw_open_use_quote_id, False)
-        raw_open_force_open = (
-            os.getenv("IG_OPEN_FORCE_OPEN")
-            or os.getenv("XTB_IG_OPEN_FORCE_OPEN")
-            or "true"
-        )
-        self._open_force_open = _as_bool(raw_open_force_open, True)
+        self._open_level_tolerance_pips = self.ig_config.open_level_tolerance_pips
+        self._open_use_quote_id = self.ig_config.open_use_quote_id
+        self._open_force_open = self.ig_config.open_force_open
         self._critical_trade_active_total = 0
         self._critical_trade_owner_threads: dict[int, int] = {}
-        raw_trade_submit_min_interval = (
-            os.getenv("IG_TRADE_SUBMIT_MIN_INTERVAL_SEC")
-            or os.getenv("XTB_IG_TRADE_SUBMIT_MIN_INTERVAL_SEC")
-            or "0.75"
-        )
-        try:
-            self._trade_submit_min_interval_sec = max(0.0, float(raw_trade_submit_min_interval))
-        except (TypeError, ValueError):
-            self._trade_submit_min_interval_sec = 0.75
+        self._trade_submit_min_interval_sec = self.ig_config.trade_submit_min_interval_sec
         self._trade_submit_next_allowed_ts = 0.0
         self._trade_submit_lock = threading.RLock()
         self._request_context = threading.local()
 
-        raw_rate_limit_enabled = (
-            os.getenv("IG_RATE_LIMIT_ENABLED")
-            or os.getenv("XTB_IG_RATE_LIMIT_ENABLED")
-            or "true"
-        )
-        self._rate_limit_enabled = _as_bool(raw_rate_limit_enabled, True)
-        raw_app_non_trading_limit = (
-            os.getenv("IG_RATE_LIMIT_APP_NON_TRADING_PER_MIN")
-            or os.getenv("XTB_IG_RATE_LIMIT_APP_NON_TRADING_PER_MIN")
-            or "60"
-        )
-        raw_account_non_trading_limit = (
-            os.getenv("IG_RATE_LIMIT_ACCOUNT_NON_TRADING_PER_MIN")
-            or os.getenv("XTB_IG_RATE_LIMIT_ACCOUNT_NON_TRADING_PER_MIN")
-            or "30"
-        )
-        raw_account_trading_limit = (
-            os.getenv("IG_RATE_LIMIT_ACCOUNT_TRADING_PER_MIN")
-            or os.getenv("XTB_IG_RATE_LIMIT_ACCOUNT_TRADING_PER_MIN")
-            or "100"
-        )
-        raw_historical_points_limit = (
-            os.getenv("IG_RATE_LIMIT_HISTORICAL_POINTS_PER_WEEK")
-            or os.getenv("XTB_IG_RATE_LIMIT_HISTORICAL_POINTS_PER_WEEK")
-            or "10000"
-        )
-        try:
-            self._rate_limit_app_non_trading_per_min = max(
-                0,
-                int(float(raw_app_non_trading_limit)),
-            )
-        except (TypeError, ValueError):
-            self._rate_limit_app_non_trading_per_min = 60
-        try:
-            self._rate_limit_account_non_trading_per_min = max(
-                0,
-                int(float(raw_account_non_trading_limit)),
-            )
-        except (TypeError, ValueError):
-            self._rate_limit_account_non_trading_per_min = 30
-        try:
-            self._rate_limit_account_trading_per_min = max(
-                0,
-                int(float(raw_account_trading_limit)),
-            )
-        except (TypeError, ValueError):
-            self._rate_limit_account_trading_per_min = 100
-        try:
-            self._rate_limit_historical_points_per_week = max(
-                0,
-                int(float(raw_historical_points_limit)),
-            )
-        except (TypeError, ValueError):
-            self._rate_limit_historical_points_per_week = 10000
+        self._rate_limit_enabled = self.ig_config.rate_limit_enabled
+        self._rate_limit_app_non_trading_per_min = self.ig_config.rate_limit_app_non_trading_per_min
+        self._rate_limit_account_non_trading_per_min = self.ig_config.rate_limit_account_non_trading_per_min
+        self._rate_limit_account_trading_per_min = self.ig_config.rate_limit_account_trading_per_min
+        self._rate_limit_historical_points_per_week = self.ig_config.rate_limit_historical_points_per_week
         self._rate_limit_window_sec = 60.0
         self._rate_limit_week_window_sec = 7.0 * 24.0 * 60.0 * 60.0
         self._rate_limit_app_non_trading_requests: deque[float] = deque()
@@ -1176,21 +1233,8 @@ class IgApiClient(BaseBrokerClient):
         self._rate_limit_worker_last_block_ts: dict[str, float] = {
             key: 0.0 for key in self._rate_limit_worker_keys
         }
-        raw_request_dispatch_enabled = (
-            os.getenv("IG_REQUEST_DISPATCH_ENABLED")
-            or os.getenv("XTB_IG_REQUEST_DISPATCH_ENABLED")
-            or "true"
-        )
-        self._request_dispatch_enabled = _as_bool(raw_request_dispatch_enabled, True)
-        raw_request_dispatch_timeout = (
-            os.getenv("IG_REQUEST_DISPATCH_TIMEOUT_SEC")
-            or os.getenv("XTB_IG_REQUEST_DISPATCH_TIMEOUT_SEC")
-            or "45.0"
-        )
-        try:
-            self._request_dispatch_timeout_sec = max(5.0, float(raw_request_dispatch_timeout))
-        except (TypeError, ValueError):
-            self._request_dispatch_timeout_sec = 45.0
+        self._request_dispatch_enabled = self.ig_config.request_dispatch_enabled
+        self._request_dispatch_timeout_sec = self.ig_config.request_dispatch_timeout_sec
         self._request_worker_queue_maxsize = 2048
         self._request_worker_stop_event = threading.Event()
         self._request_worker_thread_ids: dict[int, str] = {}
@@ -1198,59 +1242,16 @@ class IgApiClient(BaseBrokerClient):
         self._request_worker_queues: dict[str, Queue[_QueuedRequestJob | None]] = {
             key: Queue(maxsize=self._request_worker_queue_maxsize) for key in self._rate_limit_worker_keys
         }
-        raw_historical_http_cache_enabled = (
-            os.getenv("IG_HISTORICAL_HTTP_CACHE_ENABLED")
-            or os.getenv("XTB_IG_HISTORICAL_HTTP_CACHE_ENABLED")
-            or "true"
-        )
-        self._historical_http_cache_enabled = _as_bool(raw_historical_http_cache_enabled, True)
-        raw_historical_http_cache_ttl_sec = (
-            os.getenv("IG_HISTORICAL_HTTP_CACHE_TTL_SEC")
-            or os.getenv("XTB_IG_HISTORICAL_HTTP_CACHE_TTL_SEC")
-            or "600"
-        )
-        try:
-            self._historical_http_cache_ttl_sec = max(1.0, float(raw_historical_http_cache_ttl_sec))
-        except (TypeError, ValueError):
-            self._historical_http_cache_ttl_sec = 600.0
-        raw_historical_http_cache_max_entries = (
-            os.getenv("IG_HISTORICAL_HTTP_CACHE_MAX_ENTRIES")
-            or os.getenv("XTB_IG_HISTORICAL_HTTP_CACHE_MAX_ENTRIES")
-            or "256"
-        )
-        try:
-            self._historical_http_cache_max_entries = max(
-                8,
-                int(float(raw_historical_http_cache_max_entries)),
-            )
-        except (TypeError, ValueError):
-            self._historical_http_cache_max_entries = 256
+        self._historical_http_cache_enabled = self.ig_config.historical_http_cache_enabled
+        self._historical_http_cache_ttl_sec = self.ig_config.historical_http_cache_ttl_sec
+        self._historical_http_cache_max_entries = self.ig_config.historical_http_cache_max_entries
         self._historical_http_cache: OrderedDict[str, tuple[float, dict[str, Any], dict[str, str]]] = OrderedDict()
 
         self._account_snapshot_cache: AccountSnapshot | None = None
         self._account_snapshot_cached_at = 0.0
         self._account_snapshot_cache_ttl_sec = 10.0
-        raw_connectivity_status_cache_ttl_sec = (
-            os.getenv("IG_CONNECTIVITY_STATUS_CACHE_TTL_SEC")
-            or os.getenv("XTB_IG_CONNECTIVITY_STATUS_CACHE_TTL_SEC")
-            or "10.0"
-        )
-        try:
-            self._connectivity_status_cache_ttl_sec = max(0.0, float(raw_connectivity_status_cache_ttl_sec))
-        except (TypeError, ValueError):
-            self._connectivity_status_cache_ttl_sec = 10.0
-        raw_connectivity_status_unhealthy_cache_ttl_sec = (
-            os.getenv("IG_CONNECTIVITY_STATUS_UNHEALTHY_CACHE_TTL_SEC")
-            or os.getenv("XTB_IG_CONNECTIVITY_STATUS_UNHEALTHY_CACHE_TTL_SEC")
-            or "2.0"
-        )
-        try:
-            self._connectivity_status_unhealthy_cache_ttl_sec = max(
-                0.0,
-                float(raw_connectivity_status_unhealthy_cache_ttl_sec),
-            )
-        except (TypeError, ValueError):
-            self._connectivity_status_unhealthy_cache_ttl_sec = 2.0
+        self._connectivity_status_cache_ttl_sec = self.ig_config.connectivity_status_cache_ttl_sec
+        self._connectivity_status_unhealthy_cache_ttl_sec = self.ig_config.connectivity_status_unhealthy_cache_ttl_sec
         self._connectivity_status_cache: ConnectivityStatus | None = None
         self._connectivity_status_cache_ts = 0.0
         self._account_currency_code: str | None = None
@@ -1259,24 +1260,8 @@ class IgApiClient(BaseBrokerClient):
         self._position_close_sync: dict[str, dict[str, Any]] = {}
         self._pending_confirm_last_probe_ts: dict[str, float] = {}
         self._pending_confirm_probe_min_interval_sec = 30.0
-        raw_sync_cache_max_age_sec = (
-            os.getenv("IG_SYNC_CACHE_MAX_AGE_SEC")
-            or os.getenv("XTB_IG_SYNC_CACHE_MAX_AGE_SEC")
-            or "86400"
-        )
-        try:
-            self._sync_cache_max_age_sec = max(300.0, float(raw_sync_cache_max_age_sec))
-        except (TypeError, ValueError):
-            self._sync_cache_max_age_sec = 86400.0
-        raw_cache_cleanup_interval_sec = (
-            os.getenv("IG_CACHE_CLEANUP_INTERVAL_SEC")
-            or os.getenv("XTB_IG_CACHE_CLEANUP_INTERVAL_SEC")
-            or "60"
-        )
-        try:
-            self._cache_cleanup_interval_sec = max(5.0, float(raw_cache_cleanup_interval_sec))
-        except (TypeError, ValueError):
-            self._cache_cleanup_interval_sec = 60.0
+        self._sync_cache_max_age_sec = self.ig_config.sync_cache_max_age_sec
+        self._cache_cleanup_interval_sec = self.ig_config.cache_cleanup_interval_sec
         self._last_cache_cleanup_ts = 0.0
         self.connect_retry_attempts = max(1, int(self.connect_retry_attempts))
         self.connect_retry_base_sec = max(0.5, float(self.connect_retry_base_sec))
@@ -1301,54 +1286,14 @@ class IgApiClient(BaseBrokerClient):
             return "https://api.ig.com/gateway/deal"
         return "https://demo-api.ig.com/gateway/deal"
 
-    def _auth_headers(self, include_session_tokens: bool = True) -> dict[str, str]:
-        headers = {
-            "Accept": "application/json; charset=UTF-8",
-            "Content-Type": "application/json; charset=UTF-8",
-            "X-IG-API-KEY": self.api_key,
-        }
-        if include_session_tokens and self._cst:
-            headers["CST"] = self._cst
-        if include_session_tokens and self._security_token:
-            headers["X-SECURITY-TOKEN"] = self._security_token
-        return headers
 
     @staticmethod
     def _form_body(params: dict[str, Any]) -> bytes:
         payload = {key: str(value) for key, value in params.items() if value is not None}
         return parse.urlencode(payload).encode("utf-8")
 
-    @staticmethod
-    def _is_trade_critical_request(method: str, path: str) -> bool:
-        normalized_path = str(path).split("?", 1)[0]
-        upper_method = str(method).upper().strip()
-        if normalized_path.startswith("/confirms/") and upper_method == "GET":
-            return True
-        if normalized_path == "/positions/otc" and upper_method in {"POST", "DELETE"}:
-            return True
-        if normalized_path.startswith("/positions/otc/") and upper_method == "PUT":
-            return True
-        return False
 
-    @staticmethod
-    def _is_trading_allowance_request(method: str, path: str) -> bool:
-        normalized_path = str(path).split("?", 1)[0]
-        upper_method = str(method).upper().strip()
-        if normalized_path == "/positions/otc" and upper_method in {"POST", "DELETE", "PUT"}:
-            return True
-        if normalized_path.startswith("/positions/otc/") and upper_method in {"PUT", "DELETE"}:
-            return True
-        if normalized_path == "/workingorders/otc" and upper_method in {"POST", "DELETE", "PUT"}:
-            return True
-        if normalized_path.startswith("/workingorders/otc/") and upper_method in {"PUT", "DELETE"}:
-            return True
-        return False
 
-    @staticmethod
-    def _is_historical_price_request(path: str, method: str) -> bool:
-        normalized_path = str(path).split("?", 1)[0]
-        upper_method = str(method).upper().strip()
-        return upper_method == "GET" and normalized_path.startswith("/prices/")
 
     @staticmethod
     def _is_position_update_request_path(path: str) -> bool:
@@ -1523,343 +1468,22 @@ class IgApiClient(BaseBrokerClient):
                 exc_info=True,
             )
 
-    @staticmethod
-    def _parse_positive_int(value: Any) -> int:
-        try:
-            parsed = int(float(value))
-        except (TypeError, ValueError):
-            return 0
-        return max(0, parsed)
 
-    def _extract_requested_history_points(self, path: str, query: dict[str, Any] | None) -> int:
-        if not self._is_historical_price_request(path, "GET"):
-            return 0
-        candidates: list[Any] = []
-        if isinstance(query, dict):
-            for key in ("max", "numPoints", "pageSize", "count"):
-                if key in query and query.get(key) is not None:
-                    candidates.append(query.get(key))
-        parsed_url = parse.urlsplit(str(path))
-        if parsed_url.query:
-            query_params = parse.parse_qs(parsed_url.query, keep_blank_values=False)
-            for key in ("max", "numPoints", "pageSize", "count"):
-                values = query_params.get(key)
-                if values:
-                    candidates.append(values[-1])
-        for candidate in candidates:
-            points = self._parse_positive_int(candidate)
-            if points > 0:
-                return points
-        return 1
 
-    @staticmethod
-    def _request_window_wait_locked(
-        timestamps: deque[float],
-        limit_per_window: int,
-        now_ts: float,
-        window_sec: float,
-    ) -> float:
-        if limit_per_window <= 0:
-            return float("inf")
-        while timestamps and (now_ts - timestamps[0]) >= window_sec:
-            timestamps.popleft()
-        if len(timestamps) < limit_per_window:
-            return 0.0
-        wait_sec = window_sec - (now_ts - timestamps[0])
-        if not math.isfinite(wait_sec):
-            return 0.0
-        return max(0.0, wait_sec)
 
-    def _prune_historical_points_window_locked(self, now_ts: float) -> None:
-        window_sec = float(self._rate_limit_week_window_sec)
-        while self._rate_limit_historical_points_events:
-            event_ts, points = self._rate_limit_historical_points_events[0]
-            if (now_ts - event_ts) < window_sec:
-                break
-            self._rate_limit_historical_points_events.popleft()
-            self._rate_limit_historical_points_week_total = max(
-                0,
-                int(self._rate_limit_historical_points_week_total) - int(points),
-            )
 
-    def _record_rate_limit_worker_block_locked(self, worker_key: str, now_ts: float) -> None:
-        normalized = str(worker_key).strip().lower()
-        if normalized not in self._rate_limit_worker_blocked_total:
-            return
-        self._rate_limit_worker_blocked_total[normalized] = (
-            int(self._rate_limit_worker_blocked_total.get(normalized, 0)) + 1
-        )
-        self._rate_limit_worker_last_block_ts[normalized] = float(now_ts)
 
-    def _record_rate_limit_worker_request_locked(self, worker_key: str, now_ts: float) -> None:
-        normalized = str(worker_key).strip().lower()
-        if normalized not in self._rate_limit_worker_last_request_ts:
-            return
-        self._rate_limit_worker_last_request_ts[normalized] = float(now_ts)
 
-    def _rate_limit_worker_usage_snapshot_locked(self, now_ts: float) -> list[dict[str, Any]]:
-        self._request_window_wait_locked(
-            self._rate_limit_app_non_trading_requests,
-            int(self._rate_limit_app_non_trading_per_min),
-            now_ts,
-            self._rate_limit_window_sec,
-        )
-        self._request_window_wait_locked(
-            self._rate_limit_account_non_trading_requests,
-            int(self._rate_limit_account_non_trading_per_min),
-            now_ts,
-            self._rate_limit_window_sec,
-        )
-        self._request_window_wait_locked(
-            self._rate_limit_account_trading_requests,
-            int(self._rate_limit_account_trading_per_min),
-            now_ts,
-            self._rate_limit_window_sec,
-        )
-        self._prune_historical_points_window_locked(now_ts)
 
-        app_used = int(len(self._rate_limit_app_non_trading_requests))
-        app_limit = int(self._rate_limit_app_non_trading_per_min)
-        account_non_trading_used = int(len(self._rate_limit_account_non_trading_requests))
-        account_non_trading_limit = int(self._rate_limit_account_non_trading_per_min)
-        trading_used = int(len(self._rate_limit_account_trading_requests))
-        trading_limit = int(self._rate_limit_account_trading_per_min)
-        historical_used = int(self._rate_limit_historical_points_week_total)
-        historical_limit = int(self._rate_limit_historical_points_per_week)
 
-        return [
-            {
-                "worker_key": "app_non_trading",
-                "limit_scope": "per_app",
-                "limit_unit": "requests_per_minute",
-                "limit_value": app_limit,
-                "used_value": app_used,
-                "remaining_value": max(0, app_limit - app_used),
-                "window_sec": float(self._rate_limit_window_sec),
-                "blocked_total": int(self._rate_limit_worker_blocked_total.get("app_non_trading", 0)),
-                "last_request_ts": float(self._rate_limit_worker_last_request_ts.get("app_non_trading", 0.0) or 0.0),
-                "last_block_ts": float(self._rate_limit_worker_last_block_ts.get("app_non_trading", 0.0) or 0.0),
-                "notes": "IG per-app non-trading requests/minute",
-            },
-            {
-                "worker_key": "account_trading",
-                "limit_scope": "per_account",
-                "limit_unit": "requests_per_minute",
-                "limit_value": trading_limit,
-                "used_value": trading_used,
-                "remaining_value": max(0, trading_limit - trading_used),
-                "window_sec": float(self._rate_limit_window_sec),
-                "blocked_total": int(self._rate_limit_worker_blocked_total.get("account_trading", 0)),
-                "last_request_ts": float(self._rate_limit_worker_last_request_ts.get("account_trading", 0.0) or 0.0),
-                "last_block_ts": float(self._rate_limit_worker_last_block_ts.get("account_trading", 0.0) or 0.0),
-                "notes": "IG per-account trading requests/minute",
-            },
-            {
-                "worker_key": "account_non_trading",
-                "limit_scope": "per_account",
-                "limit_unit": "requests_per_minute",
-                "limit_value": account_non_trading_limit,
-                "used_value": account_non_trading_used,
-                "remaining_value": max(0, account_non_trading_limit - account_non_trading_used),
-                "window_sec": float(self._rate_limit_window_sec),
-                "blocked_total": int(self._rate_limit_worker_blocked_total.get("account_non_trading", 0)),
-                "last_request_ts": float(self._rate_limit_worker_last_request_ts.get("account_non_trading", 0.0) or 0.0),
-                "last_block_ts": float(self._rate_limit_worker_last_block_ts.get("account_non_trading", 0.0) or 0.0),
-                "notes": "IG per-account non-trading requests/minute",
-            },
-            {
-                "worker_key": "historical_points",
-                "limit_scope": "per_app",
-                "limit_unit": "points_per_week",
-                "limit_value": historical_limit,
-                "used_value": historical_used,
-                "remaining_value": max(0, historical_limit - historical_used),
-                "window_sec": float(self._rate_limit_week_window_sec),
-                "blocked_total": int(self._rate_limit_worker_blocked_total.get("historical_points", 0)),
-                "last_request_ts": float(self._rate_limit_worker_last_request_ts.get("historical_points", 0.0) or 0.0),
-                "last_block_ts": float(self._rate_limit_worker_last_block_ts.get("historical_points", 0.0) or 0.0),
-                "notes": "IG historical price data points/week",
-            },
-        ]
 
-    def get_rate_limit_workers_snapshot(self) -> list[dict[str, Any]]:
-        with self._lock:
-            now_ts = time.time()
-            return self._rate_limit_worker_usage_snapshot_locked(now_ts)
 
-    def _reserve_request_rate_limit_slot(
-        self,
-        method: str,
-        path: str,
-        query: dict[str, Any] | None,
-    ) -> None:
-        if not self._rate_limit_enabled:
-            return
-        normalized_path = str(path).split("?", 1)[0]
-        upper_method = str(method).upper().strip()
-        is_trading = self._is_trading_allowance_request(upper_method, normalized_path)
-        requested_history_points = (
-            self._extract_requested_history_points(path, query)
-            if self._is_historical_price_request(normalized_path, upper_method)
-            else 0
-        )
-        is_historical = requested_history_points > 0
-        sleep_cap_sec = 0.25
-        while True:
-            sleep_sec = 0.0
-            with self._lock:
-                now_ts = time.time()
-                if is_trading:
-                    trading_wait_sec = self._request_window_wait_locked(
-                        self._rate_limit_account_trading_requests,
-                        int(self._rate_limit_account_trading_per_min),
-                        now_ts,
-                        self._rate_limit_window_sec,
-                    )
-                    sleep_sec = trading_wait_sec
-                    if trading_wait_sec > 0:
-                        self._record_rate_limit_worker_block_locked("account_trading", now_ts)
-                else:
-                    account_non_trading_wait_sec = self._request_window_wait_locked(
-                        self._rate_limit_account_non_trading_requests,
-                        int(self._rate_limit_account_non_trading_per_min),
-                        now_ts,
-                        self._rate_limit_window_sec,
-                    )
-                    app_non_trading_wait_sec = self._request_window_wait_locked(
-                        self._rate_limit_app_non_trading_requests,
-                        int(self._rate_limit_app_non_trading_per_min),
-                        now_ts,
-                        self._rate_limit_window_sec,
-                    )
-                    sleep_sec = max(account_non_trading_wait_sec, app_non_trading_wait_sec)
-                    if account_non_trading_wait_sec > 0:
-                        self._record_rate_limit_worker_block_locked("account_non_trading", now_ts)
-                    if app_non_trading_wait_sec > 0:
-                        self._record_rate_limit_worker_block_locked("app_non_trading", now_ts)
 
-                if not math.isfinite(sleep_sec):
-                    worker_key = "account_trading" if is_trading else "account_non_trading"
-                    raise BrokerError(
-                        "IG local rate limiter blocks all requests for this allowance window "
-                        f"(worker={worker_key}, limit=0)"
-                    )
-                if sleep_sec <= 0:
-                    if requested_history_points > 0 and self._rate_limit_historical_points_per_week > 0:
-                        requested = int(requested_history_points)
-                        weekly_limit = int(self._rate_limit_historical_points_per_week)
-                        if requested > weekly_limit:
-                            self._record_rate_limit_worker_block_locked("historical_points", now_ts)
-                            raise BrokerError(
-                                "IG historical price request exceeds weekly allowance "
-                                f"(requested={requested}, weekly_limit={weekly_limit})"
-                            )
-                        self._prune_historical_points_window_locked(now_ts)
-                        weekly_used = int(self._rate_limit_historical_points_week_total)
-                        if (weekly_used + requested) > weekly_limit:
-                            self._record_rate_limit_worker_block_locked("historical_points", now_ts)
-                            raise BrokerError(
-                                "IG historical price weekly allowance exceeded by local limiter "
-                                f"(used={weekly_used}, requested={requested}, weekly_limit={weekly_limit})"
-                            )
-                    if is_trading:
-                        self._rate_limit_account_trading_requests.append(now_ts)
-                        self._record_rate_limit_worker_request_locked("account_trading", now_ts)
-                    else:
-                        self._rate_limit_account_non_trading_requests.append(now_ts)
-                        self._rate_limit_app_non_trading_requests.append(now_ts)
-                        self._record_rate_limit_worker_request_locked("account_non_trading", now_ts)
-                        self._record_rate_limit_worker_request_locked("app_non_trading", now_ts)
-                    if requested_history_points > 0 and self._rate_limit_historical_points_per_week > 0:
-                        points = int(requested_history_points)
-                        self._rate_limit_historical_points_events.append((now_ts, points))
-                        self._rate_limit_historical_points_week_total += points
-                    if is_historical:
-                        self._record_rate_limit_worker_request_locked("historical_points", now_ts)
-                    return
-            time.sleep(min(sleep_cap_sec, sleep_sec))
 
-    @staticmethod
-    def _is_non_critical_rest_request(method: str, path: str) -> bool:
-        return not IgApiClient._is_trade_critical_request(method, path)
 
-    def _critical_trade_active_for_other_threads(self) -> bool:
-        thread_id = threading.get_ident()
-        with self._lock:
-            if self._critical_trade_active_total <= 0:
-                return False
-            return self._critical_trade_owner_threads.get(thread_id, 0) <= 0
 
-    def _current_thread_has_critical_trade_context(self) -> bool:
-        thread_id = threading.get_ident()
-        with self._lock:
-            return self._critical_trade_owner_threads.get(thread_id, 0) > 0
 
-    def _current_thread_request_critical_bypass(self) -> bool:
-        return bool(getattr(self._request_context, "critical_bypass", False))
 
-    def _should_defer_non_critical_request(self, method: str, path: str) -> bool:
-        if not self._critical_trade_active_for_other_threads():
-            return False
-        return self._is_non_critical_rest_request(method, path)
-
-    def _critical_trade_defer_remaining_sec(self) -> float:
-        now = time.time()
-        with self._lock:
-            remaining = max(0.0, self._trade_submit_next_allowed_ts - now)
-            if self._critical_trade_active_total > 0:
-                remaining = max(remaining, float(self._trade_submit_min_interval_sec))
-        return max(0.1, remaining)
-
-    @contextmanager
-    def _critical_trade_operation(self, operation: str):
-        _ = operation
-        thread_id = threading.get_ident()
-        with self._trade_submit_lock:
-            while True:
-                with self._lock:
-                    wait_sec = self._trade_submit_next_allowed_ts - time.time()
-                if wait_sec <= 0:
-                    break
-                time.sleep(min(wait_sec, 0.25))
-            with self._lock:
-                self._critical_trade_active_total += 1
-                self._critical_trade_owner_threads[thread_id] = self._critical_trade_owner_threads.get(thread_id, 0) + 1
-        try:
-            yield
-        finally:
-            with self._lock:
-                current = self._critical_trade_owner_threads.get(thread_id, 0)
-                if current <= 1:
-                    self._critical_trade_owner_threads.pop(thread_id, None)
-                else:
-                    self._critical_trade_owner_threads[thread_id] = current - 1
-                self._critical_trade_active_total = max(0, self._critical_trade_active_total - 1)
-                min_interval = max(0.0, float(self._trade_submit_min_interval_sec))
-                if min_interval > 0:
-                    self._trade_submit_next_allowed_ts = max(
-                        self._trade_submit_next_allowed_ts,
-                        time.time() + min_interval,
-                    )
-
-    def _request_worker_key(self, method: str, path: str) -> str:
-        normalized_path = str(path).split("?", 1)[0]
-        upper_method = str(method).upper().strip()
-        if self._is_historical_price_request(normalized_path, upper_method):
-            return "historical_points"
-        if self._is_trading_allowance_request(upper_method, normalized_path):
-            return "account_trading"
-        if normalized_path.startswith("/accounts"):
-            return "account_non_trading"
-        if normalized_path.startswith("/positions"):
-            return "account_non_trading"
-        if normalized_path.startswith("/workingorders"):
-            return "account_non_trading"
-        if normalized_path.startswith("/confirms/"):
-            return "account_non_trading"
-        if normalized_path.startswith("/history/"):
-            return "account_non_trading"
-        return "app_non_trading"
 
     def _historical_http_cache_key(
         self,
@@ -2419,17 +2043,6 @@ class IgApiClient(BaseBrokerClient):
                 )
             raise BrokerError(error_message) from exc
 
-    @staticmethod
-    def _is_auth_token_invalid_error_text(text: str) -> bool:
-        lowered = str(text or "").lower()
-        markers = (
-            "error.security.client-token-invalid",
-            "error.security.client-token-missing",
-            "error.security.account-token-invalid",
-            "error.security.account-token-missing",
-            "error.public-api.failure.missing.credentials",
-        )
-        return any(marker in lowered for marker in markers)
 
     @staticmethod
     def _is_retryable_close_request_error_text(text: str) -> bool:
@@ -2444,58 +2057,13 @@ class IgApiClient(BaseBrokerClient):
         )
         return any(marker in lowered for marker in markers)
 
-    def _maybe_refresh_auth_session_after_failure(
-        self,
-        *,
-        method: str,
-        path: str,
-        error_text: str,
-    ) -> bool:
-        normalized_path = str(path).split("?", 1)[0]
-        if normalized_path.startswith("/session"):
-            return False
-
-        acquired = self._auth_refresh_lock.acquire(timeout=max(1.0, self.timeout_sec))
-        if not acquired:
-            return False
-        try:
-            now_ts = time.time()
-            # Avoid reconnect storm across worker threads.
-            if (now_ts - self._auth_refresh_last_attempt_ts) < self._auth_refresh_min_interval_sec:
-                return (now_ts - self._auth_refresh_last_success_ts) < self._auth_refresh_min_interval_sec
-            self._auth_refresh_last_attempt_ts = now_ts
-            logger.warning(
-                "IG auth tokens invalid during %s %s, attempting session refresh",
-                str(method).upper(),
-                normalized_path,
-            )
-            original_connect_retry_attempts = self.connect_retry_attempts
-            try:
-                # Keep auth recovery bounded to a single login cycle; repeated
-                # POST /session retries under load tend to amplify allowance storms.
-                self.connect_retry_attempts = 1
-                self.connect()
-            except Exception as refresh_exc:
-                logger.warning(
-                    "IG session refresh failed on %s %s: %s | original_error=%s",
-                    str(method).upper(),
-                    normalized_path,
-                    refresh_exc,
-                    error_text,
-                )
-                return False
-            finally:
-                self.connect_retry_attempts = original_connect_retry_attempts
-            self._auth_refresh_last_success_ts = time.time()
-            return True
-        finally:
-            self._auth_refresh_lock.release()
 
     def _maybe_reconnect_after_disconnected(self, *, method: str, path: str) -> bool:
         normalized_path = str(path).split("?", 1)[0]
         if normalized_path.startswith("/session"):
             return False
 
+        # LOCK ORDER: _runtime_reconnect_lock → _lock (via connect/self._is_connected)
         if not self._runtime_reconnect_lock.acquire(blocking=False):
             return self._is_connected()
         try:
@@ -2529,255 +2097,22 @@ class IgApiClient(BaseBrokerClient):
         with self._lock:
             return bool(self._connected)
 
-    def _epic_for_symbol(self, symbol: str) -> str:
-        upper = symbol.upper().strip()
-        epic = self._epics.get(upper)
-        if epic:
-            return epic
-        if upper.startswith(("CS.", "IX.", "CC.")):
-            return upper
-        raise BrokerError(
-            f"No IG epic mapping for symbol {symbol}. "
-            "Set ig_symbol_epics in config or IG_SYMBOL_EPICS env (JSON object)."
-        )
 
-    @staticmethod
-    def _is_epic_unavailable_error_text(text: str) -> bool:
-        return "instrument.epic.unavailable" in str(text).lower()
 
-    @staticmethod
-    def _is_instrument_invalid_error_text(text: str) -> bool:
-        lowered = str(text).lower()
-        return any(
-            marker in lowered
-            for marker in (
-                "error.service.create.otc.position.instrument.invalid",
-                "instrument.invalid",
-                "instrument_not_valid",
-                "instrument not valid",
-                "invalid_instrument",
-                "invalid instrument",
-            )
-        )
 
-    @staticmethod
-    def _is_stream_subscription_invalid_group_error_text(text: str | None) -> bool:
-        lowered = str(text or "").strip().lower()
-        if not lowered:
-            return False
-        return "invalid group" in lowered or lowered.startswith("error:21:")
 
-    def _promote_stream_subscription_epic_after_invalid_group(
-        self,
-        symbol: str,
-        failed_epic: str,
-        *,
-        reason: str,
-    ) -> str | None:
-        upper_symbol = str(symbol).upper().strip()
-        normalized_failed = str(failed_epic).upper().strip()
-        if not upper_symbol or not normalized_failed:
-            return None
 
-        self._mark_epic_temporarily_invalid(upper_symbol, normalized_failed, reason=reason)
 
-        current_ts = time.time()
-        for candidate in self._epic_attempt_order(upper_symbol):
-            if candidate == normalized_failed:
-                continue
-            if self._is_epic_temporarily_invalid(upper_symbol, candidate, now_ts=current_ts):
-                continue
-            self._activate_epic(upper_symbol, candidate, log_warning=False)
-            self._clear_stream_rest_fallback_block(upper_symbol)
-            self._schedule_stream_subscription_retry(upper_symbol)
-            logger.warning(
-                "IG stream epic failover queued for %s: %s -> %s (retry_in=%.1fs %s)",
-                upper_symbol,
-                normalized_failed,
-                candidate,
-                self._stream_subscription_retry_gap_sec,
-                reason,
-            )
-            return candidate
-        self._mark_stream_rest_fallback_block(upper_symbol, reason=reason)
-        return None
 
-    def _stream_subscription_retry_remaining(self, symbol: str, *, now_ts: float | None = None) -> float:
-        upper = str(symbol).upper().strip()
-        if not upper:
-            return 0.0
-        current_ts = time.time() if now_ts is None else float(now_ts)
-        with self._lock:
-            until_ts = float(self._stream_subscription_retry_not_before_ts_by_symbol.get(upper, 0.0))
-            remaining = until_ts - current_ts
-            if remaining > 0:
-                return remaining
-            self._stream_subscription_retry_not_before_ts_by_symbol.pop(upper, None)
-            return 0.0
 
-    def _schedule_stream_subscription_retry(self, symbol: str, delay_sec: float | None = None) -> None:
-        upper = str(symbol).upper().strip()
-        if not upper:
-            return
-        normalized_delay = self._stream_subscription_retry_gap_sec if delay_sec is None else float(delay_sec)
-        if not math.isfinite(normalized_delay):
-            normalized_delay = self._stream_subscription_retry_gap_sec
-        normalized_delay = max(0.0, normalized_delay)
-        with self._lock:
-            self._stream_subscription_retry_not_before_ts_by_symbol[upper] = max(
-                float(self._stream_subscription_retry_not_before_ts_by_symbol.get(upper, 0.0)),
-                time.time() + normalized_delay,
-            )
 
-    def _clear_stream_subscription_retry(self, symbol: str) -> None:
-        upper = str(symbol).upper().strip()
-        if not upper:
-            return
-        with self._lock:
-            self._stream_subscription_retry_not_before_ts_by_symbol.pop(upper, None)
 
-    def _stream_rest_fallback_block_remaining(self, symbol: str, *, now_ts: float | None = None) -> float:
-        upper = str(symbol).upper().strip()
-        if not upper:
-            return 0.0
-        current_ts = time.time() if now_ts is None else float(now_ts)
-        with self._lock:
-            until_ts = float(self._stream_rest_fallback_block_until_ts_by_symbol.get(upper, 0.0))
-            remaining = until_ts - current_ts
-            if remaining > 0:
-                return remaining
-            self._stream_rest_fallback_block_until_ts_by_symbol.pop(upper, None)
-            self._stream_rest_fallback_block_reason_by_symbol.pop(upper, None)
-            return 0.0
 
-    def _stream_rest_fallback_block_reason(self, symbol: str) -> str | None:
-        upper = str(symbol).upper().strip()
-        if not upper:
-            return None
-        with self._lock:
-            reason = str(self._stream_rest_fallback_block_reason_by_symbol.get(upper, "")).strip()
-        return reason or None
 
-    def _mark_stream_rest_fallback_block(self, symbol: str, *, reason: str | None = None) -> None:
-        upper = str(symbol).upper().strip()
-        if not upper:
-            return
-        cooldown_sec = max(30.0, float(self._invalid_epic_retry_sec))
-        until_ts = time.time() + cooldown_sec
-        with self._lock:
-            self._stream_rest_fallback_block_until_ts_by_symbol[upper] = max(
-                float(self._stream_rest_fallback_block_until_ts_by_symbol.get(upper, 0.0)),
-                until_ts,
-            )
-            normalized_reason = str(reason or "").strip()
-            if normalized_reason:
-                self._stream_rest_fallback_block_reason_by_symbol[upper] = normalized_reason
 
-    def _clear_stream_rest_fallback_block(self, symbol: str) -> None:
-        upper = str(symbol).upper().strip()
-        if not upper:
-            return
-        with self._lock:
-            self._clear_stream_rest_fallback_block_locked(upper)
 
-    def _clear_stream_rest_fallback_block_locked(self, upper: str) -> None:
-        self._stream_rest_fallback_block_until_ts_by_symbol.pop(upper, None)
-        self._stream_rest_fallback_block_reason_by_symbol.pop(upper, None)
 
-    def _is_epic_temporarily_invalid(
-        self,
-        symbol: str,
-        epic: str,
-        *,
-        now_ts: float | None = None,
-    ) -> bool:
-        upper_symbol = str(symbol).upper().strip()
-        upper_epic = str(epic).upper().strip()
-        if not upper_symbol or not upper_epic:
-            return False
-        current_ts = time.time() if now_ts is None else float(now_ts)
-        with self._lock:
-            symbol_invalid = self._invalid_epic_until_ts_by_symbol.get(upper_symbol)
-            if not symbol_invalid:
-                return False
-            until_ts = float(symbol_invalid.get(upper_epic, 0.0))
-            if until_ts > current_ts:
-                return True
-            symbol_invalid.pop(upper_epic, None)
-            if not symbol_invalid:
-                self._invalid_epic_until_ts_by_symbol.pop(upper_symbol, None)
-            return False
 
-    def _mark_epic_temporarily_invalid(self, symbol: str, epic: str, reason: str | None = None) -> None:
-        upper_symbol = str(symbol).upper().strip()
-        upper_epic = str(epic).upper().strip()
-        if not upper_symbol or not upper_epic:
-            return
-        cooldown_sec = max(30.0, float(self._invalid_epic_retry_sec))
-        until_ts = time.time() + cooldown_sec
-        normalized_reason = str(reason or "n/a").strip() or "n/a"
-        should_log = False
-        with self._lock:
-            symbol_invalid = self._invalid_epic_until_ts_by_symbol.setdefault(upper_symbol, {})
-            symbol_invalid[upper_epic] = max(float(symbol_invalid.get(upper_epic, 0.0)), until_ts)
-            warn_key = (upper_symbol, upper_epic, normalized_reason)
-            last_warn_ts = float(self._invalid_epic_warn_last_ts_by_key.get(warn_key, 0.0))
-            warn_interval_sec = max(300.0, min(cooldown_sec, 900.0))
-            if (time.time() - last_warn_ts) >= warn_interval_sec:
-                self._invalid_epic_warn_last_ts_by_key[warn_key] = time.time()
-                should_log = True
-        if should_log:
-            logger.warning(
-                "IG epic marked temporarily invalid for %s: %s (cooldown=%.0fs reason=%s)",
-                upper_symbol,
-                upper_epic,
-                cooldown_sec,
-                normalized_reason,
-            )
-
-    def _clear_epic_temporarily_invalid(self, symbol: str, epic: str) -> None:
-        upper_symbol = str(symbol).upper().strip()
-        upper_epic = str(epic).upper().strip()
-        if not upper_symbol or not upper_epic:
-            return
-        with self._lock:
-            symbol_invalid = self._invalid_epic_until_ts_by_symbol.get(upper_symbol)
-            if not symbol_invalid:
-                return
-            symbol_invalid.pop(upper_epic, None)
-            if not symbol_invalid:
-                self._invalid_epic_until_ts_by_symbol.pop(upper_symbol, None)
-
-    def _epic_attempt_order(self, symbol: str) -> list[str]:
-        upper = symbol.upper().strip()
-        if upper.startswith(("CS.", "IX.", "CC.")):
-            return [upper]
-
-        with self._lock:
-            active = str(self._epics.get(upper) or "").strip().upper()
-            candidates = list(self._epic_candidates.get(upper, []))
-
-        if not self._epic_failover_enabled:
-            if active:
-                return [active]
-            first_candidate = _first_non_empty_text(tuple(candidates))
-            if first_candidate is not None:
-                return [first_candidate]
-            defaults = DEFAULT_IG_EPIC_CANDIDATES.get(upper, [])
-            first_default = _first_non_empty_text(tuple(defaults))
-            if first_default is not None:
-                return [first_default]
-            return []
-
-        defaults = DEFAULT_IG_EPIC_CANDIDATES.get(upper, [])
-        candidates.extend(str(epic).strip().upper() for epic in defaults)
-        if active:
-            candidates.insert(0, active)
-        ordered = _dedupe_epics(candidates)
-        plausible = [epic for epic in ordered if _is_plausible_epic_for_symbol(upper, epic)]
-        now_ts = time.time()
-        filtered = [epic for epic in plausible if not self._is_epic_temporarily_invalid(upper, epic, now_ts=now_ts)]
-        return filtered or plausible
 
     def _wait_for_market_rest_slot(self) -> None:
         interval = _as_float(self.rest_market_min_interval_sec, 0.0)
@@ -2804,222 +2139,14 @@ class IgApiClient(BaseBrokerClient):
                     return
             time.sleep(min(wait_sec, 0.2))
 
-    def _epic_unavailable_retry_remaining(self, symbol: str) -> float:
-        upper = str(symbol).upper().strip()
-        if not upper:
-            return 0.0
-        with self._lock:
-            until_ts = float(self._epic_unavailable_until_ts_by_symbol.get(upper, 0.0))
-        remaining = until_ts - time.time()
-        if not math.isfinite(remaining) or remaining <= 0:
-            return 0.0
-        return remaining
 
-    def _mark_epic_unavailable_retry(self, symbol: str) -> None:
-        upper = str(symbol).upper().strip()
-        if not upper:
-            return
-        retry_sec = max(5.0, float(self._epic_unavailable_retry_sec))
-        with self._lock:
-            self._epic_unavailable_until_ts_by_symbol[upper] = max(
-                float(self._epic_unavailable_until_ts_by_symbol.get(upper, 0.0)),
-                time.time() + retry_sec,
-            )
 
-    def _clear_epic_unavailable_retry(self, symbol: str) -> None:
-        upper = str(symbol).upper().strip()
-        if not upper:
-            return
-        with self._lock:
-            self._epic_unavailable_until_ts_by_symbol.pop(upper, None)
 
-    @staticmethod
-    def _extract_search_item_epic(item: dict[str, Any]) -> str | None:
-        direct = str(item.get("epic") or "").strip().upper()
-        if direct:
-            return direct
-        instrument = _as_mapping(item.get("instrument"))
-        nested = str(instrument.get("epic") or "").strip().upper()
-        if nested:
-            return nested
-        return None
 
-    @staticmethod
-    def _epic_search_score(symbol: str, epic: str) -> int:
-        upper_symbol = str(symbol).upper().strip()
-        upper_epic = str(epic).upper().strip()
-        score = 0
 
-        is_index = _is_index_symbol(upper_symbol)
-        if is_index and upper_epic.startswith("IX."):
-            score += 30
-        elif is_index and not upper_epic.startswith("IX."):
-            score -= 20
-        elif (not is_index) and upper_epic.startswith("CS."):
-            score += 20
 
-        if upper_symbol in upper_epic:
-            score += 20
 
-        if upper_symbol in {"GOLD", "XAUUSD"} and ("GOLD" in upper_epic or "XAU" in upper_epic):
-            score += 30
-        if upper_symbol == "BRENT" and ("BRENT" in upper_epic or "LCO" in upper_epic):
-            score += 30
-        if upper_symbol == "WTI" and any(token in upper_epic for token in ("WTI", "CL", "CRUDE", "OIL")):
-            score += 30
-        commodity_hints = COMMODITY_EPIC_HINTS.get(upper_symbol)
-        if commodity_hints is not None and any(token in upper_epic for token in commodity_hints):
-            score += 30
-        crypto_base = _crypto_symbol_base(upper_symbol)
-        if crypto_base is not None and (
-            upper_symbol in upper_epic
-            or crypto_base + "USD" in upper_epic
-            or (crypto_base == "DOGE" and "DOGUSD" in upper_epic)
-            or (crypto_base == "BTC" and "BITCOIN" in upper_epic)
-            or (crypto_base == "ETH" and "ETHEREUM" in upper_epic)
-            or (crypto_base == "LTC" and "LITECOIN" in upper_epic)
-            or (crypto_base == "SOL" and "SOLANA" in upper_epic)
-            or (crypto_base == "XRP" and "RIPPLE" in upper_epic)
-            or (crypto_base == "DOGE" and "DOGECOIN" in upper_epic)
-        ):
-            score += 30
-        if upper_symbol in {"AAPL", "MSFT"} and upper_epic.startswith(("UA.", "SA.")):
-            score += 30
 
-        if upper_epic.endswith(".IP"):
-            score += 1
-        return score
-
-    def _search_terms_for_symbol(self, symbol: str) -> list[str]:
-        upper = str(symbol).upper().strip()
-        terms: list[str] = []
-        terms.extend(IG_EPIC_SEARCH_TERMS.get(upper, []))
-        terms.append(upper)
-
-        if upper == "GOLD":
-            terms.extend(["XAUUSD", "XAU/USD"])
-        elif upper == "XAUUSD":
-            terms.extend(["GOLD", "XAU/USD"])
-
-        if _is_fx_pair_symbol(upper):
-            terms.append(f"{upper[:3]}/{upper[3:]}")
-
-        seen: set[str] = set()
-        unique: list[str] = []
-        for term in terms:
-            text = str(term).strip()
-            if not text:
-                continue
-            key = text.upper()
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(text)
-        return unique
-
-    def _discover_epics_via_search(self, symbol: str) -> list[str]:
-        upper = symbol.upper().strip()
-        discovered: list[str] = []
-
-        for term in self._search_terms_for_symbol(upper):
-            try:
-                self._wait_for_market_rest_slot()
-                body, _ = self._request(
-                    "GET",
-                    "/markets",
-                    version="1",
-                    auth=True,
-                    query={"searchTerm": term},
-                )
-            except BrokerError as exc:
-                text = str(exc)
-                if self._is_allowance_error_text(text):
-                    raise
-                continue
-
-            markets = body.get("markets")
-            if not isinstance(markets, list):
-                continue
-
-            for item in markets:
-                if not isinstance(item, dict):
-                    continue
-                epic = self._extract_search_item_epic(item)
-                if epic and _is_plausible_epic_for_symbol(upper, epic):
-                    discovered.append(epic)
-
-        deduped = _dedupe_epics(discovered)
-        deduped.sort(key=lambda epic: self._epic_search_score(upper, epic), reverse=True)
-        return deduped
-
-    def _extend_epic_candidates_from_search(self, symbol: str) -> list[str]:
-        if not self._epic_failover_enabled:
-            return []
-        if not self._epic_search_enabled:
-            return []
-        upper = symbol.upper().strip()
-        search_candidates = self._discover_epics_via_search(upper)
-        if not search_candidates:
-            return []
-
-        with self._lock:
-            existing = self._epic_candidates.get(upper, [])
-            merged = _dedupe_epics([*existing, *search_candidates])
-            self._epic_candidates[upper] = merged
-            active = str(self._epics.get(upper) or "").strip().upper()
-
-        ordered = list(search_candidates)
-        if active:
-            ordered = [epic for epic in ordered if epic != active]
-        return ordered
-
-    def _activate_epic(self, symbol: str, epic: str, *, log_warning: bool = True) -> None:
-        upper = symbol.upper().strip()
-        normalized = str(epic).strip().upper()
-        if not normalized:
-            return
-        if not _is_plausible_epic_for_symbol(upper, normalized):
-            logger.warning(
-                "Ignoring IG epic remap for %s to non-matching epic=%s",
-                upper,
-                normalized,
-            )
-            return
-
-        with self._lock:
-            previous = self._epics.get(upper)
-            self._epics[upper] = normalized
-            existing = self._epic_candidates.get(upper, [])
-            self._epic_candidates[upper] = _dedupe_epics([normalized, *existing])
-            symbol_invalid = self._invalid_epic_until_ts_by_symbol.get(upper)
-            if symbol_invalid:
-                symbol_invalid.pop(normalized, None)
-                if not symbol_invalid:
-                    self._invalid_epic_until_ts_by_symbol.pop(upper, None)
-            epic_changed = bool(previous and previous != normalized)
-            self._stream_subscription_retry_not_before_ts_by_symbol.pop(upper, None)
-            if epic_changed:
-                self._symbol_spec_cache.pop(upper, None)
-
-                # Force re-subscribe only when epic mapping actually changed.
-                table_id = self._stream_symbol_to_table.pop(upper, None)
-                if table_id is not None:
-                    self._stream_table_to_symbol.pop(table_id, None)
-                    self._stream_table_field_values.pop(table_id, None)
-
-        if log_warning and previous and previous != normalized:
-            should_log = False
-            current_ts = time.time()
-            with self._lock:
-                signature = (str(previous).strip().upper(), normalized)
-                prior_signature = self._epic_remap_warn_last_signature_by_symbol.get(upper)
-                prior_warn_ts = float(self._epic_remap_warn_last_ts_by_symbol.get(upper, 0.0))
-                if signature != prior_signature or (current_ts - prior_warn_ts) >= 300.0:
-                    self._epic_remap_warn_last_signature_by_symbol[upper] = signature
-                    self._epic_remap_warn_last_ts_by_symbol[upper] = current_ts
-                    should_log = True
-            if should_log:
-                logger.warning("IG epic remapped for %s: %s -> %s", upper, previous, normalized)
 
     def _request_market_details_with_epic_failover(self, symbol: str) -> tuple[str, dict[str, Any]]:
         upper = symbol.upper().strip()
@@ -3172,7 +2299,7 @@ class IgApiClient(BaseBrokerClient):
         if cached:
             return cached
 
-        with self._account_currency_code_lock:
+        with self._account_currency_code_lock:  # LOCK ORDER: _account_currency_code_lock → _lock
             with self._lock:
                 cached = str(self._account_currency_code or "").strip().upper()
             if cached:
@@ -6324,838 +5451,38 @@ class IgApiClient(BaseBrokerClient):
 
         return candidate_entry, stop_loss, take_profit
 
-    @staticmethod
-    def _decode_stream_field(encoded: str, previous: str | None) -> str | None:
-        if encoded == "":
-            return previous
-        if encoded == "$":
-            return ""
-        if encoded == "#":
-            return None
-        if encoded.startswith("$$") or encoded.startswith("##"):
-            return encoded[1:]
-        if encoded[0] in {"$", "#"}:
-            return encoded[1:]
-        return encoded
 
-    @staticmethod
-    def _read_stream_line(stream_response: Any) -> str | None:
-        raw = stream_response.readline()
-        if raw is None:
-            return None
-        if isinstance(raw, bytes):
-            text = raw.decode("utf-8", errors="replace")
-        else:
-            text = str(raw)
-        if text == "":
-            return None
-        return text.rstrip("\r\n")
 
-    def _stream_backoff_delay(self, attempt: int) -> float:
-        if attempt <= 0:
-            return self._stream_backoff_base_sec
-        return min(self._stream_backoff_max_sec, self._stream_backoff_base_sec * (2 ** (attempt - 1)))
 
-    def _resolve_stream_control_url(self, control_address: str | None) -> str | None:
-        stream_endpoint = self._stream_endpoint
-        if not stream_endpoint:
-            return None
-        if not control_address:
-            return f"{stream_endpoint}/control.txt"
 
-        raw = control_address.strip().rstrip("/")
-        if not raw:
-            return f"{stream_endpoint}/control.txt"
 
-        parsed_addr = parse.urlparse(raw)
-        if parsed_addr.scheme:
-            base = raw
-        else:
-            stream_scheme = parse.urlparse(stream_endpoint).scheme or "https"
-            base = f"{stream_scheme}://{raw}"
 
-        base = base.rstrip("/")
-        if not base.endswith("/lightstreamer"):
-            base = f"{base}/lightstreamer"
-        return f"{base}/control.txt"
 
-    def _mark_stream_disconnected_locked(self, error_text: str | None, schedule_retry: bool = True) -> None:
-        response = self._stream_http_response
-        self._stream_http_response = None
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
 
-        self._stream_session_id = None
-        self._stream_control_url = None
-        self._stream_keepalive_ms = None
-        self._stream_symbol_to_table.clear()
-        self._stream_table_to_symbol.clear()
-        self._stream_table_field_values.clear()
-        self._stream_last_disconnect_ts = time.time()
 
-        if error_text:
-            self._stream_last_error = error_text
 
-        if schedule_retry:
-            self._stream_reconnect_attempts += 1
-            delay = self._stream_backoff_delay(self._stream_reconnect_attempts)
-            self._stream_next_retry_at = time.time() + delay
-        else:
-            self._stream_reconnect_attempts = 0
-            self._stream_next_retry_at = None
 
-    def _mark_stream_connected_locked(
-        self,
-        session_id: str,
-        control_url: str | None,
-        keepalive_ms: int | None,
-    ) -> None:
-        was_reconnect = self._stream_last_disconnect_ts is not None
-        self._stream_session_id = session_id
-        self._stream_control_url = control_url
-        self._stream_keepalive_ms = keepalive_ms
-        self._stream_last_error = None
-        self._stream_reconnect_attempts = 0
-        self._stream_next_retry_at = None
-        self._stream_last_reconnect_ts = time.time()
 
-        if was_reconnect:
-            self._stream_total_reconnects += 1
-            logger.warning(
-                "IG Lightstreamer reconnected | total_reconnects=%s",
-                self._stream_total_reconnects,
-            )
 
-    def _on_stream_sdk_status_change(self, status: str) -> None:
-        normalized = str(status or "").strip()
-        lowered = normalized.lower()
-        now_ts = time.time()
-        should_resubscribe = False
 
-        with self._lock:
-            was_connected = bool(self._stream_sdk_connected)
-            is_connected = lowered.startswith("connected")
-            self._stream_sdk_status = normalized or None
-            self._stream_sdk_connected = is_connected
-            if is_connected:
-                self._stream_session_id = "lightstreamer_sdk"
-                self._stream_control_url = None
-                self._stream_keepalive_ms = None
-                self._stream_last_error = None
-                self._stream_reconnect_attempts = 0
-                self._stream_next_retry_at = None
-                self._stream_last_reconnect_ts = now_ts
-                if was_connected:
-                    return
-                if self._stream_last_disconnect_ts is not None:
-                    self._stream_total_reconnects += 1
-                    logger.warning(
-                        "IG Lightstreamer SDK reconnected | total_reconnects=%s",
-                        self._stream_total_reconnects,
-                    )
-                should_resubscribe = True
-            else:
-                self._stream_session_id = None
-                self._stream_control_url = None
-                self._stream_keepalive_ms = None
-                if normalized:
-                    self._stream_last_error = f"sdk_status:{lowered}"
-                self._stream_symbol_to_table.clear()
-                self._stream_table_to_symbol.clear()
-                self._stream_table_field_values.clear()
-                if was_connected:
-                    self._stream_last_disconnect_ts = now_ts
-                    self._stream_reconnect_attempts += 1
-                    delay = self._stream_backoff_delay(self._stream_reconnect_attempts)
-                    self._stream_next_retry_at = now_ts + delay
 
-        if should_resubscribe:
-            self._resubscribe_desired_symbols()
 
-    def _on_stream_sdk_server_error(self, code: int, message: str) -> None:
-        with self._lock:
-            self._stream_last_error = f"sdk_server_error:{code}:{message}"
-            self._stream_sdk_connected = False
-            self._stream_session_id = None
 
-    def _ensure_stream_sdk_symbol_table_locked(self, upper: str) -> int:
-        self._stream_sdk_pending_subscriptions.discard(upper)
-        table_id = self._stream_symbol_to_table.get(upper)
-        if table_id is None:
-            table_id = self._stream_next_table_id
-            self._stream_next_table_id += 1
-            self._stream_symbol_to_table[upper] = table_id
-            self._stream_table_to_symbol[table_id] = upper
-            self._stream_table_field_values[table_id] = [None] * len(LIGHTSTREAMER_PRICE_FIELDS)
-        self._stream_last_error = None
-        return table_id
 
-    def _on_stream_sdk_subscription(self, symbol: str) -> None:
-        upper = str(symbol).upper()
-        with self._lock:
-            self._clear_stream_rest_fallback_block_locked(upper)
-            self._ensure_stream_sdk_symbol_table_locked(upper)
 
-    def _on_stream_sdk_unsubscription(self, symbol: str) -> None:
-        upper = str(symbol).upper()
-        with self._lock:
-            self._stream_sdk_pending_subscriptions.discard(upper)
-            table_id = self._stream_symbol_to_table.pop(upper, None)
-            if table_id is not None:
-                self._stream_table_to_symbol.pop(table_id, None)
-                self._stream_table_field_values.pop(table_id, None)
 
-    def _on_stream_sdk_subscription_error(self, symbol: str, code: int, message: str) -> None:
-        upper = str(symbol).upper()
-        reason = f"error:{code}:{message}"
-        failed_epic = ""
-        with self._lock:
-            self._stream_sdk_pending_subscriptions.discard(upper)
-            self._stream_sdk_subscriptions.pop(upper, None)
-            self._stream_sdk_subscription_listeners.pop(upper, None)
-            table_id = self._stream_symbol_to_table.pop(upper, None)
-            if table_id is not None:
-                self._stream_table_to_symbol.pop(table_id, None)
-                self._stream_table_field_values.pop(table_id, None)
-            self._stream_last_error = f"subscription_failed:{upper}:{reason}"
-            failed_epic = str(self._epics.get(upper) or "").strip().upper()
 
-        if not self._is_stream_subscription_invalid_group_error_text(reason):
-            return
 
-        next_epic = self._promote_stream_subscription_epic_after_invalid_group(
-            upper,
-            failed_epic,
-            reason=f"stream_subscription:{reason}",
-        )
-        if next_epic:
-            return
 
-    @staticmethod
-    def _stream_sdk_value(update: Any, field_name: str) -> str | None:
-        getter = getattr(update, "getValue", None)
-        if callable(getter):
-            try:
-                value = getter(field_name)
-            except Exception:
-                value = None
-            if value is not None:
-                return str(value)
-        fields_getter = getattr(update, "getFields", None)
-        if callable(fields_getter):
-            try:
-                fields = fields_getter()
-            except Exception:
-                fields = None
-            if isinstance(fields, dict):
-                value = fields.get(field_name)
-                if value is not None:
-                    return str(value)
-        return None
 
-    def _on_stream_sdk_item_update(self, symbol: str, update: Any) -> None:
-        upper = str(symbol).upper()
-        with self._lock:
-            self._clear_stream_rest_fallback_block_locked(upper)
-            table_id = self._ensure_stream_sdk_symbol_table_locked(upper)
-            previous_values = list(
-                self._stream_table_field_values.get(table_id, [None] * len(LIGHTSTREAMER_PRICE_FIELDS))
-            )
-        decoded = list(previous_values)
-        for idx, field_name in enumerate(LIGHTSTREAMER_PRICE_FIELDS):
-            value = self._stream_sdk_value(update, field_name)
-            if value is not None:
-                decoded[idx] = value
-        with self._lock:
-            if table_id is not None:
-                self._stream_table_field_values[table_id] = decoded
-        self._update_tick_from_stream_fields(upper, decoded)
 
-    def _start_stream_sdk_locked(self) -> None:
-        if _LightstreamerClient is None or _LightstreamerSubscription is None:
-            self._stream_last_error = "lightstreamer_sdk_not_installed"
-            return
-        if self._stream_sdk_client is not None:
-            return
-        if not self._stream_endpoint:
-            self._stream_last_error = "lightstreamer_endpoint_missing"
-            return
-        if not self.account_id:
-            self._stream_last_error = "lightstreamer_account_id_missing"
-            return
-        if not self._cst or not self._security_token:
-            self._stream_last_error = "lightstreamer_auth_tokens_missing"
-            return
 
-        try:
-            # SDK v2 appends /lightstreamer/ to the server address internally,
-            # so strip the suffix that _normalize_lightstreamer_endpoint added.
-            sdk_endpoint = self._stream_endpoint
-            if sdk_endpoint and sdk_endpoint.endswith("/lightstreamer"):
-                sdk_endpoint = sdk_endpoint[: -len("/lightstreamer")]
-            # IG Lightstreamer does not support WebSocket (returns 403),
-            # so force HTTP-STREAMING unless overridden via env.
-            forced_transport = self._stream_sdk_forced_transport or "HTTP-STREAMING"
-            logger.info(
-                "IG Lightstreamer SDK connecting | endpoint=%s account=%s adapter=%s transport=%s",
-                sdk_endpoint, self.account_id, LIGHTSTREAMER_ADAPTER_SET, forced_transport,
-            )
-            client = _LightstreamerClient(sdk_endpoint, LIGHTSTREAMER_ADAPTER_SET)
-            client.connectionDetails.setUser(self.account_id)
-            client.connectionDetails.setPassword(f"CST-{self._cst}|XST-{self._security_token}")
-            client.connectionOptions.setForcedTransport(forced_transport)
-            listener = _IgLightstreamerClientListener(self)
-            client.addListener(listener)
-            self._stream_sdk_client = client
-            self._stream_sdk_client_listener = listener
-            self._stream_sdk_connected = False
-            self._stream_sdk_status = "connecting"
-            client.connect()
-            logger.info("IG Lightstreamer SDK connect() returned, waiting for status callback")
-        except Exception as exc:
-            self._stream_sdk_client = None
-            self._stream_sdk_client_listener = None
-            self._stream_sdk_connected = False
-            self._stream_sdk_status = None
-            self._stream_last_error = f"sdk_connect_failed:{exc}"
 
-    def _stop_stream_sdk_locked(self) -> None:
-        client = self._stream_sdk_client
-        listener = self._stream_sdk_client_listener
-        subscriptions = list(self._stream_sdk_subscriptions.values())
-        self._stream_sdk_client = None
-        self._stream_sdk_client_listener = None
-        self._stream_sdk_subscriptions.clear()
-        self._stream_sdk_subscription_listeners.clear()
-        self._stream_sdk_pending_subscriptions.clear()
-        self._stream_sdk_connected = False
-        self._stream_sdk_status = None
-        self._stream_session_id = None
-        self._stream_control_url = None
-        self._stream_keepalive_ms = None
-        self._stream_symbol_to_table.clear()
-        self._stream_table_to_symbol.clear()
-        self._stream_table_field_values.clear()
-        if client is None:
-            return
-        for subscription in subscriptions:
-            try:
-                client.unsubscribe(subscription)
-            except Exception:
-                pass
-        if listener is not None:
-            try:
-                client.removeListener(listener)
-            except Exception:
-                pass
-        try:
-            client.disconnect()
-        except Exception:
-            pass
 
-    def _start_stream_thread_locked(self) -> None:
-        if not self._stream_enabled:
-            self._stream_last_error = "stream_disabled_by_config"
-            return
-        if self._stream_use_sdk:
-            self._start_stream_sdk_locked()
-            return
-        thread = self._stream_thread
-        if thread is not None and thread.is_alive():
-            return
-        if not self._stream_endpoint:
-            self._stream_last_error = "lightstreamer_endpoint_missing"
-            return
 
-        self._stream_stop_event.clear()
-        self._stream_thread = threading.Thread(
-            target=self._stream_loop,
-            name="ig-lightstreamer-stream",
-            daemon=True,
-        )
-        self._stream_thread.start()
-
-    def _stop_stream_thread_locked(self) -> threading.Thread | None:
-        if self._stream_use_sdk:
-            self._stop_stream_sdk_locked()
-            return None
-        self._stream_stop_event.set()
-        self._mark_stream_disconnected_locked(None, schedule_retry=False)
-        thread = self._stream_thread
-        self._stream_thread = None
-        if thread is threading.current_thread():
-            return None
-        return thread
-
-    def _send_stream_control(self, control_url: str, params: dict[str, Any]) -> tuple[bool, str]:
-        req = request.Request(
-            url=control_url,
-            method="POST",
-            data=self._form_body(params),
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Accept": "text/plain",
-            },
-        )
-        try:
-            with request.urlopen(req, timeout=self.timeout_sec) as resp:
-                payload = resp.read().decode("utf-8", errors="replace")
-        except Exception as exc:
-            return False, str(exc)
-
-        lines = [line.strip() for line in payload.replace("\r", "\n").split("\n") if line.strip()]
-        if not lines:
-            return False, "empty_control_response"
-
-        first = lines[0]
-        if first == "OK":
-            return True, "ok"
-        if first == "SYNC ERROR":
-            return False, "sync_error"
-        if first == "ERROR":
-            code = lines[1] if len(lines) > 1 else "unknown"
-            message = lines[2] if len(lines) > 2 else "unknown"
-            return False, f"error:{code}:{message}"
-        return False, first
-
-    def _subscribe_symbol(self, symbol: str) -> bool:
-        if self._stream_use_sdk:
-            with self._lock:
-                sdk_client_ready = self._stream_sdk_client is not None
-            if sdk_client_ready:
-                return self._subscribe_symbol_sdk(symbol)
-        upper = symbol.upper()
-
-        with self._lock:
-            if upper in self._stream_symbol_to_table:
-                return True
-            session_id = self._stream_session_id
-            control_url = self._stream_control_url
-            account_id = self.account_id
-            if not session_id or not control_url or not account_id:
-                return False
-            table_id = self._stream_next_table_id
-            self._stream_next_table_id += 1
-
-        try:
-            epic = self._epic_for_symbol(upper)
-        except Exception as exc:
-            with self._lock:
-                self._stream_last_error = f"epic_resolution_failed:{upper}:{exc}"
-            return False
-
-        attempted_epics: set[str] = set()
-        final_reason = "unknown"
-
-        while True:
-            normalized_epic = str(epic).strip().upper()
-            if not normalized_epic or normalized_epic in attempted_epics:
-                break
-            attempted_epics.add(normalized_epic)
-
-            item = f"PRICE:{account_id}:{normalized_epic}"
-            # Lightstreamer field lists are space-separated (+ encoded in form body).
-            schema = " ".join(LIGHTSTREAMER_PRICE_SUBSCRIPTION_FIELDS)
-            ok, reason = self._send_stream_control(
-                control_url,
-                {
-                    "LS_session": session_id,
-                    "LS_table": table_id,
-                    "LS_op": "add",
-                    "LS_data_adapter": LIGHTSTREAMER_PRICE_ADAPTER,
-                    "LS_id": item,
-                    "LS_schema": schema,
-                    "LS_mode": "MERGE",
-                    "LS_snapshot": "true",
-                },
-            )
-            if ok:
-                self._activate_epic(upper, normalized_epic)
-                self._clear_stream_rest_fallback_block(upper)
-
-                with self._lock:
-                    if session_id != self._stream_session_id:
-                        return False
-                    self._stream_symbol_to_table[upper] = table_id
-                    self._stream_table_to_symbol[table_id] = upper
-                    self._stream_table_field_values[table_id] = [None] * len(LIGHTSTREAMER_PRICE_FIELDS)
-                return True
-
-            final_reason = str(reason or "unknown")
-            if reason == "sync_error":
-                with self._lock:
-                    self._stream_last_error = f"subscription_failed:{upper}:{final_reason}"
-                    self._mark_stream_disconnected_locked("stream_sync_error", schedule_retry=True)
-                return False
-
-            if self._is_stream_subscription_invalid_group_error_text(reason):
-                next_epic = self._promote_stream_subscription_epic_after_invalid_group(
-                    upper,
-                    normalized_epic,
-                    reason=f"stream_subscription:{final_reason}",
-                )
-                if next_epic:
-                    return False
-
-            break
-
-        if self._is_stream_subscription_invalid_group_error_text(final_reason):
-            self._mark_stream_rest_fallback_block(upper, reason=f"stream_subscription:{final_reason}")
-        with self._lock:
-            self._stream_last_error = f"subscription_failed:{upper}:{final_reason}"
-        return False
-
-    def _subscribe_symbol_sdk(self, symbol: str) -> bool:
-        if _LightstreamerSubscription is None:
-            with self._lock:
-                self._stream_last_error = "lightstreamer_sdk_not_installed"
-            return False
-
-        upper = str(symbol).upper()
-        with self._lock:
-            client = self._stream_sdk_client
-            account_id = self.account_id
-            if upper in self._stream_symbol_to_table:
-                return True
-            if upper in self._stream_sdk_pending_subscriptions:
-                return True
-            if upper in self._stream_sdk_subscriptions:
-                return True
-            if client is None or not account_id:
-                return False
-
-        try:
-            epic = self._epic_for_symbol(upper)
-        except Exception as exc:
-            with self._lock:
-                self._stream_last_error = f"epic_resolution_failed:{upper}:{exc}"
-            return False
-
-        item = f"PRICE:{account_id}:{epic}"
-        try:
-            subscription = _LightstreamerSubscription(
-                "MERGE",
-                [item],
-                list(LIGHTSTREAMER_PRICE_SUBSCRIPTION_FIELDS),
-            )
-            subscription.setDataAdapter(LIGHTSTREAMER_PRICE_ADAPTER)
-            subscription.setRequestedSnapshot("yes")
-            listener = _IgLightstreamerSubscriptionListener(self, upper)
-            subscription.addListener(listener)
-            with self._lock:
-                self._stream_sdk_subscriptions[upper] = subscription
-                self._stream_sdk_subscription_listeners[upper] = listener
-                self._stream_sdk_pending_subscriptions.add(upper)
-            client.subscribe(subscription)
-            return True
-        except Exception as exc:
-            with self._lock:
-                self._stream_sdk_pending_subscriptions.discard(upper)
-                self._stream_sdk_subscriptions.pop(upper, None)
-                self._stream_sdk_subscription_listeners.pop(upper, None)
-                self._stream_last_error = f"subscription_failed:{upper}:{exc}"
-            return False
-
-    def _ensure_stream_subscription(self, symbol: str) -> bool:
-        if not self._stream_enabled:
-            return False
-        upper = symbol.upper()
-        block_remaining = self._stream_rest_fallback_block_remaining(upper)
-        retry_remaining = self._stream_subscription_retry_remaining(upper)
-        with self._lock:
-            self._stream_desired_subscriptions.add(upper)
-            already_subscribed = upper in self._stream_symbol_to_table
-            if self._stream_use_sdk:
-                stream_ready = self._stream_sdk_client is not None
-            else:
-                stream_ready = bool(self._stream_session_id and self._stream_control_url)
-        if already_subscribed:
-            return True
-        if block_remaining > 0:
-            return False
-        if retry_remaining > 0:
-            return False
-        if not stream_ready:
-            return False
-        return self._subscribe_symbol(upper)
-
-    def _resubscribe_desired_symbols(self) -> None:
-        with self._lock:
-            desired = sorted(self._stream_desired_subscriptions)
-        for symbol in desired:
-            self._ensure_stream_subscription(symbol)
-
-    def set_stream_tick_handler(self, handler: Callable[[PriceTick], None] | None) -> None:
-        with self._lock:
-            self._stream_tick_handler = handler if callable(handler) else None
-
-    def _emit_stream_tick(self, tick: PriceTick) -> None:
-        with self._lock:
-            handler = self._stream_tick_handler
-        if handler is None:
-            return
-        try:
-            handler(self._clone_tick(tick))
-        except Exception:
-            logger.debug("Stream tick handler failed", exc_info=True)
-
-    def _update_tick_from_stream_fields(self, symbol: str, field_values: list[str | None]) -> None:
-        field_map: dict[str, str | None] = {}
-        for idx, name in enumerate(LIGHTSTREAMER_PRICE_FIELDS):
-            field_map[name] = field_values[idx] if idx < len(field_values) else None
-
-        def _first_positive_field(*names: str) -> float:
-            for name in names:
-                parsed = _as_float(field_map.get(name), 0.0)
-                if parsed > 0:
-                    return parsed
-            return 0.0
-
-        bid = _first_positive_field("BIDPRICE1", "BID")
-        ask = _first_positive_field("ASKPRICE1", "OFR", "OFFER")
-        timestamp_raw: str | None = None
-        for key in ("TIMESTAMP", "UTM", "UPDATE_TIME"):
-            raw = field_map.get(key)
-            if raw not in (None, ""):
-                timestamp_raw = raw
-                break
-
-        if bid <= 0 and ask <= 0:
-            return
-        if bid <= 0:
-            bid = ask
-        if ask <= 0:
-            ask = bid
-
-        now_ts = time.time()
-        tick_ts = self._parse_ts({"updateTimeUTC": timestamp_raw}, now_ts)
-
-        tick = PriceTick(
-            symbol=symbol,
-            bid=bid,
-            ask=ask,
-            timestamp=tick_ts,
-            received_at=now_ts,
-        )
-        with self._lock:
-            previous_tick = self._tick_cache.get(symbol)
-            quote_changed = (
-                previous_tick is None
-                or abs(float(previous_tick.bid) - bid) > FLOAT_ROUNDING_TOLERANCE
-                or abs(float(previous_tick.ask) - ask) > FLOAT_ROUNDING_TOLERANCE
-            )
-            if quote_changed or symbol not in self._stream_last_quote_change_ts_by_symbol:
-                self._stream_last_quote_change_ts_by_symbol[symbol] = now_ts
-            self._tick_cache[symbol] = tick
-            self._last_tick_by_symbol[symbol] = tick_ts
-        self._emit_stream_tick(tick)
-
-    def _is_stream_quote_stagnant_locked(self, symbol: str, now_ts: float) -> bool:
-        max_age = float(self._stream_stagnant_quote_max_age_sec)
-        if max_age <= 0:
-            return False
-        changed_at = self._stream_last_quote_change_ts_by_symbol.get(symbol)
-        if changed_at is None:
-            return False
-        return (now_ts - changed_at) > max_age
-
-    def _handle_lightstreamer_table_update(self, table_id: int, raw_values: str) -> bool:
-        with self._lock:
-            symbol = self._stream_table_to_symbol.get(table_id)
-            previous_values = list(
-                self._stream_table_field_values.get(table_id, [None] * len(LIGHTSTREAMER_PRICE_FIELDS))
-            )
-
-        if symbol is None:
-            return True
-
-        encoded_values = raw_values.split("|")
-        decoded: list[str | None] = []
-        for idx in range(len(LIGHTSTREAMER_PRICE_FIELDS)):
-            prev = previous_values[idx] if idx < len(previous_values) else None
-            encoded = encoded_values[idx] if idx < len(encoded_values) else ""
-            decoded.append(self._decode_stream_field(encoded, prev))
-
-        with self._lock:
-            self._stream_table_field_values[table_id] = decoded
-
-        self._update_tick_from_stream_fields(symbol, decoded)
-        return True
-
-    def _handle_stream_line(self, line: str) -> bool:
-        if line == "" or line == "PROBE":
-            return True
-
-        if line.startswith("Preamble"):
-            return True
-
-        if line.startswith(("ERROR", "END", "LOOP", "SYNC ERROR")):
-            logger.warning("IG Lightstreamer control event: %s", line)
-            return False
-
-        if line.startswith("U,"):
-            # Some servers may emit TLCP-style updates; try to read table id and pipe payload.
-            parts = line.split(",", 3)
-            if len(parts) >= 4:
-                try:
-                    table_id = int(parts[1])
-                except ValueError:
-                    return True
-                return self._handle_lightstreamer_table_update(table_id, parts[3])
-            return True
-
-        if "|" in line and "," in line:
-            prefix, values = line.split("|", 1)
-            prefix_parts = prefix.split(",")
-            if len(prefix_parts) >= 2 and prefix_parts[0].isdigit() and prefix_parts[1].isdigit():
-                return self._handle_lightstreamer_table_update(int(prefix_parts[0]), values)
-        elif "|" in line:
-            # Some servers emit table updates as "<table>|<values>" in MERGE mode.
-            prefix, values = line.split("|", 1)
-            if prefix.isdigit():
-                return self._handle_lightstreamer_table_update(int(prefix), values)
-
-        if ",EOS" in line or ",OV" in line:
-            return True
-
-        return True
-
-    def _open_stream_session(self) -> Any:
-        with self._lock:
-            stream_endpoint = self._stream_endpoint
-            account_id = self.account_id
-            cst = self._cst
-            security_token = self._security_token
-
-        if not stream_endpoint:
-            raise BrokerError("lightstreamer_endpoint_missing")
-        if not account_id:
-            raise BrokerError("lightstreamer_account_id_missing")
-        if not cst or not security_token:
-            raise BrokerError("lightstreamer_auth_tokens_missing")
-
-        create_url = f"{stream_endpoint}/create_session.txt"
-        body = self._form_body(
-            {
-                "LS_op2": "create",
-                "LS_cid": LIGHTSTREAMER_CID,
-                "LS_adapter_set": LIGHTSTREAMER_ADAPTER_SET,
-                "LS_user": account_id,
-                "LS_password": f"CST-{cst}|XST-{security_token}",
-                "LS_keepalive_millis": 5000,
-                "LS_content_length": 50000000,
-            }
-        )
-
-        req = request.Request(
-            url=create_url,
-            method="POST",
-            data=body,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Accept": "text/plain",
-            },
-        )
-
-        timeout = max(self.stream_read_timeout_sec, self.timeout_sec)
-        return request.urlopen(req, timeout=timeout)
 
     _STREAM_MAX_RECONNECT_ATTEMPTS = 50
 
-    def _stream_loop(self) -> None:
-        while not self._stream_stop_event.is_set():
-            with self._lock:
-                if not self._connected:
-                    return
-                retry_at = self._stream_next_retry_at
-                reconnect_attempts = self._stream_reconnect_attempts
-
-            # Circuit breaker: stop reconnecting after too many consecutive failures
-            if reconnect_attempts >= self._STREAM_MAX_RECONNECT_ATTEMPTS:
-                logger.error(
-                    "IG Lightstreamer circuit breaker: %d consecutive reconnect failures, "
-                    "stopping stream loop. REST fallback remains active.",
-                    reconnect_attempts,
-                )
-                return
-
-            now = time.time()
-            if retry_at is not None and now < retry_at:
-                self._stream_stop_event.wait(max(0.1, retry_at - now))
-                continue
-
-            stream_response: Any | None = None
-            try:
-                stream_response = self._open_stream_session()
-                first_line = self._read_stream_line(stream_response)
-                if first_line != "OK":
-                    raise BrokerError(f"stream_create_failed:{first_line}")
-
-                session_id: str | None = None
-                control_address: str | None = None
-                keepalive_ms: int | None = None
-
-                while not self._stream_stop_event.is_set():
-                    header_line = self._read_stream_line(stream_response)
-                    if header_line is None:
-                        raise BrokerError("stream_header_unexpected_eof")
-                    if header_line == "":
-                        break
-                    if ":" not in header_line:
-                        continue
-                    key, value = header_line.split(":", 1)
-                    key = key.strip()
-                    value = value.strip()
-                    if key == "SessionId":
-                        session_id = value
-                    elif key == "ControlAddress":
-                        control_address = value
-                    elif key == "KeepaliveMillis":
-                        try:
-                            keepalive_ms = int(value)
-                        except ValueError:
-                            keepalive_ms = None
-
-                if not session_id:
-                    raise BrokerError("stream_session_id_missing")
-
-                control_url = self._resolve_stream_control_url(control_address)
-                with self._lock:
-                    self._stream_http_response = stream_response
-                    self._mark_stream_connected_locked(session_id, control_url, keepalive_ms)
-
-                self._resubscribe_desired_symbols()
-
-                while not self._stream_stop_event.is_set():
-                    line = self._read_stream_line(stream_response)
-                    if line is None:
-                        raise BrokerError("stream_eof")
-                    handled = self._handle_stream_line(line)
-                    if handled:
-                        continue
-                    raise BrokerError(f"stream_control_message:{line}")
-
-            except Exception as exc:
-                if self._stream_stop_event.is_set():
-                    break
-                with self._lock:
-                    self._mark_stream_disconnected_locked(str(exc), schedule_retry=True)
-                    retry_in = (
-                        max(0.1, (self._stream_next_retry_at or time.time()) - time.time())
-                        if self._stream_next_retry_at is not None
-                        else self._stream_backoff_base_sec
-                    )
-                logger.warning("IG Lightstreamer degraded, switching to REST fallback: %s", exc)
-                self._stream_stop_event.wait(retry_in)
-            finally:
-                if stream_response is not None:
-                    try:
-                        stream_response.close()
-                    except Exception:
-                        pass
 
     def _get_cached_tick_locked(self, symbol: str, max_age_sec: float) -> PriceTick | None:
         tick = self._tick_cache.get(symbol)
@@ -7179,340 +5506,19 @@ class IgApiClient(BaseBrokerClient):
             received_at=(float(received_at) if received_at is not None else None),
         )
 
-    @staticmethod
-    def _is_allowance_error_text(text: str) -> bool:
-        lowered = text.lower()
-        return (
-            "exceeded-account-allowance" in lowered
-            or "exceeded-api-key-allowance" in lowered
-            or "exceeded-account-trading-allowance" in lowered
-        )
 
-    @staticmethod
-    def _is_trade_allowance_error_text(text: str) -> bool:
-        lowered = str(text).lower()
-        return "exceeded-account-trading-allowance" in lowered
 
-    def _maybe_start_allowance_cooldown(self, error_text: str, scope: str) -> float | None:
-        if not self._is_allowance_error_text(error_text):
-            return None
-        minimum_cooldown_sec = 30.0 if self._is_trade_allowance_error_text(error_text) else 0.0
-        cooldown_sec = self._start_allowance_cooldown(error_text, minimum_sec=minimum_cooldown_sec)
-        with self._lock:
-            self._allowance_last_scope = str(scope)
-        self._adapt_market_rest_interval_after_allowance(scope)
-        logger.warning(
-            "IG allowance exceeded for %s, pausing REST calls for %.1fs",
-            scope,
-            cooldown_sec,
-        )
-        return cooldown_sec
 
-    def _allowance_cooldown_remaining(self) -> float:
-        with self._lock:
-            return max(0.0, self._allowance_cooldown_until_ts - time.time())
 
-    def _allowance_cooldown_remaining_for_market_data(self) -> float:
-        remaining = self._allowance_cooldown_remaining()
-        if remaining <= 0:
-            return 0.0
-        with self._lock:
-            last_error = str(self._allowance_last_error or "")
-            last_scope = str(self._allowance_last_scope or "").strip().lower()
-        if (
-            self._is_trade_allowance_error_text(last_error)
-            and last_scope in {"trade open", "trade open confirm", "managed positions"}
-        ):
-            # Trading allowance should not block quote acquisition if quotes are still available.
-            return 0.0
-        return remaining
 
-    def _adapt_market_rest_interval_after_allowance(self, scope: str) -> None:
-        normalized_scope = str(scope or "").strip().lower()
-        if normalized_scope not in {"market data", "symbol spec", "managed positions", "accounts"}:
-            return
-        with self._lock:
-            previous = float(self.rest_market_min_interval_sec)
-            target = min(
-                float(self._rest_market_min_interval_max_sec),
-                max(previous + 0.2, previous * 1.4),
-            )
-            if target <= (previous + FLOAT_COMPARISON_TOLERANCE):
-                return
-            self.rest_market_min_interval_sec = target
-        logger.warning(
-            "IG REST market interval auto-raised after allowance exceed: %.2fs -> %.2fs",
-            previous,
-            target,
-        )
 
-    def _start_allowance_cooldown(self, error_text: str, *, minimum_sec: float = 0.0) -> float:
-        now = time.time()
-        with self._lock:
-            remaining = self._allowance_cooldown_until_ts - now
-            if remaining > 0:
-                self._allowance_last_error = error_text
-                return remaining
-            previous = self._allowance_cooldown_sec
-            next_delay = min(
-                self._allowance_cooldown_max_sec,
-                max(2.0, float(minimum_sec), previous * 2.0),
-            )
-            self._allowance_cooldown_sec = next_delay
-            self._allowance_cooldown_until_ts = now + next_delay
-            self._allowance_last_error = error_text
-            return next_delay
 
-    def _reset_allowance_cooldown(self) -> None:
-        with self._lock:
-            self._allowance_cooldown_until_ts = 0.0
-            self._allowance_cooldown_sec = 1.0
-            self._allowance_last_error = None
-            self._allowance_last_scope = None
 
-    @staticmethod
-    def _extract_session_tokens(
-        headers: dict[str, str],
-        body: dict[str, Any] | None,
-    ) -> tuple[str | None, str | None]:
-        normalized_headers = {str(key).strip().lower(): str(value) for key, value in headers.items()}
-        cst = normalized_headers.get("cst")
-        security = normalized_headers.get("x-security-token")
 
-        payload = body if isinstance(body, dict) else {}
-        if not cst:
-            for key in ("cst", "CST", "clientSessionToken"):
-                raw = payload.get(key)
-                if raw not in (None, ""):
-                    cst = str(raw)
-                    break
-        if not security:
-            for key in ("x-security-token", "X-SECURITY-TOKEN", "securityToken", "xst"):
-                raw = payload.get(key)
-                if raw not in (None, ""):
-                    security = str(raw)
-                    break
 
-        return cst, security
 
-    @staticmethod
-    def _is_invalid_client_security_token_error_text(text: str) -> bool:
-        lowered = str(text).lower()
-        return "invalid-client-security-token" in lowered
 
-    def _api_key_tail(self) -> str:
-        key = str(self.api_key or "").strip()
-        if not key:
-            return "empty"
-        if len(key) <= 4:
-            return key
-        return key[-4:]
 
-    def _reset_auth_state_for_login(self) -> None:
-        with self._lock:
-            self._connected = False
-            self._cst = None
-            self._security_token = None
-            self._connectivity_status_cache = None
-            self._connectivity_status_cache_ts = 0.0
-
-    def connect(self) -> None:
-        # Ensure login starts from a clean auth state.
-        self._reset_auth_state_for_login()
-
-        payload = {"identifier": self.identifier, "password": self.password}
-        transient_delay_sec = self.connect_retry_base_sec
-        for attempt in range(1, self.connect_retry_attempts + 1):
-            self._reset_auth_state_for_login()
-            try:
-                login_version = "3"
-                try:
-                    body_raw, headers = self._request(
-                        "POST", "/session", payload=payload, version=login_version, auth=False
-                    )
-                    body = _as_mapping(body_raw)
-                except BrokerError as exc:
-                    text = str(exc).lower()
-                    if not self._is_invalid_client_security_token_error_text(text):
-                        raise
-                    # Some IG environments intermittently reject v3 login with this error.
-                    # Retry once with v2 before giving up.
-                    login_version = "2"
-                    body_raw, headers = self._request(
-                        "POST", "/session", payload=payload, version=login_version, auth=False
-                    )
-                    body = _as_mapping(body_raw)
-
-                cst, security = self._extract_session_tokens(headers, body)
-                if login_version == "3" and (not cst or not security):
-                    # Some IG accounts return session headers only for v2 login.
-                    try:
-                        body_v2_raw, headers_v2 = self._request(
-                            "POST",
-                            "/session",
-                            payload=payload,
-                            version="2",
-                            auth=False,
-                        )
-                    except BrokerError as exc:
-                        text = str(exc).lower()
-                        if self._is_invalid_client_security_token_error_text(text):
-                            raise BrokerError(
-                                f"IG login v2 fallback failed: {exc}"
-                            ) from exc
-                        raise
-                    body_v2 = _as_mapping(body_v2_raw)
-                    cst_v2, security_v2 = self._extract_session_tokens(headers_v2, body_v2)
-                    if cst_v2 and security_v2:
-                        cst = cst_v2
-                        security = security_v2
-                        if not body.get("currentAccountId"):
-                            body["currentAccountId"] = body_v2.get("currentAccountId")
-                        if not body.get("lightstreamerEndpoint"):
-                            body["lightstreamerEndpoint"] = body_v2.get("lightstreamerEndpoint")
-                if not cst or not security:
-                    raise BrokerError("IG login succeeded but session tokens are missing")
-
-                explicit_account_id = str(self.account_id).strip() if self.account_id not in (None, "") else None
-                current_account_id = str(body.get("currentAccountId") or "").strip() or None
-                resolved_account_id = explicit_account_id or current_account_id
-
-                with self._lock:
-                    self._cst = cst
-                    self._security_token = security
-                    self._connected = True
-                    self.account_id = resolved_account_id
-                    self._stream_endpoint = self._normalize_lightstreamer_endpoint(body.get("lightstreamerEndpoint"))
-                    if self._stream_enabled and self._stream_endpoint is None:
-                        self._stream_last_error = "lightstreamer_endpoint_missing"
-
-                should_switch_account = bool(
-                    explicit_account_id and (current_account_id is None or explicit_account_id != current_account_id)
-                )
-                if should_switch_account and explicit_account_id:
-                    try:
-                        self._request(
-                            "PUT",
-                            "/session",
-                            payload={"accountId": explicit_account_id, "defaultAccount": True},
-                            version="1",
-                            auth=True,
-                        )
-                    except Exception as exc:
-                        logger.warning("IG account switch failed for account_id=%s: %s", explicit_account_id, exc)
-
-                with self._lock:
-                    self._start_stream_thread_locked()
-                self._reset_allowance_cooldown()
-                return
-            except BrokerError as exc:
-                error_text = str(exc)
-                lowered = error_text.lower()
-                if attempt >= self.connect_retry_attempts:
-                    if self._is_invalid_client_security_token_error_text(lowered):
-                        endpoint = str(self._endpoint or "")
-                        account_type = self.account_type.value
-                        raise BrokerError(
-                            f"{error_text} | hint: login rejected with invalid-client-security-token; "
-                            "verify IG credentials and that endpoint matches account type "
-                            "(demo->demo-api, live->api). If you use .env, it now overrides shell env "
-                            "by default; set BOT_DOTENV_PREFER_ENV=1 to keep existing shell values. "
-                            f"account_type={account_type} endpoint={endpoint} api_key_tail={self._api_key_tail()}"
-                        ) from exc
-                    raise
-
-                delay_sec = 0.0
-                if self._is_allowance_error_text(lowered):
-                    delay_sec = self._start_allowance_cooldown(error_text)
-                    logger.warning(
-                        "IG login allowance exceeded on connect attempt %s/%s; retrying in %.1fs",
-                        attempt,
-                        self.connect_retry_attempts,
-                        delay_sec,
-                    )
-                elif self._is_invalid_client_security_token_error_text(lowered):
-                    delay_sec = min(self.connect_retry_max_sec, transient_delay_sec)
-                    transient_delay_sec = min(self.connect_retry_max_sec, transient_delay_sec * 2.0)
-                    logger.warning(
-                        "IG login invalid-client-security-token on attempt %s/%s; retrying in %.1fs",
-                        attempt,
-                        self.connect_retry_attempts,
-                        delay_sec,
-                    )
-                elif any(
-                    token in lowered
-                    for token in (
-                        "timed out",
-                        "timeout",
-                        "temporarily unavailable",
-                        "service unavailable",
-                        "bad gateway",
-                        "gateway timeout",
-                        "connection reset",
-                        "connection refused",
-                        "network is unreachable",
-                    )
-                ):
-                    delay_sec = min(self.connect_retry_max_sec, transient_delay_sec)
-                    transient_delay_sec = min(self.connect_retry_max_sec, transient_delay_sec * 2.0)
-                    logger.warning(
-                        "IG connect transient error on attempt %s/%s; retrying in %.1fs: %s",
-                        attempt,
-                        self.connect_retry_attempts,
-                        delay_sec,
-                        error_text,
-                    )
-                else:
-                    raise
-                time.sleep(max(0.1, delay_sec))
-
-    def close(self) -> None:
-        stream_thread_to_join: threading.Thread | None = None
-        request_threads_to_join: list[threading.Thread] = []
-        with self._lock:
-            stream_thread_to_join = self._stop_stream_thread_locked()
-
-        if stream_thread_to_join is not None and stream_thread_to_join.is_alive():
-            stream_thread_to_join.join(timeout=2.0)
-
-        try:
-            if self._connected:
-                self._request("DELETE", "/session", version="1", auth=True)
-        except Exception:
-            pass
-        finally:
-            with self._lock:
-                request_threads_to_join = self._stop_request_workers_locked()
-                self._connected = False
-                self._cst = None
-                self._security_token = None
-                self._tick_cache.clear()
-                self._last_tick_by_symbol.clear()
-                self._stream_desired_subscriptions.clear()
-                self._stream_last_error = None
-                self._stream_endpoint = None
-                self._account_snapshot_cache = None
-                self._account_snapshot_cached_at = 0.0
-                self._connectivity_status_cache = None
-                self._connectivity_status_cache_ts = 0.0
-                self._position_open_sync.clear()
-                self._position_close_sync.clear()
-                self._epic_unavailable_until_ts_by_symbol.clear()
-                self._last_stream_rest_fallback_ts_by_symbol.clear()
-                self._request_worker_thread_ids.clear()
-                self._historical_http_cache.clear()
-                self._stream_sdk_client = None
-                self._stream_sdk_client_listener = None
-                self._stream_sdk_subscriptions.clear()
-                self._stream_sdk_subscription_listeners.clear()
-                self._stream_sdk_pending_subscriptions.clear()
-                self._stream_sdk_connected = False
-                self._stream_sdk_status = None
-                self._stream_tick_handler = None
-
-        for thread in request_threads_to_join:
-            if thread.is_alive():
-                thread.join(timeout=2.0)
 
     def _get_price_rest(self, symbol: str) -> PriceTick:
         upper = symbol.upper()
@@ -8072,7 +6078,7 @@ class IgApiClient(BaseBrokerClient):
                     pong_ok=cached.pong_ok,
                 )
 
-        with self._connectivity_probe_lock:
+        with self._connectivity_probe_lock:  # LOCK ORDER: _connectivity_probe_lock → _lock
             now = time.time()
             allowance_remaining = self._allowance_cooldown_remaining()
             if allowance_remaining > 0.0:
@@ -8167,129 +6173,6 @@ class IgApiClient(BaseBrokerClient):
             ttl_sec = max(ttl_sec, 15.0)
         return ttl_sec
 
-    def get_stream_health_status(
-        self,
-        symbol: str | None,
-        max_tick_age_sec: float,
-    ) -> StreamHealthStatus:
-        if not self._connected:
-            return StreamHealthStatus(
-                healthy=False,
-                connected=False,
-                reason="broker_not_connected",
-                symbol=symbol.upper() if symbol else None,
-            )
-
-        now = time.time()
-        upper = symbol.upper() if symbol else None
-
-        with self._lock:
-            stream_thread = self._stream_thread
-            stream_enabled = self._stream_enabled
-            legacy_stream_connected = (
-                self._stream_session_id is not None
-                and stream_thread is not None
-                and stream_thread.is_alive()
-            )
-            sdk_stream_connected = bool(self._stream_use_sdk and self._stream_sdk_client and self._stream_sdk_connected)
-            stream_connected = legacy_stream_connected or sdk_stream_connected
-
-            last_tick_age_sec: float | None = None
-            quote_stagnation_age_sec: float | None = None
-            if upper:
-                tick = self._tick_cache.get(upper)
-                if tick is not None:
-                    last_tick_age_sec = max(0.0, now - tick.timestamp)
-                changed_at = self._stream_last_quote_change_ts_by_symbol.get(upper)
-                if changed_at is not None:
-                    quote_stagnation_age_sec = max(0.0, now - changed_at)
-                symbol_subscription_active = upper in self._stream_symbol_to_table
-            elif self._tick_cache:
-                freshest_ts = max(
-                    float(getattr(item, "received_at", item.timestamp) or item.timestamp)
-                    for item in self._tick_cache.values()
-                )
-                last_tick_age_sec = max(0.0, now - freshest_ts)
-                symbol_subscription_active = False
-            else:
-                symbol_subscription_active = False
-
-            next_retry_in_sec = None
-            if self._stream_next_retry_at is not None:
-                next_retry_in_sec = max(0.0, self._stream_next_retry_at - now)
-
-            desired_subscriptions = len(self._stream_desired_subscriptions)
-            active_subscriptions = len(self._stream_symbol_to_table)
-            last_error = self._stream_last_error
-            reconnect_attempts = self._stream_reconnect_attempts
-            total_reconnects = self._stream_total_reconnects
-            last_disconnect_ts = self._stream_last_disconnect_ts
-            last_reconnect_ts = self._stream_last_reconnect_ts
-            stream_endpoint_configured = self._stream_endpoint is not None
-            price_requests_total = self._price_requests_total
-            stream_hits_total = self._stream_price_hits_total
-            rest_fallback_hits_total = self._rest_fallback_hits_total
-
-        stream_hit_rate_pct: float | None = None
-        if price_requests_total > 0:
-            stream_hit_rate_pct = (stream_hits_total / price_requests_total) * 100.0
-
-        if not stream_enabled:
-            reason = "stream_disabled_rest_only"
-        elif stream_connected:
-            if upper and upper in self._stream_desired_subscriptions:
-                if not symbol_subscription_active:
-                    if last_error and "subscription_failed:" in str(last_error):
-                        reason = f"stream_subscription_failed_rest_fallback:{last_error}"
-                    else:
-                        reason = "stream_subscription_pending_rest_fallback"
-                elif last_tick_age_sec is None:
-                    reason = "stream_warmup_rest_fallback"
-                elif last_tick_age_sec > max(0.1, max_tick_age_sec):
-                    reason = f"stream_tick_stale_rest_fallback:{last_tick_age_sec:.2f}s>{max_tick_age_sec:.2f}s"
-                elif (
-                    self._stream_stagnant_quote_max_age_sec > 0
-                    and quote_stagnation_age_sec is not None
-                    and quote_stagnation_age_sec > self._stream_stagnant_quote_max_age_sec
-                ):
-                    reason = (
-                        "stream_quote_stagnant_rest_fallback:"
-                        f"{quote_stagnation_age_sec:.2f}s>{self._stream_stagnant_quote_max_age_sec:.2f}s"
-                    )
-                else:
-                    reason = "ok"
-            else:
-                reason = "ok"
-        else:
-            if self._stream_sdk_enabled and not self._stream_sdk_available:
-                reason = "lightstreamer_sdk_missing_rest_fallback"
-            elif not stream_endpoint_configured:
-                reason = "stream_endpoint_missing_rest_fallback"
-            elif last_error:
-                reason = f"stream_disconnected_rest_fallback:{last_error}"
-            else:
-                reason = "stream_disconnected_rest_fallback"
-
-        # IG client keeps REST fallback active; stream degradation should not hard-block openings.
-        return StreamHealthStatus(
-            healthy=True,
-            connected=stream_connected,
-            reason=reason,
-            symbol=upper,
-            last_tick_age_sec=last_tick_age_sec,
-            reconnect_attempts=reconnect_attempts,
-            total_reconnects=total_reconnects,
-            last_disconnect_ts=last_disconnect_ts,
-            last_reconnect_ts=last_reconnect_ts,
-            next_retry_in_sec=next_retry_in_sec,
-            desired_subscriptions=desired_subscriptions,
-            active_subscriptions=active_subscriptions,
-            last_error=last_error,
-            price_requests_total=price_requests_total,
-            stream_hits_total=stream_hits_total,
-            rest_fallback_hits_total=rest_fallback_hits_total,
-            stream_hit_rate_pct=stream_hit_rate_pct,
-        )
 
     def open_position(
         self,

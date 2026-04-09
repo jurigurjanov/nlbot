@@ -7,13 +7,14 @@ from typing import Any
 
 from xtb_bot.broker_method_support import call_broker_method_with_supported_kwargs
 from xtb_bot.models import Position, PriceTick, RunMode, Side
+from xtb_bot.worker.protocol import WorkerProtocol
 
 
 logger = logging.getLogger("xtb_bot.worker")
 
 
 class WorkerReconcileManager:
-    def __init__(self, worker: Any) -> None:
+    def __init__(self, worker: WorkerProtocol) -> None:
         self._worker = worker
 
     @staticmethod

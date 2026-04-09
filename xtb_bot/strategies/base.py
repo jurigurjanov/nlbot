@@ -177,6 +177,59 @@ class Strategy(ABC):
             metadata=annotate_hold_metadata({"reason": "no_signal"}),
         )
 
+    # ------------------------------------------------------------------
+    # Param-reading helpers (typed access to self.params with clamping)
+    # ------------------------------------------------------------------
+
+    def _param_float(
+        self,
+        key: str,
+        default: float = 0.0,
+        *,
+        min_val: float | None = None,
+        max_val: float | None = None,
+    ) -> float:
+        """Read a float param with optional clamping."""
+        try:
+            val = float(self.params.get(key, default))
+        except (TypeError, ValueError):
+            val = float(default)
+        if min_val is not None:
+            val = max(val, min_val)
+        if max_val is not None:
+            val = min(val, max_val)
+        return val
+
+    def _param_int(
+        self,
+        key: str,
+        default: int = 0,
+        *,
+        min_val: int | None = None,
+        max_val: int | None = None,
+    ) -> int:
+        """Read an int param with optional clamping."""
+        try:
+            val = int(self.params.get(key, default))
+        except (TypeError, ValueError):
+            val = int(default)
+        if min_val is not None:
+            val = max(val, min_val)
+        if max_val is not None:
+            val = min(val, max_val)
+        return val
+
+    def _param_bool(self, key: str, default: bool = False) -> bool:
+        """Read a bool param, handling string representations."""
+        raw = self.params.get(key, default)
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            return bool(raw)
+        if isinstance(raw, str):
+            return raw.strip().lower() not in ("0", "false", "no", "off", "")
+        return bool(raw)
+
     @staticmethod
     def _as_bool(value: object, default: bool = False, *, strict_strings: bool = False) -> bool:
         if value is None:
