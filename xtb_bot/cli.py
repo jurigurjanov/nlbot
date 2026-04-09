@@ -2326,17 +2326,49 @@ def _show_status(storage_path: Path) -> int:
         latest_closed_rows = _latest_closed_performance_rows_from_db(con)
         unavailable_symbols = _status_unavailable_symbols_from_db(con)
         open_trade_rows = _open_trades_status_rows_from_db(con)
+        # Count broker-side positions for reconciliation
+        pending_open_row = None
+        broker_real_row = None
+        try:
+            pending_open_row = con.execute(
+                "SELECT COUNT(*) AS cnt FROM pending_opens"
+            ).fetchone()
+        except Exception:
+            pass
+        try:
+            broker_real_row = con.execute(
+                "SELECT COUNT(*) AS cnt FROM real_positions_cache WHERE abs(real_qty_lots) > 1e-9"
+            ).fetchone()
+        except Exception:
+            pass
     finally:
         con.close()
 
     open_count = int((open_row["cnt"] if open_row is not None else 0) or 0)
     closed_count = int((closed_row["cnt"] if closed_row is not None else 0) or 0)
     events_count = int((events_row["cnt"] if events_row is not None else 0) or 0)
+    pending_open_count = int((pending_open_row["cnt"] if pending_open_row is not None else 0) or 0)
+    broker_real_count = int((broker_real_row["cnt"] if broker_real_row is not None else 0) or 0)
+    broker_snapshot_open = (
+        int(latest_snapshot["open_positions"] or 0) if latest_snapshot is not None else None
+    )
 
     print(f"State status | path={storage_path}")
-    print(
-        f"trades_open={open_count} trades_closed={closed_count} events_total={events_count}"
-    )
+    open_parts = [
+        f"trades_open={open_count}",
+        f"trades_closed={closed_count}",
+        f"events_total={events_count}",
+    ]
+    if pending_open_count > 0:
+        open_parts.append(f"pending_opens={pending_open_count}")
+    if broker_real_count > 0 and broker_real_count != open_count:
+        open_parts.append(f"broker_positions={broker_real_count}")
+    print(" ".join(open_parts))
+    if broker_snapshot_open is not None and broker_snapshot_open != open_count:
+        print(
+            f"  WARNING: trades_open={open_count} but broker reports "
+            f"open_positions={broker_snapshot_open} — possible sync lag or external position"
+        )
 
     if latest_event is not None:
         latest_event_ts = float(latest_event["ts"] or 0.0)
@@ -3314,7 +3346,11 @@ def _show_trades(storage_path: Path, limit: int, open_only: bool = False, strate
                 FROM trades t
                 LEFT JOIN worker_states ws ON ws.symbol = t.symbol
                 LEFT JOIN broker_ticks bt ON bt.symbol = t.symbol
-                LEFT JOIN broker_symbol_specs bss ON bss.symbol = t.symbol
+                LEFT JOIN (
+                    SELECT symbol, tick_size, tick_value
+                    FROM broker_symbol_specs
+                    GROUP BY symbol
+                ) bss ON bss.symbol = t.symbol
                 {trade_performance_join}
             """
         else:

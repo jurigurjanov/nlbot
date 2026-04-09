@@ -204,16 +204,29 @@ class _AsyncBatchWriter(Generic[_BatchT]):
             logger.exception("%s: writer loop crashed", self._name)
             self._stop.set()
 
+    _MAX_BATCH_RETRIES = 2
+
     def _flush_pending(self, pending: list[_BatchT]) -> None:
         if not pending:
             return
         batch = list(pending)
         pending.clear()
-        try:
-            self._apply_batch(batch)
-        except Exception as exc:
-            self._record_failure(exc)
-            logger.exception("%s: batch apply failed (%d ops)", self._name, len(batch))
+        for attempt in range(1, self._MAX_BATCH_RETRIES + 1):
+            try:
+                self._apply_batch(batch)
+                return
+            except Exception as exc:
+                self._record_failure(exc)
+                if attempt < self._MAX_BATCH_RETRIES:
+                    logger.warning(
+                        "%s: batch apply failed (attempt %d/%d, %d ops), retrying",
+                        self._name, attempt, self._MAX_BATCH_RETRIES, len(batch),
+                    )
+                else:
+                    logger.exception(
+                        "%s: batch apply failed after %d attempts (%d ops dropped)",
+                        self._name, self._MAX_BATCH_RETRIES, len(batch),
+                    )
 
     def _record_failure(self, exc: Exception) -> None:
         with self._failure_lock:
@@ -749,6 +762,12 @@ class StateStore:
                     ON real_positions_cache(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_system_errors_updated_at
                     ON system_errors(updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_pending_opens_symbol
+                    ON pending_opens(symbol, mode);
+                CREATE INDEX IF NOT EXISTS idx_trades_symbol
+                    ON trades(symbol, status, opened_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_trade_performance_symbol_closed_at
+                    ON trade_performance(symbol, closed_at DESC, close_reason);
                 """
             )
             self._apply_schema_migrations(cur)
@@ -806,7 +825,14 @@ class StateStore:
         for version, description, migration in migrations:
             if version in applied_versions:
                 continue
-            migration(cursor)
+            try:
+                migration(cursor)
+            except Exception:
+                logger.exception(
+                    "schema migration v%d (%s) failed — database may be in an inconsistent state",
+                    version, description,
+                )
+                raise
             cursor.execute(
                 """
                 INSERT OR REPLACE INTO schema_migrations(version, description, applied_at)
@@ -814,6 +840,7 @@ class StateStore:
                 """,
                 (int(version), str(description), time.time()),
             )
+            logger.info("schema migration v%d applied: %s", version, description)
         cursor.execute(f"PRAGMA user_version={int(_LATEST_STATE_STORE_SCHEMA_VERSION)}")
 
     def _migrate_schema_v1_broker_symbol_spec_variants(self, cursor: sqlite3.Cursor) -> None:
@@ -1280,12 +1307,14 @@ class StateStore:
         return writer.flush(timeout_sec=timeout_sec)
 
     def _enqueue_multi_async_write(self, op: str, payload: tuple[Any, ...]) -> bool:
-        if (not self._multi_async_writer_enabled) or self._closed:
-            return False
-        writer = self._multi_async_writer
+        with self._lock:
+            if (not self._multi_async_writer_enabled) or self._closed:
+                return False
+            writer = self._multi_async_writer
         if writer is not None and writer.enqueue((op, payload)):
             return True
-        self._multi_async_writer_enabled = False
+        with self._lock:
+            self._multi_async_writer_enabled = False
         self._mark_multi_async_failure(RuntimeError("multi async writer unavailable"))
         logger.error(
             "state_store: multi async writer unavailable, falling back to synchronous writes%s",
@@ -1294,12 +1323,14 @@ class StateStore:
         return False
 
     def _enqueue_event_async_write(self, payload: tuple[Any, ...]) -> bool:
-        if (not self._event_async_writer_enabled) or self._closed:
-            return False
-        writer = self._event_async_writer
+        with self._lock:
+            if (not self._event_async_writer_enabled) or self._closed:
+                return False
+            writer = self._event_async_writer
         if writer is not None and writer.enqueue(payload):
             return True
-        self._event_async_writer_enabled = False
+        with self._lock:
+            self._event_async_writer_enabled = False
         logger.error(
             "state_store: event async writer unavailable, falling back to synchronous writes%s",
             f" (last_error={writer.last_error})" if writer is not None and writer.last_error else "",
@@ -1634,6 +1665,7 @@ class StateStore:
         return [dict(row) for row in rows]
 
     def load_hot_multi_positions_snapshot(self) -> dict[str, Any]:
+        self.flush_multi_async_writes()
         with self._hot_lock:
             return {
                 "virtual_positions": dict(self._hot_virtual_positions),
@@ -4376,7 +4408,8 @@ class StateStore:
             checkpoint_payload: dict[str, int] | None = None
             try:
                 checkpoint_row = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as exc:
+                logger.warning("housekeeping: WAL checkpoint failed: %s", exc)
                 checkpoint_row = None
             if checkpoint_row is not None and len(checkpoint_row) >= 3:
                 checkpoint_payload = {
@@ -4390,8 +4423,8 @@ class StateStore:
                     self._conn.execute(
                         f"PRAGMA incremental_vacuum({int(self._housekeeping_incremental_vacuum_pages)})"
                     )
-                except sqlite3.OperationalError:
-                    pass
+                except sqlite3.OperationalError as exc:
+                    logger.warning("housekeeping: incremental vacuum failed: %s", exc)
 
             summary = {
                 "ran": True,
@@ -4412,34 +4445,42 @@ class StateStore:
             return summary
 
     def close(self) -> None:
-        _FLUSH_TIMEOUT = 5.0
-        _WRITER_JOIN_TIMEOUT = 5.0
+        raw_flush = os.getenv("XTB_DB_CLOSE_FLUSH_TIMEOUT_SEC", "10")
+        raw_join = os.getenv("XTB_DB_CLOSE_JOIN_TIMEOUT_SEC", "10")
+        try:
+            flush_timeout = max(1.0, float(raw_flush))
+        except (TypeError, ValueError):
+            flush_timeout = 10.0
+        try:
+            join_timeout = max(1.0, float(raw_join))
+        except (TypeError, ValueError):
+            join_timeout = 10.0
 
         if self._event_async_writer is not None and not self._closed:
-            flushed = self.flush_event_async_writes(timeout_sec=_FLUSH_TIMEOUT)
+            flushed = self.flush_event_async_writes(timeout_sec=flush_timeout)
             if not flushed:
-                logger.warning("state_store close: event async flush timed out, some writes may be lost")
+                logger.error("state_store close: event async flush timed out, pending writes may be lost")
             writer = self._event_async_writer
             if writer is not None:
                 _closed_flushed, joined = writer.close(
-                    flush_timeout_sec=_FLUSH_TIMEOUT,
-                    join_timeout_sec=_WRITER_JOIN_TIMEOUT,
+                    flush_timeout_sec=flush_timeout,
+                    join_timeout_sec=join_timeout,
                 )
                 if not joined:
-                    logger.warning("state_store close: event async writer thread still alive after join timeout")
+                    logger.error("state_store close: event async writer thread still alive after join timeout")
             self._event_async_writer = None
         if self._multi_async_writer is not None and not self._closed:
-            flushed = self.flush_multi_async_writes(timeout_sec=_FLUSH_TIMEOUT)
+            flushed = self.flush_multi_async_writes(timeout_sec=flush_timeout)
             if not flushed:
-                logger.warning("state_store close: multi async flush timed out, some writes may be lost")
+                logger.error("state_store close: multi async flush timed out, pending writes may be lost")
             writer = self._multi_async_writer
             if writer is not None:
                 _closed_flushed, joined = writer.close(
-                    flush_timeout_sec=_FLUSH_TIMEOUT,
-                    join_timeout_sec=_WRITER_JOIN_TIMEOUT,
+                    flush_timeout_sec=flush_timeout,
+                    join_timeout_sec=join_timeout,
                 )
                 if not joined:
-                    logger.warning("state_store close: multi async writer thread still alive after join timeout")
+                    logger.error("state_store close: multi async writer thread still alive after join timeout")
             self._multi_async_writer = None
         with self._lock:
             if self._closed:

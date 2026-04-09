@@ -381,20 +381,6 @@ def test_load_config_xtb_uses_strategy_scoped_symbols_for_active_strategy(monkey
     assert cfg.symbols == ["US500", "US100", "DE40"]
 
 
-def test_load_config_xtb_rejects_disabled_oil_strategy(monkeypatch):
-    _clear_env(monkeypatch)
-    monkeypatch.setenv("BROKER", "xtb")
-    monkeypatch.setenv("XTB_USER_ID", "xtb-user")
-    monkeypatch.setenv("XTB_PASSWORD", "xtb-pass")
-    monkeypatch.setenv("XTB_STRATEGY", "oil")
-    monkeypatch.setenv("XTB_SYMBOLS", "EURUSD,WTI")
-    monkeypatch.setenv("XTB_SYMBOLS_OIL", "WTI,BRENT")
-    monkeypatch.setenv("XTB_STRATEGY_PARAMS_OIL", '{"g1_execution_min_confidence_for_entry":0.72}')
-
-    with pytest.raises(ConfigError, match="Unknown strategy: oil|strategy must be one of"):
-        load_config()
-
-
 def test_load_config_xtb_uses_strategy_scoped_symbols_for_g2(monkeypatch):
     _clear_env(monkeypatch)
     monkeypatch.setenv("BROKER", "xtb")

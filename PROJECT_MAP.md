@@ -200,7 +200,6 @@ Key strategies:
 - `mean_breakout_v2.py`
 - `mean_reversion_bb.py`
 - `donchian_breakout.py`
-- `oil.py`
 - `crypto_trend_following.py`
 
 Common helpers:
