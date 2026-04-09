@@ -40,6 +40,7 @@ from xtb_bot.bot._assignment import (
     _freeze_cache_value,
     _strategy_params_signature,
 )
+from xtb_bot.bot.ig_budget import BotIgBudgetRuntime
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,40 @@ _MULTI_STRATEGY_BASE_COMPONENT_PARAM = "_multi_strategy_base_component"
 
 class TradingBot:
     _WORKER_WALL_CLOCK_EPOCH_THRESHOLD_SEC = 1_000_000_000.0
+
+    # -- IG budget compat proxies (accessed by tests) --
+
+    @property
+    def _ig_non_trading_budget_reserve_rpm(self) -> float:
+        return self._ig_budget.reserve_rpm
+
+    @property
+    def _ig_non_trading_budget(self) -> _TokenBucket:
+        return self._ig_budget._bucket
+
+    @property
+    def _ig_non_trading_budget_blocked_total(self) -> int:
+        return self._ig_budget._blocked_total
+
+    @_ig_non_trading_budget_blocked_total.setter
+    def _ig_non_trading_budget_blocked_total(self, value: int) -> None:
+        self._ig_budget._blocked_total = value
+
+    @property
+    def _ig_non_trading_budget_warn_interval_sec(self) -> float:
+        return self._ig_budget._warn_interval_sec
+
+    @_ig_non_trading_budget_warn_interval_sec.setter
+    def _ig_non_trading_budget_warn_interval_sec(self, value: float) -> None:
+        self._ig_budget._warn_interval_sec = value
+
+    @property
+    def _last_ig_account_non_trading_snapshot(self) -> dict[str, float | int] | None:
+        return self._ig_budget._last_account_non_trading_snapshot
+
+    @_last_ig_account_non_trading_snapshot.setter
+    def _last_ig_account_non_trading_snapshot(self, value: dict[str, float | int] | None) -> None:
+        self._ig_budget._last_account_non_trading_snapshot = value
 
     @staticmethod
     def _worker_key(symbol: str | None) -> str:
@@ -225,40 +260,7 @@ class TradingBot:
         self._last_runtime_closed_details_backfill_monotonic = 0.0
         self._closed_trade_details_retry_after_monotonic: dict[str, float] = {}
         self._closed_trade_details_retry_backoff_sec: dict[str, float] = {}
-        self._last_rate_limit_metrics_flush_monotonic = 0.0
-        self._last_rate_limit_metrics_flush_error_monotonic = 0.0
-        self._rate_limit_metrics_flush_interval_sec = max(
-            1.0,
-            self._env_float("XTB_IG_RATE_LIMIT_METRICS_FLUSH_INTERVAL_SEC", 5.0),
-        )
-        self._ig_non_trading_budget_enabled = self._env_bool(
-            "XTB_IG_NON_TRADING_BUDGET_ENABLED",
-            config.broker == "ig",
-        )
-        ig_non_trading_budget_rpm = self._env_float("XTB_IG_NON_TRADING_BUDGET_RPM", 24.0)
-        self._ig_non_trading_budget_rpm = max(1.0, min(29.0, ig_non_trading_budget_rpm))
-        ig_non_trading_reserve_default = "12" if config.broker == "ig" else "4"
-        reserve_rpm = self._env_float(
-            "XTB_IG_NON_TRADING_BUDGET_RESERVE_RPM",
-            float(ig_non_trading_reserve_default),
-        )
-        max_reserve_rpm = max(0.0, self._ig_non_trading_budget_rpm - 1.0)
-        self._ig_non_trading_budget_reserve_rpm = max(0.0, min(max_reserve_rpm, reserve_rpm))
-        ig_non_trading_budget_burst = self._env_int("XTB_IG_NON_TRADING_BUDGET_BURST", 4)
-        self._ig_non_trading_budget_burst = max(1, min(30, ig_non_trading_budget_burst))
-        self._ig_non_trading_budget = _TokenBucket(
-            capacity=self._ig_non_trading_budget_burst,
-            refill_per_sec=self._ig_non_trading_budget_rpm / 60.0,
-        )
-        self._ig_non_trading_budget_last_warn_monotonic = 0.0
-        self._ig_non_trading_budget_blocked_total = 0
-        self._ig_non_trading_budget_warn_interval_sec = max(
-            5.0,
-            self._env_float("XTB_IG_NON_TRADING_BUDGET_WARN_INTERVAL_SEC", 30.0),
-        )
-        self._ig_account_non_trading_warn_at = max(1, self._env_int("XTB_IG_ACCOUNT_NON_TRADING_WARN_AT", 24))
-        self._last_ig_account_non_trading_warn_monotonic = 0.0
-        self._last_ig_account_non_trading_snapshot: dict[str, float | int] | None = None
+        self._ig_budget = BotIgBudgetRuntime(self)
         self._last_runtime_monitor_noncritical_deferral_monotonic = 0.0
         self._last_db_housekeeping_error_monotonic = 0.0
         self._trade_reason_summary_enabled = self._env_bool("XTB_TRADE_REASON_SUMMARY_ENABLED", True)
@@ -292,10 +294,10 @@ class TradingBot:
         db_first_tick_target_rpm = self._env_float("XTB_DB_FIRST_TICK_TARGET_RPM", 24.0)
         # Keep headroom under IG per-app non-trading allowance (60 rpm).
         self._db_first_tick_target_rpm = max(1.0, min(58.0, db_first_tick_target_rpm))
-        if self._ig_non_trading_budget_enabled and self.config.broker == "ig":
+        if self._ig_budget.enabled and self.config.broker == "ig":
             max_tick_rpm_by_local_budget = max(
                 1.0,
-                self._ig_non_trading_budget_rpm - self._ig_non_trading_budget_reserve_rpm,
+                self._ig_budget.rpm - self._ig_budget.reserve_rpm,
             )
             self._db_first_tick_target_rpm = min(
                 self._db_first_tick_target_rpm,
@@ -333,8 +335,8 @@ class TradingBot:
         )
         self._db_first_symbol_spec_refresh_age_sec = max(10.0, db_first_symbol_spec_refresh_age_sec)
         default_db_first_account_poll_interval_sec = 3.0
-        if self._ig_non_trading_budget_enabled and self.config.broker == "ig":
-            reserve_rpm = max(1.0, self._ig_non_trading_budget_reserve_rpm)
+        if self._ig_budget.enabled and self.config.broker == "ig":
+            reserve_rpm = max(1.0, self._ig_budget.reserve_rpm)
             default_db_first_account_poll_interval_sec = max(
                 3.0,
                 60.0 / reserve_rpm,
@@ -2367,44 +2369,7 @@ class TradingBot:
         scope: str,
         wait_timeout_sec: float = 0.0,
     ) -> bool:
-        if (not self._ig_non_trading_budget_enabled) or self.config.broker != "ig":
-            return True
-        deadline = time.monotonic() + max(0.0, float(wait_timeout_sec))
-        while not self.stop_event.is_set():
-            if self._ig_non_trading_budget.try_consume():
-                return True
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-
-        now_monotonic = time.monotonic()
-        self._ig_non_trading_budget_blocked_total += 1
-        if (now_monotonic - self._ig_non_trading_budget_last_warn_monotonic) >= self._ig_non_trading_budget_warn_interval_sec:
-            available_tokens = self._ig_non_trading_budget.available_tokens()
-            payload = {
-                "scope": str(scope).strip().lower(),
-                "budget_rpm": self._ig_non_trading_budget_rpm,
-                "budget_burst": self._ig_non_trading_budget_burst,
-                "available_tokens": round(available_tokens, 3),
-                "blocked_total": self._ig_non_trading_budget_blocked_total,
-                "mode": self.config.mode.value,
-            }
-            self.store.record_event(
-                "WARN",
-                None,
-                "IG non-trading request deferred by local budget",
-                payload,
-            )
-            logger.warning(
-                "IG non-trading request deferred by local budget | scope=%s blocked_total=%s tokens=%.3f rpm=%.1f burst=%s",
-                str(scope).strip().lower(),
-                self._ig_non_trading_budget_blocked_total,
-                available_tokens,
-                self._ig_non_trading_budget_rpm,
-                self._ig_non_trading_budget_burst,
-            )
-            self._ig_non_trading_budget_last_warn_monotonic = now_monotonic
-        return False
+        return self._ig_budget.reserve(scope=scope, wait_timeout_sec=wait_timeout_sec)
 
     def _active_symbols_for_db_first_tick_cache(self) -> list[str]:
         active: list[str] = []
@@ -5029,19 +4994,7 @@ class TradingBot:
         self._runtime_monitor_last_progress_monotonic = self._runtime_monitor_last_completed_monotonic
 
     def _ig_account_non_trading_under_pressure(self) -> bool:
-        snapshot = self._last_ig_account_non_trading_snapshot
-        if not isinstance(snapshot, dict):
-            return False
-        used_value = int(float(snapshot.get("used_value") or 0))
-        limit_value = max(0, int(float(snapshot.get("limit_value") or 0)))
-        remaining_value = max(0, int(float(snapshot.get("remaining_value") or 0)))
-        if limit_value <= 0:
-            return False
-        if used_value >= self._ig_account_non_trading_warn_at:
-            return True
-        if remaining_value <= 0:
-            return True
-        return False
+        return self._ig_budget.account_non_trading_under_pressure()
 
     def _record_runtime_monitor_noncritical_deferral(
         self,
@@ -5058,7 +5011,7 @@ class TradingBot:
             "deferred_tasks": [str(task) for task in deferred_tasks],
             "mode": self.config.mode.value,
         }
-        snapshot = self._last_ig_account_non_trading_snapshot
+        snapshot = self._ig_budget.last_account_non_trading_snapshot
         if isinstance(snapshot, dict):
             payload.update(snapshot)
         self.store.record_event(
@@ -5140,106 +5093,7 @@ class TradingBot:
         return self._backfill_closed_trade_details()
 
     def _flush_ig_rate_limit_worker_metrics(self, now_monotonic: float) -> None:
-        if self.config.broker != "ig":
-            return
-        if (now_monotonic - self._last_rate_limit_metrics_flush_monotonic) < self._rate_limit_metrics_flush_interval_sec:
-            return
-
-        getter = getattr(self.broker, "get_rate_limit_workers_snapshot", None)
-        if not callable(getter):
-            return
-        self._last_rate_limit_metrics_flush_monotonic = now_monotonic
-
-        try:
-            snapshot_rows = getter()
-        except Exception as exc:
-            if (now_monotonic - self._last_rate_limit_metrics_flush_error_monotonic) >= 60.0:
-                logger.warning("Rate-limit worker metrics flush failed: %s", exc)
-                self.store.record_event(
-                    "WARN",
-                    None,
-                    "Rate-limit worker metrics flush failed",
-                    {"error": str(exc)},
-                )
-                self._last_rate_limit_metrics_flush_error_monotonic = now_monotonic
-            return
-
-        self._last_rate_limit_metrics_flush_error_monotonic = 0.0
-        if not isinstance(snapshot_rows, list):
-            return
-        for row in snapshot_rows:
-            if not isinstance(row, dict):
-                continue
-            try:
-                worker_key = str(row.get("worker_key") or "").strip().lower()
-                limit_scope = str(row.get("limit_scope") or "unknown")
-                limit_unit = str(row.get("limit_unit") or "requests_per_minute")
-                limit_value = int(float(row.get("limit_value") or 0))
-                used_value = int(float(row.get("used_value") or 0))
-                remaining_value = int(float(row.get("remaining_value") or 0))
-                window_sec = float(row.get("window_sec") or 60.0)
-                blocked_total = int(float(row.get("blocked_total") or 0))
-                last_request_ts = float(row.get("last_request_ts")) if row.get("last_request_ts") else None
-                last_block_ts = float(row.get("last_block_ts")) if row.get("last_block_ts") else None
-                notes = str(row.get("notes")) if row.get("notes") is not None else None
-                self.store.upsert_ig_rate_limit_worker(
-                    worker_key=worker_key,
-                    limit_scope=limit_scope,
-                    limit_unit=limit_unit,
-                    limit_value=limit_value,
-                    used_value=used_value,
-                    remaining_value=remaining_value,
-                    window_sec=window_sec,
-                    blocked_total=blocked_total,
-                    last_request_ts=last_request_ts,
-                    last_block_ts=last_block_ts,
-                    notes=notes,
-                )
-            except Exception as exc:
-                logger.debug("Failed to persist rate-limit worker row %s: %s", row, exc)
-                continue
-            if worker_key == "account_non_trading" and used_value >= self._ig_account_non_trading_warn_at:
-                self._last_ig_account_non_trading_snapshot = {
-                    "used_value": used_value,
-                    "limit_value": limit_value,
-                    "remaining_value": remaining_value,
-                    "window_sec": window_sec,
-                    "blocked_total": blocked_total,
-                }
-                if (now_monotonic - self._last_ig_account_non_trading_warn_monotonic) < 60.0:
-                    continue
-                self._last_ig_account_non_trading_warn_monotonic = now_monotonic
-                payload = {
-                    "used_value": used_value,
-                    "limit_value": limit_value,
-                    "remaining_value": remaining_value,
-                    "window_sec": window_sec,
-                    "blocked_total": blocked_total,
-                    "warn_at": self._ig_account_non_trading_warn_at,
-                    "mode": self.config.mode.value,
-                }
-                self.store.record_event(
-                    "WARN",
-                    None,
-                    "IG account non-trading usage is high",
-                    payload,
-                )
-                logger.warning(
-                    "IG account non-trading usage is high | used=%s limit=%s remaining=%s window=%.1fs blocked_total=%s",
-                    used_value,
-                    limit_value,
-                    remaining_value,
-                    window_sec,
-                    blocked_total,
-                )
-            elif worker_key == "account_non_trading":
-                self._last_ig_account_non_trading_snapshot = {
-                    "used_value": used_value,
-                    "limit_value": limit_value,
-                    "remaining_value": remaining_value,
-                    "window_sec": window_sec,
-                    "blocked_total": blocked_total,
-                }
+        self._ig_budget.flush_worker_metrics(now_monotonic)
 
     def _runtime_sync_open_positions(self, force: bool = False) -> None:
         self._pulse_runtime_monitor_progress()
