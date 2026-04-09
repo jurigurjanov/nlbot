@@ -41,6 +41,7 @@ from xtb_bot.bot._assignment import (
     _strategy_params_signature,
 )
 from xtb_bot.bot.ig_budget import BotIgBudgetRuntime
+from xtb_bot.bot.broker_state import BotBrokerStateRuntime
 
 
 logger = logging.getLogger(__name__)
@@ -261,6 +262,7 @@ class TradingBot:
         self._closed_trade_details_retry_after_monotonic: dict[str, float] = {}
         self._closed_trade_details_retry_backoff_sec: dict[str, float] = {}
         self._ig_budget = BotIgBudgetRuntime(self)
+        self._broker_state = BotBrokerStateRuntime(self)
         self._last_runtime_monitor_noncritical_deferral_monotonic = 0.0
         self._last_db_housekeeping_error_monotonic = 0.0
         self._trade_reason_summary_enabled = self._env_bool("XTB_TRADE_REASON_SUMMARY_ENABLED", True)
@@ -3891,137 +3893,35 @@ class TradingBot:
             self._runtime_deferred_startup_completion_recorded = True
 
     def _broker_public_api_backoff_remaining_sec(self) -> float:
-        getter = getattr(self.broker, "get_public_api_backoff_remaining_sec", None)
-        if not callable(getter):
-            return 0.0
-        try:
-            remaining = float(getter())
-        except Exception:
-            return 0.0
-        if not math.isfinite(remaining) or remaining <= 0:
-            return 0.0
-        return remaining
+        return self._broker_state.broker_public_api_backoff_remaining_sec()
 
     def _broker_market_data_wait_remaining_sec(self) -> float:
-        getter = getattr(self.broker, "get_market_data_wait_remaining_sec", None)
-        if not callable(getter):
-            return 0.0
-        try:
-            remaining = float(getter())
-        except Exception:
-            return 0.0
-        if not math.isfinite(remaining) or remaining <= 0:
-            return 0.0
-        return remaining
+        return self._broker_state.broker_market_data_wait_remaining_sec()
 
     @staticmethod
     def _finite_float_or_none(raw: object) -> float | None:
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(value):
-            return None
-        return value
+        return BotBrokerStateRuntime.finite_float_or_none(raw)
 
     @staticmethod
     def _normalize_currency_code(value: object) -> str | None:
-        text = str(value or "").strip().upper().replace(".", "")
-        if not text:
-            return None
-        aliases = {
-            "€": "EUR",
-            "$": "USD",
-            "£": "GBP",
-            "#": "GBP",
-            "E": "EUR",
-        }
-        mapped = aliases.get(text, text)
-        if len(mapped) == 3 and mapped.isalpha():
-            return mapped
-        return None
+        return BotBrokerStateRuntime.normalize_currency_code(value)
 
     def _broker_account_currency_code(self) -> str | None:
-        getter = getattr(self.broker, "get_account_currency_code", None)
-        if not callable(getter):
-            return None
-        try:
-            return self._normalize_currency_code(getter())
-        except Exception:
-            return None
+        return self._broker_state.broker_account_currency_code()
 
     def _currency_conversion_rate(
         self,
         from_currency: str | None,
         to_currency: str | None,
     ) -> tuple[float | None, str | None]:
-        source_currency = self._normalize_currency_code(from_currency)
-        target_currency = self._normalize_currency_code(to_currency)
-        if not source_currency or not target_currency:
-            return None, None
-        if source_currency == target_currency:
-            return 1.0, "identity"
-
-        stream_only_getter = getattr(self.broker, "get_price_stream_only", None)
-        pair_candidates = (
-            (f"{source_currency}{target_currency}", False),
-            (f"{target_currency}{source_currency}", True),
-        )
-        for pair_symbol, invert in pair_candidates:
-            tick: PriceTick | None = None
-            if callable(stream_only_getter):
-                try:
-                    tick = stream_only_getter(pair_symbol, wait_timeout_sec=0.0)
-                except Exception:
-                    tick = None
-            if tick is None:
-                try:
-                    tick = self.broker.get_price(pair_symbol)
-                except Exception:
-                    tick = None
-            if tick is None:
-                continue
-            mid = (float(tick.bid) + float(tick.ask)) / 2.0
-            if mid <= 0.0:
-                continue
-            if invert:
-                return 1.0 / mid, f"fx:{pair_symbol}:inverse_mid"
-            return mid, f"fx:{pair_symbol}:mid"
-        return None, None
+        return self._broker_state.currency_conversion_rate(from_currency, to_currency)
 
     def _normalize_pnl_to_account_currency(
         self,
         pnl_amount: float | None,
         pnl_currency: object | None,
     ) -> tuple[float | None, dict[str, object]]:
-        diagnostics: dict[str, object] = {}
-        if pnl_amount is None:
-            return None, diagnostics
-        amount = float(pnl_amount)
-        native_currency = self._normalize_currency_code(pnl_currency)
-        if native_currency:
-            diagnostics["pnl_currency"] = native_currency
-        account_currency = self._broker_account_currency_code()
-        if account_currency:
-            diagnostics["account_currency"] = account_currency
-        if not native_currency or not account_currency or native_currency == account_currency:
-            diagnostics["pnl_conversion_applied"] = False
-            return amount, diagnostics
-
-        conversion_rate, conversion_source = self._currency_conversion_rate(
-            native_currency,
-            account_currency,
-        )
-        if conversion_rate is None or conversion_rate <= 0.0:
-            diagnostics["pnl_conversion_applied"] = False
-            diagnostics["pnl_conversion_missing"] = True
-            return amount, diagnostics
-
-        diagnostics["pnl_conversion_applied"] = True
-        diagnostics["pnl_conversion_rate"] = conversion_rate
-        diagnostics["pnl_conversion_source"] = conversion_source
-        diagnostics["pnl_native_amount"] = amount
-        return amount * conversion_rate, diagnostics
+        return self._broker_state.normalize_pnl_to_account_currency(pnl_amount, pnl_currency)
 
     def _estimate_position_pnl_from_close_price(
         self,
@@ -4029,36 +3929,7 @@ class TradingBot:
         close_price: float | None,
         pnl_currency: object | None = None,
     ) -> tuple[float | None, dict[str, object]]:
-        normalized_close_price = self._finite_float_or_none(close_price)
-        if normalized_close_price is None or normalized_close_price <= 0.0:
-            return None, {}
-        spec = self.store.load_broker_symbol_spec(
-            position.symbol,
-            max_age_sec=0.0,
-            epic=str(position.epic or "").strip().upper() or None,
-            epic_variant=str(position.epic_variant or "").strip().lower() or None,
-        )
-        if spec is None:
-            return None, {}
-        tick_size = max(float(spec.tick_size), FLOAT_COMPARISON_TOLERANCE)
-        tick_value = float(spec.tick_value)
-        calibration = self.store.load_broker_tick_value_calibration(position.symbol)
-        if isinstance(calibration, dict):
-            calibrated_tick_value = self._finite_float_or_none(calibration.get("tick_value"))
-            calibrated_tick_size = self._finite_float_or_none(calibration.get("tick_size"))
-            if (
-                calibrated_tick_value is not None
-                and calibrated_tick_value > 0.0
-                and calibrated_tick_size is not None
-                and math.isclose(calibrated_tick_size, tick_size, rel_tol=0.0, abs_tol=max(FLOAT_COMPARISON_TOLERANCE, tick_size * FLOAT_COMPARISON_TOLERANCE))
-            ):
-                tick_value = calibrated_tick_value
-        if tick_value <= 0.0:
-            return None, {}
-        ticks = (normalized_close_price - float(position.open_price)) / tick_size
-        signed_ticks = ticks if position.side.value == "buy" else -ticks
-        pnl_native = signed_ticks * tick_value * float(position.volume)
-        return self._normalize_pnl_to_account_currency(pnl_native, pnl_currency)
+        return self._broker_state.estimate_position_pnl_from_close_price(position, close_price, pnl_currency)
 
     @staticmethod
     def _trade_event_matches_position(payload: dict[str, object] | None, position_id: str) -> bool:
