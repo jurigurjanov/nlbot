@@ -1222,6 +1222,8 @@ def resolve_strategy_param(
 class RiskConfig:
     start_balance: float = 10_000.0
     max_risk_per_trade_pct: float = 1.0
+    allow_min_lot_override: bool = True
+    min_lot_risk_cap_pct: float = 3.0
     max_daily_drawdown_pct: float = 5.0
     max_total_drawdown_pct: float = 12.0
     drawdown_risk_throttle_enabled: bool = True
@@ -2142,6 +2144,19 @@ def load_config(
             _resolve(risk_raw, "XTB_MAX_RISK_PER_TRADE_PCT", "max_risk_per_trade_pct", 1.0),
             1.0,
         ),
+        allow_min_lot_override=_as_bool(
+            _resolve(
+                risk_raw,
+                "XTB_ALLOW_MIN_LOT_OVERRIDE",
+                "allow_min_lot_override",
+                True,
+            ),
+            True,
+        ),
+        min_lot_risk_cap_pct=_as_float(
+            _resolve(risk_raw, "XTB_MIN_LOT_RISK_CAP_PCT", "min_lot_risk_cap_pct", 3.0),
+            3.0,
+        ),
         max_daily_drawdown_pct=_as_float(
             _resolve(risk_raw, "XTB_MAX_DAILY_DRAWDOWN_PCT", "max_daily_drawdown_pct", 5.0),
             5.0,
@@ -2663,6 +2678,8 @@ def load_config(
 
     if not (0.0 < risk.max_risk_per_trade_pct <= 2.0):
         raise ConfigError("max_risk_per_trade_pct must be in range (0, 2]")
+    if not (0.0 < risk.min_lot_risk_cap_pct <= 10.0):
+        raise ConfigError("min_lot_risk_cap_pct must be in range (0, 10]")
     if not (0.0 < risk.max_daily_drawdown_pct <= 20.0):
         raise ConfigError("max_daily_drawdown_pct must be in range (0, 20]")
     if not (0.0 < risk.max_total_drawdown_pct <= 50.0):

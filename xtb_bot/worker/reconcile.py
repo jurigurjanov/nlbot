@@ -427,11 +427,25 @@ class WorkerReconcileManager:
             if isinstance(history_broker_sync, dict) and self.broker_sync_has_factual_close_details(history_broker_sync):
                 broker_sync = history_broker_sync
 
+        # If a pending close verification reason exists (from the original
+        # _close_position call), preserve it so the real trigger is visible in
+        # trade history instead of a generic "broker_manual_close" label.
+        pending_reason = (
+            worker._pending_close_verification_reason
+            if worker._pending_close_verification_position_id == position.position_id
+            else None
+        )
+
         if not self.broker_sync_has_factual_close_details(broker_sync):
             bid = tick.bid if tick is not None else None
             ask = tick.ask if tick is not None else None
             inferred_price, inferred_reason = self.infer_missing_position_close(position, bid, ask)
             broker_source = str((broker_sync or {}).get("source") or "").strip().lower() or "unknown"
+            close_reason = (
+                f"close_verified:{pending_reason}:pending_broker_sync:{broker_source}"
+                if pending_reason
+                else f"broker_manual_close:{inferred_reason}:pending_broker_sync:{broker_source}"
+            )
             worker.store.record_event(
                 "WARN",
                 worker.symbol,
@@ -440,6 +454,7 @@ class WorkerReconcileManager:
                     "position_id": position.position_id,
                     "inferred_reason": inferred_reason,
                     "inferred_close_price": inferred_price,
+                    "original_close_reason": pending_reason,
                     "broker_close_sync": broker_sync,
                 },
             )
@@ -447,7 +462,7 @@ class WorkerReconcileManager:
             worker._finalize_position_close(
                 position,
                 inferred_price,
-                f"broker_manual_close:{inferred_reason}:pending_broker_sync:{broker_source}",
+                close_reason,
                 broker_sync=broker_sync,
                 use_local_close_price=False,
                 estimate_close_price=inferred_price,
@@ -462,11 +477,16 @@ class WorkerReconcileManager:
         inferred_price, inferred_reason = self.infer_missing_position_close(position, bid, ask)
         broker_close_price = worker._safe_float((broker_sync or {}).get("close_price"))
         use_local_close_price = broker_close_price is not None and broker_close_price > 0
+        close_reason = (
+            f"close_verified:{pending_reason}:{broker_source}"
+            if pending_reason
+            else f"broker_manual_close:{inferred_reason}:{broker_source}"
+        )
         self.clear_pending_missing_position_reconciliation()
         worker._finalize_position_close(
             position,
             inferred_price,
-            f"broker_manual_close:{inferred_reason}:{broker_source}",
+            close_reason,
             broker_sync=broker_sync,
             use_local_close_price=use_local_close_price,
             estimate_close_price=inferred_price,
