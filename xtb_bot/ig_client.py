@@ -359,15 +359,17 @@ class _IgLightstreamerClientListener(_LightstreamerClientListenerBase):
 
     def onStatusChange(self, status: str) -> None:  # noqa: N802
         try:
+            logger.info("IG Lightstreamer SDK status change: %s", status)
             self._owner._on_stream_sdk_status_change(status)
         except Exception:
-            logger.debug("IG Lightstreamer SDK status callback failed", exc_info=True)
+            logger.warning("IG Lightstreamer SDK status callback failed", exc_info=True)
 
     def onServerError(self, code: int, message: str) -> None:  # noqa: N802
         try:
+            logger.warning("IG Lightstreamer SDK server error: code=%s message=%s", code, message)
             self._owner._on_stream_sdk_server_error(code, message)
         except Exception:
-            logger.debug("IG Lightstreamer SDK server error callback failed", exc_info=True)
+            logger.warning("IG Lightstreamer SDK server error callback failed", exc_info=True)
 
 
 class _IgLightstreamerSubscriptionListener(_LightstreamerSubscriptionListenerBase):
@@ -377,21 +379,24 @@ class _IgLightstreamerSubscriptionListener(_LightstreamerSubscriptionListenerBas
 
     def onSubscription(self) -> None:  # noqa: N802
         try:
+            logger.info("IG Lightstreamer SDK subscription active: %s", self._symbol)
             self._owner._on_stream_sdk_subscription(self._symbol)
         except Exception:
-            logger.debug("IG Lightstreamer SDK subscription callback failed", exc_info=True)
+            logger.warning("IG Lightstreamer SDK subscription callback failed: %s", self._symbol, exc_info=True)
 
     def onUnsubscription(self) -> None:  # noqa: N802
         try:
+            logger.info("IG Lightstreamer SDK unsubscription: %s", self._symbol)
             self._owner._on_stream_sdk_unsubscription(self._symbol)
         except Exception:
-            logger.debug("IG Lightstreamer SDK unsubscription callback failed", exc_info=True)
+            logger.warning("IG Lightstreamer SDK unsubscription callback failed: %s", self._symbol, exc_info=True)
 
     def onSubscriptionError(self, code: int, message: str) -> None:  # noqa: N802
         try:
+            logger.warning("IG Lightstreamer SDK subscription error: %s code=%s message=%s", self._symbol, code, message)
             self._owner._on_stream_sdk_subscription_error(self._symbol, code, message)
         except Exception:
-            logger.debug("IG Lightstreamer SDK subscription-error callback failed", exc_info=True)
+            logger.warning("IG Lightstreamer SDK subscription-error callback failed: %s", self._symbol, exc_info=True)
 
     def onItemUpdate(self, update: Any) -> None:  # noqa: N802
         try:
@@ -6581,6 +6586,10 @@ class IgApiClient(BaseBrokerClient):
             return
 
         try:
+            logger.info(
+                "IG Lightstreamer SDK connecting | endpoint=%s account=%s adapter=%s",
+                self._stream_endpoint, self.account_id, LIGHTSTREAMER_ADAPTER_SET,
+            )
             client = _LightstreamerClient(self._stream_endpoint, LIGHTSTREAMER_ADAPTER_SET)
             client.connectionDetails.setUser(self.account_id)
             client.connectionDetails.setPassword(f"CST-{self._cst}|XST-{self._security_token}")
@@ -6591,6 +6600,7 @@ class IgApiClient(BaseBrokerClient):
             self._stream_sdk_connected = False
             self._stream_sdk_status = "connecting"
             client.connect()
+            logger.info("IG Lightstreamer SDK connect() returned, waiting for status callback")
         except Exception as exc:
             self._stream_sdk_client = None
             self._stream_sdk_client_listener = None
