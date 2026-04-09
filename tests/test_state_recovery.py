@@ -1337,7 +1337,7 @@ def test_runtime_sync_uses_idle_interval_when_no_local_or_pending_positions(monk
             return None
 
     bot.broker = _FakeBroker()  # type: ignore[assignment]
-    monkeypatch.setattr("xtb_bot.bot.time.monotonic", lambda: monotonic_now["value"])
+    monkeypatch.setattr("xtb_bot.bot.core.time.monotonic", lambda: monotonic_now["value"])
     monkeypatch.setattr(bot, "_reserve_ig_non_trading_budget", lambda **kwargs: True)
     monkeypatch.setattr(bot, "_broker_public_api_backoff_remaining_sec", lambda: 0.0)
     monkeypatch.setattr(TradingBot, "_symbols_to_run", lambda self: ["AUS200"])
@@ -1412,7 +1412,7 @@ def test_runtime_sync_keeps_fast_interval_when_pending_open_exists(monkeypatch, 
             return None
 
     bot.broker = _FakeBroker()  # type: ignore[assignment]
-    monkeypatch.setattr("xtb_bot.bot.time.monotonic", lambda: monotonic_now["value"])
+    monkeypatch.setattr("xtb_bot.bot.core.time.monotonic", lambda: monotonic_now["value"])
     monkeypatch.setattr(bot, "_reserve_ig_non_trading_budget", lambda **kwargs: True)
     monkeypatch.setattr(bot, "_broker_public_api_backoff_remaining_sec", lambda: 0.0)
     monkeypatch.setattr(TradingBot, "_symbols_to_run", lambda self: ["AUS200"])
@@ -2026,8 +2026,8 @@ def test_runtime_backfill_closed_trade_details_throttles_pending_trade_retries(m
 
     bot.broker = _FakeBroker()  # type: ignore[assignment]
     monkeypatch.setattr(TradingBot, "_connect_broker", lambda self: None)
-    monkeypatch.setattr("xtb_bot.bot.time.monotonic", lambda: now["mono"])
-    monkeypatch.setattr("xtb_bot.bot.time.time", lambda: now["ts"])
+    monkeypatch.setattr("xtb_bot.bot.core.time.monotonic", lambda: now["mono"])
+    monkeypatch.setattr("xtb_bot.bot.core.time.time", lambda: now["ts"])
 
     reconciled_first = bot._backfill_closed_trade_details()
     reconciled_second = bot._backfill_closed_trade_details()

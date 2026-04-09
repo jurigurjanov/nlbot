@@ -489,7 +489,7 @@ def test_multi_strategy_carrier_support_check_uses_component_support(monkeypatch
         started.append((assignment.symbol, assignment.strategy_name))
         return _DummyWorker(assignment.symbol, assignment.strategy_name, stop_event)
 
-    monkeypatch.setattr("xtb_bot.bot.create_strategy", fake_create_strategy)
+    monkeypatch.setattr("xtb_bot.bot.core.create_strategy", fake_create_strategy)
     monkeypatch.setattr(TradingBot, "_connect_broker", lambda self: None)
     monkeypatch.setattr(TradingBot, "_make_worker", fake_make_worker)
 
@@ -1055,7 +1055,7 @@ def test_history_keep_rows_estimate_respects_caps(monkeypatch, tmp_path):
         def supports_symbol(symbol: str) -> bool:
             return bool(symbol)
 
-    monkeypatch.setattr("xtb_bot.bot.create_strategy", lambda name, params: _FakeStrategy())
+    monkeypatch.setattr("xtb_bot.bot.core.create_strategy", lambda name, params: _FakeStrategy())
 
     try:
         estimated = bot._estimate_history_keep_rows("momentum", {"a": 1})
@@ -1138,7 +1138,7 @@ def test_bot_passively_warms_history_for_inactive_scheduled_symbols(monkeypatch,
         "_now_utc",
         lambda self: datetime(2026, 3, 12, 8, 0, tzinfo=timezone.utc),
     )
-    monkeypatch.setattr("xtb_bot.bot.time.time", lambda: 1_700_000_000.0)
+    monkeypatch.setattr("xtb_bot.bot.core.time.time", lambda: 1_700_000_000.0)
 
     bot._monitor_workers()
 

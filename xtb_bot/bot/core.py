@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from xtb_bot.tolerances import FLOAT_COMPARISON_TOLERANCE, FLOAT_ROUNDING_TOLERANCE
 
-import _thread
+import _thread as _thread  # noqa: force stdlib resolution
 import faulthandler
 import hashlib
 import json
@@ -13,7 +13,6 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -35,138 +34,18 @@ from xtb_bot.strategies import create_strategy
 from xtb_bot.time_utils import normalize_unix_timestamp_seconds
 from xtb_bot.worker import SymbolWorker
 
+from xtb_bot.bot._utils import _TokenBucket, _BoundedTtlCache
+from xtb_bot.bot._assignment import (
+    WorkerAssignment,
+    _freeze_cache_value,
+    _strategy_params_signature,
+)
+
 
 logger = logging.getLogger(__name__)
 
 _MULTI_STRATEGY_CARRIER_NAME = "multi_strategy"
 _MULTI_STRATEGY_BASE_COMPONENT_PARAM = "_multi_strategy_base_component"
-
-
-def _freeze_cache_value(value: object) -> object:
-    if isinstance(value, dict):
-        return tuple(
-            (str(key), _freeze_cache_value(item))
-            for key, item in sorted(value.items(), key=lambda entry: str(entry[0]))
-        )
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_cache_value(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        frozen_items = [_freeze_cache_value(item) for item in value]
-        return tuple(sorted(frozen_items, key=repr))
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
-def _strategy_params_signature(strategy_params: dict[str, object]) -> tuple[tuple[str, object], ...]:
-    return tuple(
-        (str(key), _freeze_cache_value(value))
-        for key, value in sorted(strategy_params.items(), key=lambda entry: str(entry[0]))
-    )
-
-
-class _TokenBucket:
-    def __init__(self, capacity: int, refill_per_sec: float) -> None:
-        self._capacity = max(1, int(capacity))
-        self._refill_per_sec = max(FLOAT_COMPARISON_TOLERANCE, float(refill_per_sec))
-        self._tokens = float(self._capacity)
-        self._last_refill_mono = time.monotonic()
-        self._lock = threading.Lock()
-
-    def _refill_locked(self) -> None:
-        now_mono = time.monotonic()
-        elapsed = now_mono - self._last_refill_mono
-        if elapsed <= 0:
-            return
-        self._tokens = min(self._capacity, self._tokens + (elapsed * self._refill_per_sec))
-        self._last_refill_mono = now_mono
-
-    def try_consume(self, tokens: float = 1.0) -> bool:
-        requested = max(FLOAT_COMPARISON_TOLERANCE, float(tokens))
-        with self._lock:
-            self._refill_locked()
-            if self._tokens < requested:
-                return False
-            self._tokens -= requested
-            return True
-
-    def available_tokens(self) -> float:
-        with self._lock:
-            self._refill_locked()
-            return self._tokens
-
-
-class _BoundedTtlCache:
-    def __init__(self, *, max_entries: int, ttl_sec: float) -> None:
-        self._max_entries = max(1, int(max_entries))
-        self._ttl_sec = max(1.0, float(ttl_sec))
-        self._entries: dict[object, tuple[object, float]] = {}
-        self._lock = threading.Lock()
-
-    def clear(self) -> None:
-        with self._lock:
-            self._entries.clear()
-
-    def get(self, key: object, default: object | None = None) -> object | None:
-        with self._lock:
-            now = time.monotonic()
-            entry = self._entries.get(key)
-            if entry is None:
-                return default
-            value, expires_at = entry
-            if expires_at <= now:
-                self._entries.pop(key, None)
-                return default
-            self._entries.pop(key, None)
-            self._entries[key] = (value, now + self._ttl_sec)
-            self._evict_locked(now)
-            return value
-
-    def __setitem__(self, key: object, value: object) -> None:
-        with self._lock:
-            now = time.monotonic()
-            self._entries.pop(key, None)
-            self._entries[key] = (value, now + self._ttl_sec)
-            self._evict_locked(now)
-
-    def _evict_locked(self, now: float) -> None:
-        expired_keys = [
-            key
-            for key, (_, expires_at) in list(self._entries.items())
-            if expires_at <= now
-        ]
-        for key in expired_keys:
-            self._entries.pop(key, None)
-        while len(self._entries) > self._max_entries:
-            oldest_key = next(iter(self._entries))
-            self._entries.pop(oldest_key, None)
-
-
-@dataclass(frozen=True)
-class WorkerAssignment:
-    symbol: str
-    strategy_name: str
-    strategy_params: dict[str, object]
-    mode_override: RunMode | None = None
-    source: str = "static"
-    label: str | None = None
-
-    def signature(self) -> tuple[str, str, str, str, tuple[tuple[str, object], ...]]:
-        return (
-            self.symbol,
-            self.strategy_name,
-            (self.mode_override.value if isinstance(self.mode_override, RunMode) else ""),
-            self.source,
-            _strategy_params_signature(self.strategy_params),
-        )
-
-    def runtime_signature(self) -> tuple[str, str, str, tuple[tuple[str, object], ...]]:
-        return (
-            self.symbol,
-            self.strategy_name,
-            (self.mode_override.value if isinstance(self.mode_override, RunMode) else ""),
-            _strategy_params_signature(self.strategy_params),
-        )
 
 
 class TradingBot:

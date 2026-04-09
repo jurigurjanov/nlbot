@@ -2111,7 +2111,7 @@ def test_abort_process_for_watchdog_requests_graceful_shutdown(tmp_path, monkeyp
         "flush_multi_async_writes",
         lambda timeout_sec=1.0: multi_flushes.append(float(timeout_sec)) or True,
     )
-    monkeypatch.setattr("xtb_bot.bot._thread.interrupt_main", lambda: interrupt_calls.append("called"))
+    monkeypatch.setattr("xtb_bot.bot.core._thread.interrupt_main", lambda: interrupt_calls.append("called"))
 
     try:
         with pytest.raises(SystemExit) as exc:
@@ -2197,7 +2197,7 @@ def test_passive_history_refresh_clamps_future_broker_timestamp(tmp_path, monkey
 
     fake = _FakeBroker()
     bot.broker = fake  # type: ignore[assignment]
-    monkeypatch.setattr("xtb_bot.bot.time.time", lambda: 1_800_000_000.0)
+    monkeypatch.setattr("xtb_bot.bot.core.time.time", lambda: 1_800_000_000.0)
     try:
         bot._refresh_passive_price_history(force=True)
         bot._refresh_passive_price_history(force=True)
