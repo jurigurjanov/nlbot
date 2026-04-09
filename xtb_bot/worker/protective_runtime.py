@@ -12,6 +12,7 @@ import math
 from typing import Any
 
 from xtb_bot.models import Position, Side
+from xtb_bot.worker.protocol import WorkerProtocol
 
 
 _TREND_ENTRY_COMPONENTS: set[str] = {
@@ -29,7 +30,7 @@ _INDEX_TREND_BREAKEVEN_STOP_RATIO = 0.50
 
 
 class WorkerProtectiveRuntime:
-    def __init__(self, worker: Any) -> None:
+    def __init__(self, worker: WorkerProtocol) -> None:
         self.worker = worker
 
     def is_index_trend_following_position(self, position: Position) -> bool:

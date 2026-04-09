@@ -53,8 +53,8 @@ class MomentumStrategy(Strategy):
 
     def __init__(self, params: dict[str, object]):
         super().__init__(params)
-        self.fast_window = int(params.get("fast_window", 8))
-        self.slow_window = int(params.get("slow_window", 21))
+        self.fast_window = self._param_int("fast_window", 8)
+        self.slow_window = self._param_int("slow_window", 21)
         self.ma_type = str(params.get("momentum_ma_type", "sma")).strip().lower()
         if self.ma_type not in {"sma", "ema"}:
             self.ma_type = "sma"
@@ -65,28 +65,19 @@ class MomentumStrategy(Strategy):
             1,
             int(params.get("momentum_confirm_bars", params.get("confirm_bars", 1))),
         )
-        self.low_tf_min_confirm_bars = max(
-            1,
-            int(params.get("momentum_low_tf_min_confirm_bars", 1)),
+        self.low_tf_min_confirm_bars = self._param_int(
+            "momentum_low_tf_min_confirm_bars", 1, min_val=1,
         )
         self.low_tf_max_confirm_bars = max(
             self.low_tf_min_confirm_bars,
-            int(params.get("momentum_low_tf_max_confirm_bars", 1)),
+            self._param_int("momentum_low_tf_max_confirm_bars", 1, min_val=1),
         )
-        self.high_tf_max_confirm_bars = max(
-            1,
-            int(params.get("momentum_high_tf_max_confirm_bars", 1)),
+        self.high_tf_max_confirm_bars = self._param_int(
+            "momentum_high_tf_max_confirm_bars", 1, min_val=1,
         )
-        auto_confirm_raw = params.get("momentum_auto_confirm_by_timeframe", False)
-        if isinstance(auto_confirm_raw, str):
-            self.auto_confirm_by_timeframe = auto_confirm_raw.strip().lower() not in {
-                "0",
-                "false",
-                "no",
-                "off",
-            }
-        else:
-            self.auto_confirm_by_timeframe = bool(auto_confirm_raw)
+        self.auto_confirm_by_timeframe = self._param_bool(
+            "momentum_auto_confirm_by_timeframe", False,
+        )
         timeframe_raw = params.get("momentum_timeframe_sec")
         self.timeframe_sec = float(timeframe_raw) if timeframe_raw is not None else None
         if self.timeframe_sec is not None and self.timeframe_sec <= 0:
@@ -112,16 +103,13 @@ class MomentumStrategy(Strategy):
         self.max_spread_to_atr_ratio = (
             max_spread_to_atr if math.isfinite(max_spread_to_atr) and max_spread_to_atr > 0 else None
         )
-        tick_size_guard_raw = params.get("momentum_require_context_tick_size", False)
-        if isinstance(tick_size_guard_raw, str):
-            self.require_context_tick_size = tick_size_guard_raw.strip().lower() not in {"0", "false", "no", "off"}
-        else:
-            self.require_context_tick_size = bool(tick_size_guard_raw)
-        self.base_stop_loss_pips = max(0.1, float(params.get("stop_loss_pips", 25.0)))
-        self.base_take_profit_pips = max(0.1, float(params.get("take_profit_pips", 50.0)))
-        default_atr_window = 14
-        self.atr_window = max(2, int(params.get("momentum_atr_window", default_atr_window)))
-        self.atr_multiplier = max(0.1, float(params.get("momentum_atr_multiplier", 1.7)))
+        self.require_context_tick_size = self._param_bool(
+            "momentum_require_context_tick_size", False,
+        )
+        self.base_stop_loss_pips = self._param_float("stop_loss_pips", 25.0, min_val=0.1)
+        self.base_take_profit_pips = self._param_float("take_profit_pips", 50.0, min_val=0.1)
+        self.atr_window = self._param_int("momentum_atr_window", 14, min_val=2)
+        self.atr_multiplier = self._param_float("momentum_atr_multiplier", 1.7, min_val=0.1)
         self.min_stop_loss_pips = max(
             0.1,
             float(params.get("momentum_min_stop_loss_pips", self.base_stop_loss_pips)),
@@ -132,11 +120,9 @@ class MomentumStrategy(Strategy):
             0.1,
             float(params.get("momentum_min_take_profit_pips", self.base_take_profit_pips)),
         )
-        low_tf_risk_raw = params.get("momentum_low_tf_risk_profile_enabled", True)
-        if isinstance(low_tf_risk_raw, str):
-            self.low_tf_risk_profile_enabled = low_tf_risk_raw.strip().lower() not in {"0", "false", "no", "off"}
-        else:
-            self.low_tf_risk_profile_enabled = bool(low_tf_risk_raw)
+        self.low_tf_risk_profile_enabled = self._param_bool(
+            "momentum_low_tf_risk_profile_enabled", True,
+        )
         self.low_tf_max_timeframe_sec = max(
             1.0,
             float(params.get("momentum_low_tf_max_timeframe_sec", 5.0 * 60.0)),

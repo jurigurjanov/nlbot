@@ -280,7 +280,14 @@ class StateStore:
         self._db_integrity_error: str | None = None
         self._db_recovered_from_corruption = False
         self._db_quarantine_path: str | None = None
-        self._conn = self._open_connection()
+        self._init_conn = self._open_connection()
+        self._thread_local = threading.local()
+        # Seed the main thread's thread-local slot with the init connection so
+        # that _init_schema (and everything else on the main thread) reuses it
+        # instead of opening a redundant second connection.
+        self._thread_local.conn = self._init_conn
+        self._thread_local_connections: list[sqlite3.Connection] = [self._init_conn]
+        self._thread_local_connections_lock = threading.Lock()
         self._closed = False
         raw_async_multi_writer = os.getenv("XTB_MULTI_DB_ASYNC_WRITER_ENABLED", "false")
         self._multi_async_writer_enabled = str(raw_async_multi_writer).strip().lower() in {"1", "true", "yes", "on"}
@@ -346,7 +353,47 @@ class StateStore:
                 timeout=self._sqlite_timeout_sec,
             )
         conn.row_factory = sqlite3.Row
+        busy_timeout_ms = max(1_000, int(self._sqlite_timeout_sec * 1000))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
         return conn
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Return a per-thread SQLite connection (lazy-created)."""
+        conn = getattr(self._thread_local, "conn", None)
+        if conn is None:
+            conn = self._open_connection()
+            self._thread_local.conn = conn
+            with self._thread_local_connections_lock:
+                self._thread_local_connections.append(conn)
+        return conn
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        """Per-thread SQLite connection (transparently replaces the old shared self._conn)."""
+        return self._get_connection()
+
+    @_conn.setter
+    def _conn(self, value: sqlite3.Connection) -> None:
+        """Allow direct assignment for quarantine/reinitialize flows."""
+        self._init_conn = value
+
+    def _close_all_connections(self) -> None:
+        """Close the init connection and every thread-local connection."""
+        with self._thread_local_connections_lock:
+            conns = list(self._thread_local_connections)
+            self._thread_local_connections.clear()
+        # _init_conn is already in the tracked list (seeded in __init__), but
+        # add it to the close set defensively in case it was replaced.
+        all_conns = {id(c): c for c in conns}
+        all_conns[id(self._init_conn)] = self._init_conn
+        for c in all_conns.values():
+            try:
+                c.close()
+            except Exception:
+                pass
+        self._thread_local = threading.local()
 
     def _quarantine_db_files(self, reason: str) -> Path:
         quarantine_suffix = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
@@ -970,9 +1017,14 @@ class StateStore:
             except Exception:
                 logger.debug("Failed to close %s async writer during DB quarantine", writer_name, exc_info=True)
         with self._lock:
-            self._conn.close()
+            self._close_all_connections()
             quarantine_path = self._quarantine_db_files(integrity_error)
-            self._conn = self._open_connection()
+            self._init_conn = self._open_connection()
+            # Re-seed the current thread's slot so _init_schema (and subsequent
+            # operations on this thread) reuse the new init connection.
+            self._thread_local.conn = self._init_conn
+            with self._thread_local_connections_lock:
+                self._thread_local_connections.append(self._init_conn)
             self._init_schema()
             self._db_recovered_from_corruption = True
             self._db_integrity_ok = True
@@ -1152,8 +1204,10 @@ class StateStore:
     def _apply_multi_async_batch(self, batch: list[tuple[str, tuple[Any, ...]]]) -> None:
         if not batch:
             return
+        conn = self._get_connection()
         with self._lock:
-            with self._conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 for op, payload in batch:
                     if op == "virtual_position":
                         self._apply_virtual_position_write_in_txn(*payload)
@@ -1164,6 +1218,10 @@ class StateStore:
                     if op == "system_error":
                         self._apply_system_error_write_in_txn(*payload)
                         continue
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         self._apply_hot_multi_batch(batch)
 
     def _mark_multi_async_failure(self, exc: Exception) -> None:
@@ -1291,12 +1349,18 @@ class StateStore:
     def _apply_event_async_batch(self, batch: list[tuple[Any, ...]]) -> None:
         if not batch:
             return
+        conn = self._get_connection()
         with self._lock:
-            with self._conn:
-                self._conn.executemany(
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.executemany(
                     "INSERT INTO events(ts, level, symbol, message, payload_json) VALUES (?, ?, ?, ?, ?)",
                     batch,
                 )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def flush_event_async_writes(self, timeout_sec: float = 2.0) -> bool:
         if (not self._event_async_writer_enabled) or self._closed:
@@ -1346,20 +1410,19 @@ class StateStore:
         return value
 
     def _run_write_tx(self, operation: Callable[[], _T]) -> _T:
+        conn = self._get_connection()
         with self._lock:
-            with self._conn:
-                return operation()
-
-    def _run_write_tx_immediate(self, operation: Callable[[], _T]) -> _T:
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            conn.execute("BEGIN IMMEDIATE")
             try:
                 result = operation()
-                self._conn.execute("COMMIT")
+                conn.execute("COMMIT")
                 return result
             except Exception:
-                self._conn.execute("ROLLBACK")
+                conn.execute("ROLLBACK")
                 raise
+
+    # Backward-compatible alias: _run_write_tx now always uses BEGIN IMMEDIATE.
+    _run_write_tx_immediate = _run_write_tx
 
     def _apply_virtual_position_write_in_txn(
         self,
@@ -4383,9 +4446,11 @@ class StateStore:
             keep_events = max(100, int(self._housekeeping_events_keep_rows))
             events_deleted = 0
             position_updates_deleted = 0
-            deleted_before = self._conn.total_changes
-            with self._conn:
-                self._conn.execute(
+            conn = self._get_connection()
+            deleted_before = conn.total_changes
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
                     """
                     DELETE FROM events
                     WHERE id < COALESCE(
@@ -4395,15 +4460,19 @@ class StateStore:
                     """,
                     (keep_events - 1,),
                 )
-                deleted_after_events = self._conn.total_changes
+                deleted_after_events = conn.total_changes
                 events_deleted = max(0, deleted_after_events - deleted_before)
                 cutoff_ts = now - self._housekeeping_position_updates_retention_sec
-                self._conn.execute(
+                conn.execute(
                     "DELETE FROM position_updates WHERE ts < ?",
                     (float(cutoff_ts),),
                 )
-                deleted_after_updates = self._conn.total_changes
+                deleted_after_updates = conn.total_changes
                 position_updates_deleted = max(0, deleted_after_updates - deleted_after_events)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
             checkpoint_payload: dict[str, int] | None = None
             try:
@@ -4435,12 +4504,17 @@ class StateStore:
                 "position_updates_retention_sec": self._housekeeping_position_updates_retention_sec,
                 "checkpoint": checkpoint_payload,
             }
-            with self._conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 self._upsert_kv_in_txn(
                     "db.housekeeping.last_summary",
                     json.dumps(summary, separators=(",", ":"), ensure_ascii=False),
                 )
                 self._upsert_kv_in_txn("db.housekeeping.last_ts", f"{now}")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
             self._last_housekeeping_ts = now
             return summary
 
@@ -4488,7 +4562,7 @@ class StateStore:
             # Checkpoint WAL to fold all pending writes into main DB before closing.
             # This prevents stale WAL files from blocking the next startup.
             try:
-                result = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                result = self._init_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                 logger.info(
                     "state_store close: WAL checkpoint result: blocked=%s, wal_pages=%s, checkpointed=%s",
                     result[0] if result else "?",
@@ -4497,5 +4571,5 @@ class StateStore:
                 )
             except Exception as exc:
                 logger.warning("state_store close: WAL checkpoint failed: %s", exc)
-            self._conn.close()
+            self._close_all_connections()
             self._closed = True
