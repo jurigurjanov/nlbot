@@ -8,7 +8,7 @@
 2. `PROJECT_MAP.md`
 3. `README.md`
 4. Дальше уже идти в нужный домен:
-   - orchestration: `xtb_bot/bot.py`
+   - orchestration: `xtb_bot/bot/` (package, see Bot Architecture below)
    - worker runtime: `xtb_bot/worker/`
    - broker/data: `xtb_bot/ig_client.py`, `xtb_bot/ig_proxy.py`, `xtb_bot/client.py`
    - persistence: `xtb_bot/state_store.py`
@@ -36,13 +36,25 @@
   - all CLI commands
   - run/start modes
   - read-only diagnostics (`--show-status`, `--show-trades`, `--show-trade-reasons`, etc.)
-- `xtb_bot/bot.py`
-  - top-level orchestrator
-  - worker lifecycle
-  - startup restore/sync
-  - periodic runtime monitor/watchdog
-  - shared latest tick cache
-  - broker-wide runtime tasks
+- `xtb_bot/bot/` (package)
+  - `core.py` — `TradingBot` facade: `__init__`, `start`, `stop`, `run_forever`, `_monitor_workers`, shutdown
+  - `__init__.py` — re-exports `TradingBot`, `WorkerAssignment`
+  - `_utils.py` — `_TokenBucket`, `_BoundedTtlCache`
+  - `_assignment.py` — `WorkerAssignment` dataclass, cache helpers
+  - `ig_budget.py` — `BotIgBudgetRuntime` — IG non-trading rate budget
+  - `broker_state.py` — `BotBrokerStateRuntime` — broker backoff, PnL, currency conversion
+  - `strategy_assignment.py` — `BotStrategyAssignmentRuntime` — strategy params, labels, multi-strategy rollout
+  - `stream_ticks.py` — `BotStreamTickRuntime` — tick persistence hook, latest tick cache
+  - `db_first_tick.py` — `BotDbFirstTickRuntime` — DB-first tick cache loop, symbol selection
+  - `db_first_spec.py` — `BotDbFirstSpecRuntime` — symbol spec preload/refresh
+  - `price_history.py` — `BotPriceHistoryRuntime` — history estimation, prefetch, passive refresh
+  - `close_details.py` — `BotCloseDetailsRuntime` — close detail resolution, trade backfill
+  - `trade_metadata.py` — `BotTradeMetadataRuntime` — trade reason summaries, error classification
+  - `position_sync.py` — `BotPositionSyncRuntime` — position sync, restore, broker reconcile
+  - `worker_lifecycle.py` — `BotWorkerLifecycleRuntime` — make/start/stop workers, leases
+  - `worker_reconcile.py` — `BotWorkerReconcileRuntime` — schedule, assignments, reconcile loop
+  - `worker_health.py` — `BotWorkerHealthRuntime` — heartbeat, watchdog, monitoring
+  - `db_first_startup.py` — `BotDbFirstStartupRuntime` — startup priming, deferred tasks, account/history cache loops
 
 ## Broker Stack
 
@@ -232,7 +244,7 @@ If the problem is...
 
 Start here:
 - `xtb_bot/cli.py`
-- `xtb_bot/bot.py`
+- `xtb_bot/bot/`
 - `xtb_bot/worker/risk.py`
 - `xtb_bot/worker/signal_runtime.py`
 - `xtb_bot/worker/multi_strategy.py`
@@ -247,7 +259,7 @@ Useful CLI:
 ### Bot stopped writing to DB / hung / watchdog fired
 
 Start here:
-- `xtb_bot/bot.py`
+- `xtb_bot/bot/`
 - `xtb_bot/worker/orchestrator.py`
 - `xtb_bot/worker/lifecycle.py`
 - `xtb_bot/worker/health.py`
@@ -266,7 +278,7 @@ Look for events:
 Start here:
 - `xtb_bot/worker/reconcile.py`
 - `xtb_bot/worker/orders.py`
-- `xtb_bot/bot.py`
+- `xtb_bot/bot/`
 - `xtb_bot/ig_client.py`
 - `xtb_bot/broker_method_support.py`
 
@@ -275,7 +287,7 @@ Start here:
 Start here:
 - `xtb_bot/worker/history.py`
 - `xtb_bot/worker/data_access.py`
-- `xtb_bot/bot.py`
+- `xtb_bot/bot/`
 - `xtb_bot/state_store.py`
 
 ### Risk sizing / blocked trades / min lot
@@ -306,7 +318,7 @@ Never assume one layer is authoritative without checking which code path owns th
 
 ### Runtime / execution
 
-- `xtb_bot/bot.py`
+- `xtb_bot/bot/`
 - `xtb_bot/worker/`
 - `xtb_bot/risk_manager.py`
 - `xtb_bot/state_store.py`
