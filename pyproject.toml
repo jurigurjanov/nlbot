@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.26.0",
-  "lightstreamer-client-lib>=1.0.3",
+  "lightstreamer-client-lib>=2.0.0",
   "websocket-client>=1.8.0",
 ]
 
