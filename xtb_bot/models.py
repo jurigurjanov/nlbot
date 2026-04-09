@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import math
+from xtb_bot.tolerances import FLOAT_COMPARISON_TOLERANCE, FLOAT_ROUNDING_TOLERANCE
+
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+import math
 from typing import Any
 
 
@@ -30,6 +32,7 @@ class PriceTick:
     ask: float
     timestamp: float
     volume: float | None = None
+    received_at: float | None = None
 
     @property
     def mid(self) -> float:
@@ -53,19 +56,38 @@ class SymbolSpec:
     lot_min: float
     lot_max: float
     lot_step: float
+    min_stop_distance_price: float | None = None
+    one_pip_means: float | None = None
     price_precision: int = 5
     lot_precision: int = 2
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def effective_lot_max(self) -> float:
+        lot_max = float(self.lot_max)
+        if not math.isfinite(lot_max) or lot_max <= 0:
+            return float("inf")
+        return lot_max
+
+    def effective_lot_precision(self) -> int:
+        try:
+            precision = int(self.lot_precision)
+        except (TypeError, ValueError, OverflowError):
+            try:
+                precision = int(float(self.lot_precision))
+            except (TypeError, ValueError, OverflowError):
+                precision = 0
+        return max(0, precision)
 
     def round_volume(self, raw: float) -> float:
         if raw <= 0:
             return 0.0
         step = self.lot_step if self.lot_step > 0 else 0.01
-        normalized = math.ceil(raw / step - 1e-9) * step
-        clamped = max(normalized, self.lot_min)
-        if self.lot_max > 0:
-            clamped = min(clamped, self.lot_max)
-        return round(clamped, self.lot_precision)
+        units = math.floor((raw + FLOAT_ROUNDING_TOLERANCE) / step)
+        normalized = units * step
+        if normalized + FLOAT_ROUNDING_TOLERANCE < self.lot_min:
+            return 0.0
+        clamped = min(max(normalized, 0.0), self.effective_lot_max())
+        return round(clamped, self.effective_lot_precision())
 
 
 @dataclass(slots=True)
@@ -130,6 +152,18 @@ class Position:
     close_price: float | None = None
     closed_at: float | None = None
     pnl: float = 0.0
+    pnl_is_estimated: bool = False
+    pnl_estimate_source: str | None = None
+    epic: str | None = None
+    epic_variant: str | None = None
+    strategy: str | None = field(default=None, compare=False)
+    strategy_base: str | None = field(default=None, compare=False)
+    strategy_entry: str | None = field(default=None, compare=False)
+    strategy_entry_component: str | None = field(default=None, compare=False)
+    strategy_entry_signal: str | None = field(default=None, compare=False)
+    strategy_exit: str | None = field(default=None, compare=False)
+    strategy_exit_component: str | None = field(default=None, compare=False)
+    strategy_exit_signal: str | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -156,7 +190,10 @@ class PendingOpen:
     mode: str
     entry_confidence: float = 0.0
     position_id: str | None = None
-    trailing_override: dict[str, float] | None = None
+    strategy_entry: str | None = None
+    strategy_entry_component: str | None = None
+    strategy_entry_signal: str | None = None
+    trailing_override: dict[str, float | str] | None = None
 
 
 @dataclass(slots=True)
@@ -168,6 +205,10 @@ class WorkerState:
     last_price: float | None
     last_heartbeat: float
     iteration: int
+    strategy_base: str | None = None
+    position_strategy_entry: str | None = None
+    position_strategy_component: str | None = None
+    position_strategy_signal: str | None = None
     position: dict[str, Any] | None = None
     last_error: str | None = None
 

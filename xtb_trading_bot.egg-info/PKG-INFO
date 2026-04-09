@@ -40,12 +40,8 @@ Requires-Dist: pytest>=8.0.0; extra == "dev"
   - `g1` (EMA cross + ADX/ATR + динамический SL/TP, с отдельными авто-профилями для FX и индексов)
   - `donchian_breakout` (breakout-only по каналу Дончиана)
   - `index_hybrid` (гибрид для индексов: trend-following + mean-reversion)
-  - `mean_breakout` (z-score + breakout уровней: подтвержденный пробой после отклонения от среднего)
-  - `mean_breakout_session` (пробой opening range: коробка первых 15-30 минут сессии)
-  - `mean_reversion_rsi` (RSI mean-reversion: overbought/oversold уровни)
   - `mean_reversion_bb` (Bollinger Bands mean-reversion, опционально с RSI-фильтром)
   - `momentum`
-  - `mean_reversion`
   - `trend_following` (EMA 50/200 + опциональный breakout канала Дончиана)
 - Переключение режимов:
   - `signal_only` (только сигналы)
@@ -115,7 +111,7 @@ xtb-bot --mode signal_only
 Запуск в live execution:
 
 ```bash
-xtb-bot --mode execution --strategy mean_reversion
+xtb-bot --mode execution --strategy mean_breakout_v2
 ```
 
 Запуск `g1`:

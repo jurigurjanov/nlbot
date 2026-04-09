@@ -26,11 +26,7 @@ xtb_bot/strategies/base.py
 xtb_bot/strategies/donchian_breakout.py
 xtb_bot/strategies/g1.py
 xtb_bot/strategies/index_hybrid.py
-xtb_bot/strategies/mean_breakout.py
-xtb_bot/strategies/mean_breakout_session.py
-xtb_bot/strategies/mean_reversion.py
 xtb_bot/strategies/mean_reversion_bb.py
-xtb_bot/strategies/mean_reversion_rsi.py
 xtb_bot/strategies/momentum.py
 xtb_bot/strategies/trend_following.py
 xtb_trading_bot.egg-info/PKG-INFO

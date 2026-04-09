@@ -7,6 +7,8 @@ from xtb_bot.models import Position
 
 
 class PositionBook:
+    _ACTIVE_STATUSES = {"open", "closing"}
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._positions_by_id: dict[str, Position] = {}
@@ -20,6 +22,10 @@ class PositionBook:
     def _position_sort_key(position: Position) -> tuple[float, str]:
         return (float(position.opened_at), str(position.position_id))
 
+    @classmethod
+    def _is_active_status(cls, status: object) -> bool:
+        return str(status or "").strip().lower() in cls._ACTIVE_STATUSES
+
     def bootstrap(self, positions: dict[str, Position] | list[Position]) -> None:
         if isinstance(positions, dict):
             values = list(positions.values())
@@ -30,7 +36,7 @@ class PositionBook:
             self._symbol_index.clear()
             for position in values:
                 position_id = str(position.position_id).strip()
-                if not position_id or position.status != "open":
+                if not position_id or not self._is_active_status(position.status):
                     continue
                 symbol = self._normalize_symbol(position.symbol)
                 self._positions_by_id[position_id] = position
@@ -73,7 +79,7 @@ class PositionBook:
                     previous_ids.discard(position_id)
                     if not previous_ids:
                         self._symbol_index.pop(previous_symbol, None)
-            if position.status == "open":
+            if self._is_active_status(position.status):
                 self._positions_by_id[position_id] = position
                 self._symbol_index.setdefault(normalized_symbol, set()).add(position_id)
             else:

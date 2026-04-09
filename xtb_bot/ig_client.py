@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from xtb_bot.tolerances import FLOAT_COMPARISON_TOLERANCE, FLOAT_ROUNDING_TOLERANCE
+
+import copy
+from collections import OrderedDict, deque
 from contextlib import contextmanager
+from queue import Empty, Full, Queue
 import json
 import logging
 import math
@@ -11,20 +16,21 @@ import time
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib import error, parse, request
 
 try:
     from lightstreamer.client import (
-        LightstreamerClient as _LsClient,
-        Subscription as _LsSubscription,
-        SubscriptionListener as _LsSubscriptionListener,
-        ClientListener as _LsClientListener,
-        ItemUpdate as _LsItemUpdate,
+        ClientListener as _LightstreamerClientListenerBase,
+        LightstreamerClient as _LightstreamerClient,
+        Subscription as _LightstreamerSubscription,
+        SubscriptionListener as _LightstreamerSubscriptionListenerBase,
     )
-    _HAS_LIGHTSTREAMER = True
-except ImportError:
-    _HAS_LIGHTSTREAMER = False
+except Exception:  # pragma: no cover - optional dependency for legacy compatibility
+    _LightstreamerClient = None
+    _LightstreamerSubscription = None
+    _LightstreamerClientListenerBase = object  # type: ignore[assignment]
+    _LightstreamerSubscriptionListenerBase = object  # type: ignore[assignment]
 
 from xtb_bot.client import BaseBrokerClient, BrokerError
 from xtb_bot.models import (
@@ -39,15 +45,36 @@ from xtb_bot.models import (
     StreamHealthStatus,
     SymbolSpec,
 )
+from xtb_bot.symbols import is_index_symbol as _shared_is_index_symbol
 
 
 logger = logging.getLogger(__name__)
+
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({500, 502, 503, 504})
+_FLOAT_TEXT_PATTERN = re.compile(r"^[0-9,.\-+eE]+$")
+
+
+@dataclass(slots=True)
+class _QueuedRequestJob:
+    method: str
+    path: str
+    payload: dict[str, Any] | None
+    version: str
+    auth: bool
+    extra_headers: dict[str, str] | None
+    query: dict[str, Any] | None
+    retry_on_auth_failure: bool
+    critical_bypass: bool = False
+    done: threading.Event = field(default_factory=threading.Event)
+    result: tuple[dict[str, Any], dict[str, str]] | None = None
+    error: Exception | None = None
 
 
 DEFAULT_IG_EPICS: dict[str, str] = {
     "EURUSD": "CS.D.EURUSD.CFD.IP",
     "GBPUSD": "CS.D.GBPUSD.CFD.IP",
     "USDJPY": "CS.D.USDJPY.CFD.IP",
+    "GBPJPY": "CS.D.GBPJPY.CFD.IP",
     "USDCAD": "CS.D.USDCAD.CFD.IP",
     "EURGBP": "CS.D.EURGBP.CFD.IP",
     "EURCHF": "CS.D.EURCHF.CFD.IP",
@@ -62,6 +89,7 @@ DEFAULT_IG_EPICS: dict[str, str] = {
     "EU50": "IX.D.EUSTX50.CASH.IP",
     "UK100": "IX.D.FTSE.CASH.IP",
     "AUS200": "IX.D.ASX.CASH.IP",
+    "JP225": "IX.D.NIKKEI.CASH.IP",
     "JPN225": "IX.D.NIKKEI.CASH.IP",
     "XAUUSD": "CS.D.GOLD.CFD.IP",
     "GOLD": "CS.D.GOLD.CFD.IP",
@@ -80,6 +108,7 @@ DEFAULT_IG_EPIC_CANDIDATES: dict[str, list[str]] = {
     "EURUSD": ["CS.D.EURUSD.CFD.IP"],
     "GBPUSD": ["CS.D.GBPUSD.CFD.IP"],
     "USDJPY": ["CS.D.USDJPY.CFD.IP"],
+    "GBPJPY": ["CS.D.GBPJPY.CFD.IP"],
     "USDCAD": ["CS.D.USDCAD.CFD.IP"],
     "EURGBP": ["CS.D.EURGBP.CFD.IP"],
     "EURCHF": ["CS.D.EURCHF.CFD.IP"],
@@ -138,11 +167,19 @@ DEFAULT_IG_EPIC_CANDIDATES: dict[str, list[str]] = {
         "IX.D.ASX.DAILY.IP",
         "IX.D.ASX.IFS.IP",
     ],
+    "JP225": [
+        "IX.D.NIKKEI.CASH.IP",
+        "IX.D.NIKKEI.DAILY.IP",
+        "IX.D.NIKKEI.IFS.IP",
+        "IX.D.JP225.CASH.IP",
+        "IX.D.JPN225.CASH.IP",
+    ],
     "JPN225": [
         "IX.D.NIKKEI.CASH.IP",
         "IX.D.NIKKEI.DAILY.IP",
         "IX.D.NIKKEI.IFS.IP",
-        "IX.D.NIKKEI.CFD.IP",
+        "IX.D.JP225.CASH.IP",
+        "IX.D.JPN225.CASH.IP",
     ],
     "XAUUSD": [
         "CS.D.GOLD.CFD.IP",
@@ -196,13 +233,31 @@ DEFAULT_IG_EPIC_CANDIDATES: dict[str, list[str]] = {
 }
 IG_EPIC_SEARCH_TERMS: dict[str, list[str]] = {
     "US500": ["S&P 500", "US 500", "SPX"],
-    "US100": ["NASDAQ 100", "US 100", "NASDAQ"],
+    "US100": ["NASDAQ 100", "US 100", "NASDAQ", "US TECH 100", "USTECH 100", "US TECH"],
+    "US2000": ["RUSSELL 2000", "US RUSSELL 2000", "US 2000", "RUSSELL", "RUT", "RUS 2000"],
     "DE40": ["DAX 40", "GERMANY 40", "DAX"],
     "UK100": ["FTSE 100", "UK 100", "FTSE"],
     "FR40": ["CAC 40", "FRANCE 40", "FR40"],
     "EU50": ["EURO STOXX 50", "EU50", "STOXX 50"],
+    "IT40": ["ITALY 40", "FTSE MIB", "MIB 40", "ITALY40"],
+    "ES35": ["SPAIN 35", "IBEX 35", "SPAIN35"],
+    "SK20": ["SWEDEN 30", "OMX STOCKHOLM 30", "OMXS30", "SK20"],
+    "NK20": ["NORWAY 25", "NORWAY 25 CASH", "OBX", "OSLO BORS BENCHMARK", "NK20"],
+    "SE30": ["SWEDEN 30", "OMX STOCKHOLM 30", "OMXS30", "SE30"],
+    "DEMID50": ["GERMANY MID-CAP 50", "GERMANY MID CAP 50", "MDAX", "DEMID50", "MIDCAP 50"],
+    "MDAX50": ["GERMANY MID-CAP 50", "GERMANY MID CAP 50", "MDAX", "MDAX50", "MIDCAP 50"],
     "AUS200": ["AUSTRALIA 200", "AUS200", "ASX 200"],
-    "JPN225": ["JAPAN 225", "NIKKEI 225", "NIKKEI", "JPN225"],
+    "JP225": ["JAPAN 225", "NIKKEI 225", "NIKKEI", "JP225", "JPN225"],
+    "JPN225": ["JAPAN 225", "NIKKEI 225", "NIKKEI", "JP225", "JPN225"],
+    "TOPIX": ["TOPIX", "TOKYO FIRST SECTION", "TOKYO STOCK PRICE INDEX"],
+    "CARBON": ["CARBON EMISSIONS", "CARBON", "EU CARBON", "EUA"],
+    "UKNATGAS": ["NATURAL GAS - UK", "UK NATURAL GAS", "NATURAL GAS UK", "UK GAS"],
+    "GASOLINE": ["GASOLINE", "RBOB GASOLINE", "RB GASOLINE"],
+    "WHEAT": ["WHEAT - CHICAGO", "CHICAGO WHEAT", "WHEAT"],
+    "COCOA": ["COCOA - NEW YORK", "NEW YORK COCOA", "COCOA"],
+    "CORN": ["CORN", "CHICAGO CORN"],
+    "SOYBEANOIL": ["SOYBEAN OIL", "SOY OIL", "BEAN OIL"],
+    "OATS": ["OATS", "CHICAGO OATS"],
     "GOLD": ["GOLD", "XAUUSD", "SPOT GOLD"],
     "XAUUSD": ["XAUUSD", "GOLD", "SPOT GOLD"],
     "BRENT": ["BRENT", "UK CRUDE"],
@@ -215,6 +270,17 @@ IG_EPIC_SEARCH_TERMS: dict[str, list[str]] = {
     "DOGE": ["DOGECOIN", "DOGE", "DOGUSD", "DOGEUSD"],
     "AAPL": ["APPLE", "AAPL"],
     "MSFT": ["MICROSOFT", "MSFT"],
+}
+
+COMMODITY_EPIC_HINTS: dict[str, tuple[str, ...]] = {
+    "CARBON": ("CARBON", "EUA", "EMISS"),
+    "UKNATGAS": ("NGASUK", "NATGASUK", "UKGAS", "NGUK"),
+    "GASOLINE": ("GASOLINE", "RBOB", ".RB."),
+    "WHEAT": ("WHEAT", ".ZW."),
+    "COCOA": ("COCOA", "COCO"),
+    "CORN": ("CORN", ".ZC."),
+    "SOYBEANOIL": ("SOY", "BEAN", ".ZL."),
+    "OATS": ("OATS", "OAT", ".ZO."),
 }
 
 _FX_MARGIN_CURRENCIES = {
@@ -241,8 +307,97 @@ _FX_MARGIN_CURRENCIES = {
     "ZAR",
 }
 
+_CRYPTO_SYMBOL_BASES = frozenset(
+    {
+        "ADA",
+        "ATOM",
+        "AVAX",
+        "BCH",
+        "BTC",
+        "DOGE",
+        "DOT",
+        "ETC",
+        "ETH",
+        "LINK",
+        "LTC",
+        "MATIC",
+        "SOL",
+        "UNI",
+        "XLM",
+        "XRP",
+    }
+)
+_CRYPTO_SYMBOL_QUOTES = ("USD", "USDT", "USDC", "EUR", "GBP", "JPY", "BTC", "ETH")
 
-IG_LS_PRICE_FIELDS = ("BID", "OFFER", "UPDATE_TIME")
+
+LIGHTSTREAMER_CID = "mgQkwtwdysogQz2BJ4Ji kOj2Bg"
+LIGHTSTREAMER_ADAPTER_SET = "DEFAULT"
+LIGHTSTREAMER_PRICE_ADAPTER = "Pricing"
+# IG PRICE subscriptions use a space-separated field list.
+# Keep the requested schema compact and strictly aligned with IG docs.
+LIGHTSTREAMER_PRICE_SUBSCRIPTION_FIELDS = (
+    "BIDPRICE1",
+    "ASKPRICE1",
+    "TIMESTAMP",
+)
+# Internal decode aliases; includes legacy fallback names seen in tests/older feeds.
+LIGHTSTREAMER_PRICE_FIELDS = (
+    "BIDPRICE1",
+    "ASKPRICE1",
+    "TIMESTAMP",
+    "BID",
+    "OFFER",
+    "UPDATE_TIME",
+    "OFR",
+    "UTM",
+)
+
+
+class _IgLightstreamerClientListener(_LightstreamerClientListenerBase):
+    def __init__(self, owner: "IgApiClient") -> None:
+        self._owner = owner
+
+    def onStatusChange(self, status: str) -> None:  # noqa: N802
+        try:
+            self._owner._on_stream_sdk_status_change(status)
+        except Exception:
+            logger.debug("IG Lightstreamer SDK status callback failed", exc_info=True)
+
+    def onServerError(self, code: int, message: str) -> None:  # noqa: N802
+        try:
+            self._owner._on_stream_sdk_server_error(code, message)
+        except Exception:
+            logger.debug("IG Lightstreamer SDK server error callback failed", exc_info=True)
+
+
+class _IgLightstreamerSubscriptionListener(_LightstreamerSubscriptionListenerBase):
+    def __init__(self, owner: "IgApiClient", symbol: str) -> None:
+        self._owner = owner
+        self._symbol = str(symbol).upper()
+
+    def onSubscription(self) -> None:  # noqa: N802
+        try:
+            self._owner._on_stream_sdk_subscription(self._symbol)
+        except Exception:
+            logger.debug("IG Lightstreamer SDK subscription callback failed", exc_info=True)
+
+    def onUnsubscription(self) -> None:  # noqa: N802
+        try:
+            self._owner._on_stream_sdk_unsubscription(self._symbol)
+        except Exception:
+            logger.debug("IG Lightstreamer SDK unsubscription callback failed", exc_info=True)
+
+    def onSubscriptionError(self, code: int, message: str) -> None:  # noqa: N802
+        try:
+            self._owner._on_stream_sdk_subscription_error(self._symbol, code, message)
+        except Exception:
+            logger.debug("IG Lightstreamer SDK subscription-error callback failed", exc_info=True)
+
+    def onItemUpdate(self, update: Any) -> None:  # noqa: N802
+        try:
+            self._owner._on_stream_sdk_item_update(self._symbol, update)
+        except Exception:
+            logger.debug("IG Lightstreamer SDK item-update callback failed", exc_info=True)
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -253,6 +408,8 @@ def _as_float(value: Any, default: float = 0.0) -> float:
             text = value.strip().replace("\xa0", "").replace(" ", "")
             if not text or text in {"-", "--", "N/A", "null", "None"}:
                 return default
+            if not _FLOAT_TEXT_PATTERN.fullmatch(text):
+                return default
             if "," in text and "." in text:
                 if text.rfind(",") > text.rfind("."):
                     text = text.replace(".", "").replace(",", ".")
@@ -260,15 +417,10 @@ def _as_float(value: Any, default: float = 0.0) -> float:
                     text = text.replace(",", "")
             elif "," in text:
                 text = text.replace(",", ".")
-            filtered = "".join(ch for ch in text if ch.isdigit() or ch in {".", "-", "+", "e", "E"})
-            # Strip leading 'e'/'E' that is a currency prefix (e.g. "E-56.81"
-            # from IG's profitAndLoss), not part of scientific notation.
-            if filtered and filtered[0] in {"e", "E"}:
-                filtered = filtered.lstrip("eE")
-            if filtered in {"", "-", "+", ".", "-.", "+."}:
+            if text in {"", "-", "+", ".", "-.", "+."}:
                 return default
             try:
-                return float(filtered)
+                return float(text)
             except Exception:
                 return default
         return default
@@ -351,26 +503,6 @@ def _first_positive_float(mapping: dict[str, Any], *keys: str) -> float:
     return 0.0
 
 
-def _step_from_min(lot_min: float) -> float:
-    """Derive a deal-size step from the minDealSize precision.
-
-    IG does not expose an explicit size-increment field.  We use the
-    precision of ``minDealSize`` as a hint, but cap at 0.01 because IG
-    typically accepts 0.01-lot increments for most instruments.
-    E.g. lot_min=0.001 → step 0.001; lot_min=0.5 → step 0.01;
-    lot_min=1.0 → step 0.01.
-    We clamp the result to [0.001, 0.01].
-    """
-    if lot_min <= 0:
-        return 0.01
-    text = f"{lot_min:.10f}".rstrip("0")
-    if "." not in text:
-        return 0.01  # integer lot_min → default 0.01
-    decimals = len(text.split(".", 1)[1])
-    step = 10 ** (-decimals)
-    return max(0.001, min(step, 0.01))
-
-
 def _precision_from_step(step: float) -> int:
     text = f"{step:.10f}".rstrip("0")
     if "." not in text:
@@ -379,7 +511,7 @@ def _precision_from_step(step: float) -> int:
 
 
 def _normalize_price_floor_for_spec(spec: SymbolSpec, price: float) -> float:
-    tick = Decimal(str(max(float(spec.tick_size), 1e-9)))
+    tick = Decimal(str(max(float(spec.tick_size), FLOAT_COMPARISON_TOLERANCE)))
     value = Decimal(str(float(price)))
     steps = (value / tick).to_integral_value(rounding=ROUND_FLOOR)
     normalized = steps * tick
@@ -387,23 +519,61 @@ def _normalize_price_floor_for_spec(spec: SymbolSpec, price: float) -> float:
 
 
 def _normalize_price_ceil_for_spec(spec: SymbolSpec, price: float) -> float:
-    tick = Decimal(str(max(float(spec.tick_size), 1e-9)))
+    tick = Decimal(str(max(float(spec.tick_size), FLOAT_COMPARISON_TOLERANCE)))
     value = Decimal(str(float(price)))
     steps = (value / tick).to_integral_value(rounding=ROUND_CEILING)
     normalized = steps * tick
     return round(float(normalized), spec.price_precision)
 
 
+def _normalize_volume_floor_for_spec(spec: SymbolSpec, raw_volume: float) -> float:
+    if raw_volume <= 0:
+        return 0.0
+    step = max(0.001, float(spec.lot_step) if float(spec.lot_step) > 0 else 0.01)
+    step_dec = Decimal(str(step))
+    raw_dec = Decimal(str(float(raw_volume))) + (step_dec * Decimal(str(FLOAT_COMPARISON_TOLERANCE)))
+    steps = (raw_dec / step_dec).to_integral_value(rounding=ROUND_FLOOR)
+    normalized = float(steps * step_dec)
+    normalized = min(normalized, float(spec.effective_lot_max()))
+    if normalized + FLOAT_ROUNDING_TOLERANCE < float(spec.lot_min):
+        return 0.0
+    return round(normalized, int(spec.lot_precision))
+
+
 def _sanitize_deal_reference(value: str) -> str:
     return "".join(ch for ch in str(value or "") if ch.isalnum() or ch in {"-", "_"})
 
 
-def _format_open_deal_reference(value: str, attempt: int = 0) -> str:
+def _format_open_deal_reference(value: str) -> str:
     normalized = _sanitize_deal_reference(value)
-    if attempt > 0:
-        suffix = f"-a{attempt}"
-        return normalized[: 30 - len(suffix)] + suffix
     return normalized[:30]
+
+
+def _format_open_deal_reference_for_attempt(value: str, attempt_index: int) -> str:
+    base = _format_open_deal_reference(value)
+    if attempt_index <= 0:
+        return base
+    suffix = f"{int(attempt_index) % 100:02d}"
+    if len(base) <= 27:
+        return f"{base}_{suffix}"
+    if len(base) <= 28:
+        return f"{base}{suffix}"
+    return f"{base[:28]}{suffix}"
+
+
+def _deal_reference_matches(expected: str, actual: str) -> bool:
+    expected_norm = _sanitize_deal_reference(str(expected or "").strip())
+    actual_norm = _sanitize_deal_reference(str(actual or "").strip())
+    if not expected_norm or not actual_norm:
+        return False
+    if expected_norm == actual_norm:
+        return True
+    # Allow short retry suffixes appended to the base reference for re-attempted POSTs.
+    if actual_norm.startswith(expected_norm) and (len(actual_norm) - len(expected_norm)) <= 3:
+        return True
+    if expected_norm.startswith(actual_norm) and (len(expected_norm) - len(actual_norm)) <= 3:
+        return True
+    return False
 
 
 def _snapshot_missing_quote_error(
@@ -482,26 +652,33 @@ def _is_plausible_epic_for_symbol(symbol: str, epic: str) -> bool:
             return False
         return any(token in upper_epic for token in ("BRENT", "LCO", "BRN", "CRUDE", "OIL"))
 
+    commodity_hints = COMMODITY_EPIC_HINTS.get(upper_symbol)
+    if commodity_hints is not None:
+        if not upper_epic.startswith("CC."):
+            return False
+        return any(token in upper_epic for token in commodity_hints)
+
     if upper_symbol in {"GOLD", "XAUUSD"}:
         if not upper_epic.startswith(("CS.", "CC.")):
             return False
         return "GOLD" in upper_epic or "XAU" in upper_epic
 
-    if upper_symbol in {"BTC", "ETH", "LTC", "SOL", "XRP", "DOGE"}:
+    crypto_base = _crypto_symbol_base(upper_symbol)
+    if crypto_base is not None:
         if not upper_epic.startswith("CS.D."):
             return False
         symbol_matches = (
             upper_symbol in upper_epic
-            or f"{upper_symbol}USD" in upper_epic
-            or (upper_symbol == "DOGE" and "DOGUSD" in upper_epic)
+            or f"{crypto_base}USD" in upper_epic
+            or (crypto_base == "DOGE" and "DOGUSD" in upper_epic)
         )
         name_matches = (
-            (upper_symbol == "BTC" and "BITCOIN" in upper_epic)
-            or (upper_symbol == "ETH" and "ETHEREUM" in upper_epic)
-            or (upper_symbol == "LTC" and "LITECOIN" in upper_epic)
-            or (upper_symbol == "SOL" and "SOLANA" in upper_epic)
-            or (upper_symbol == "XRP" and "RIPPLE" in upper_epic)
-            or (upper_symbol == "DOGE" and "DOGECOIN" in upper_epic)
+            (crypto_base == "BTC" and "BITCOIN" in upper_epic)
+            or (crypto_base == "ETH" and "ETHEREUM" in upper_epic)
+            or (crypto_base == "LTC" and "LITECOIN" in upper_epic)
+            or (crypto_base == "SOL" and "SOLANA" in upper_epic)
+            or (crypto_base == "XRP" and "RIPPLE" in upper_epic)
+            or (crypto_base == "DOGE" and "DOGECOIN" in upper_epic)
         )
         return symbol_matches or name_matches
 
@@ -513,9 +690,7 @@ def _is_plausible_epic_for_symbol(symbol: str, epic: str) -> bool:
 
 def _is_index_symbol(symbol: str, epic: str | None = None) -> bool:
     upper = str(symbol).upper()
-    if upper in {"US100", "US500", "US30", "DE40", "UK100", "FR40", "FRA40", "JP225", "JPN225", "EU50", "AUS200"}:
-        return True
-    if upper.startswith(("US", "DE", "UK", "FR", "FRA", "JP", "EU", "AUS", "AU")) and any(ch.isdigit() for ch in upper):
+    if _shared_is_index_symbol(upper):
         return True
     epic_upper = str(epic or "").upper()
     if epic_upper.startswith("IX."):
@@ -531,7 +706,7 @@ def _is_non_fx_cfd_symbol(symbol: str, epic: str | None = None) -> bool:
     if upper_epic.startswith(("UA.", "SA.", "CC.")):
         return True
     if upper_epic.startswith("CS.D."):
-        return not (len(upper_symbol) == 6 and upper_symbol.isalpha())
+        return not _is_fx_pair_symbol(upper_symbol)
     return upper_symbol in {
         "WTI",
         "BRENT",
@@ -545,9 +720,28 @@ def _is_non_fx_cfd_symbol(symbol: str, epic: str | None = None) -> bool:
     }
 
 
+def _epic_variant_key(epic: str) -> str:
+    upper_epic = str(epic or "").strip().upper()
+    if not upper_epic:
+        return "unknown"
+    if ".CASH." in upper_epic:
+        return "cash"
+    if ".DAILY." in upper_epic:
+        return "daily"
+    if ".IFS." in upper_epic:
+        return "ifs"
+    if ".IFD." in upper_epic:
+        return "ifd"
+    if ".CFD." in upper_epic:
+        return "cfd"
+    return "other"
+
+
 def _is_fx_pair_symbol(symbol: str) -> bool:
     upper = str(symbol or "").strip().upper()
     if len(upper) != 6 or not upper.isalpha():
+        return False
+    if _is_crypto_symbol(upper):
         return False
     base = upper[:3]
     quote = upper[3:]
@@ -556,122 +750,66 @@ def _is_fx_pair_symbol(symbol: str) -> bool:
     return base in _FX_MARGIN_CURRENCIES and quote in _FX_MARGIN_CURRENCIES
 
 
-def _infer_margin_price_scale_divisor(symbol: str, pip_size: float, one_pip_means: float) -> float:
+def _is_crypto_symbol(symbol: str) -> bool:
+    return _crypto_symbol_base(symbol) is not None
+
+
+def _crypto_symbol_base(symbol: str) -> str | None:
     upper = str(symbol or "").strip().upper()
+    if not upper:
+        return None
+    if upper in _CRYPTO_SYMBOL_BASES:
+        return upper
+    for quote in _CRYPTO_SYMBOL_QUOTES:
+        if upper.endswith(quote):
+            base = upper[: -len(quote)]
+            if base in _CRYPTO_SYMBOL_BASES:
+                return base
+    return None
+
+
+def _first_non_empty_text(values: list[str] | tuple[str, ...]) -> str | None:
+    for value in values:
+        normalized = str(value or "").strip().upper()
+        if normalized:
+            return normalized
+    return None
+
+
+def _infer_margin_price_scale_divisor(
+    symbol: str,
+    pip_size: float,
+    one_pip_means: float,
+    *,
+    scaling_factor: float = 1.0,
+    pip_position: float | None = None,
+) -> float:
+    upper = str(symbol or "").strip().upper()
+    pip_value = abs(float(pip_size))
+    one_pip_value = abs(float(one_pip_means))
+    if pip_value > 0.0 and one_pip_value > 0.0:
+        divisor = pip_value / one_pip_value
+        if math.isfinite(divisor):
+            if _is_fx_pair_symbol(upper):
+                if divisor >= 100.0:
+                    return float(divisor)
+            elif divisor >= 10.0:
+                return float(divisor)
     if not _is_fx_pair_symbol(upper):
         return 1.0
-
-    expected_pip = one_pip_means if one_pip_means > 0 else (0.01 if upper.endswith("JPY") else 0.0001)
-    if expected_pip <= 0:
-        return 1.0
-
-    divisor = pip_size / expected_pip
-    if not math.isfinite(divisor) or divisor < 100.0:
-        return 1.0
-    return float(divisor)
-
-
-class _IgClientListener:
-    """Receives connection lifecycle events from LightstreamerClient."""
-
-    def __init__(self, client: "IgApiClient") -> None:
-        self._client = client
-
-    def onStatusChange(self, status: str) -> None:  # noqa: N802
-        ig = self._client
-        logger.debug("IG Lightstreamer status: %s", status)
-        with ig._lock:
-            if status.startswith("CONNECTED:"):
-                was_disconnected = ig._stream_last_disconnect_ts is not None
-                ig._stream_connected = True
-                ig._stream_last_error = None
-                ig._stream_reconnect_attempts = 0
-                ig._stream_last_reconnect_ts = time.time()
-                if was_disconnected:
-                    ig._stream_total_reconnects += 1
-                    logger.warning(
-                        "IG Lightstreamer reconnected | total_reconnects=%s status=%s",
-                        ig._stream_total_reconnects,
-                        status,
-                    )
-            elif status == "DISCONNECTED:WILL-RETRY":
-                ig._stream_connected = False
-                ig._stream_reconnect_attempts += 1
-                ig._stream_last_disconnect_ts = time.time()
-            elif status == "DISCONNECTED":
-                ig._stream_connected = False
-                ig._stream_last_disconnect_ts = time.time()
-        # Re-subscribe desired symbols after reconnection
-        if status.startswith("CONNECTED:"):
-            ig._resubscribe_desired_symbols()
-
-    def onServerError(self, code: int, message: str) -> None:  # noqa: N802
-        ig = self._client
-        error_text = f"ls_server_error:{code}:{message}"
-        logger.warning("IG Lightstreamer server error: code=%s message=%s", code, message)
-        with ig._lock:
-            ig._stream_last_error = error_text
-        # Auth errors (code 1, 2) - try to refresh tokens
-        if code in (1, 2):
-            threading.Thread(
-                target=ig._refresh_stream_auth,
-                name="ig-ls-auth-refresh",
-                daemon=True,
-            ).start()
-
-    def onPropertyChange(self, prop: str) -> None:  # noqa: N802
-        pass
-
-
-class _IgSubscriptionListener:
-    """Receives price updates for a single Lightstreamer subscription."""
-
-    def __init__(self, client: "IgApiClient", symbol: str) -> None:
-        self._client = client
-        self._symbol = symbol
-
-    def onItemUpdate(self, update: "_LsItemUpdate") -> None:  # noqa: N802
-        bid_raw = update.getValue("BID")
-        ask_raw = update.getValue("OFFER")
-        ts_raw = update.getValue("UPDATE_TIME")
-        self._client._update_tick_from_stream_update(self._symbol, bid_raw, ask_raw, ts_raw)
-
-    def onSubscription(self) -> None:  # noqa: N802
-        logger.debug("IG Lightstreamer subscribed: %s", self._symbol)
-
-    def onUnsubscription(self) -> None:  # noqa: N802
-        logger.debug("IG Lightstreamer unsubscribed: %s", self._symbol)
-
-    def onSubscriptionError(self, code: int, message: str) -> None:  # noqa: N802
-        ig = self._client
-        error_text = f"subscription_error:{self._symbol}:{code}:{message}"
-        logger.warning("IG Lightstreamer subscription error for %s: code=%s message=%s", self._symbol, code, message)
-        with ig._lock:
-            ig._stream_last_error = error_text
-
-    def onEndOfSnapshot(self, item_name: str, item_pos: int) -> None:  # noqa: N802
-        pass
-
-    def onItemLostUpdates(self, item_name: str, item_pos: int, lost: int) -> None:  # noqa: N802
-        logger.warning("IG Lightstreamer lost %d updates for %s (item=%s)", lost, self._symbol, item_name)
-
-    def onListenEnd(self) -> None:  # noqa: N802
-        pass
-
-    def onListenStart(self) -> None:  # noqa: N802
-        pass
-
-    def onRealMaxFrequency(self, freq: str | None) -> None:  # noqa: N802
-        pass
-
-    def onCommandSecondLevelItemLostUpdates(self, lost: int, key: str) -> None:  # noqa: N802
-        pass
-
-    def onCommandSecondLevelSubscriptionError(self, code: int, message: str, key: str) -> None:  # noqa: N802
-        pass
-
-    def onClearSnapshot(self, item_name: str, item_pos: int) -> None:  # noqa: N802
-        pass
+    scale = abs(float(scaling_factor))
+    if math.isfinite(scale) and scale >= 100.0:
+        return float(scale)
+    if pip_position is not None:
+        try:
+            pip_position_value = abs(int(float(pip_position)))
+        except (TypeError, ValueError):
+            pip_position_value = 0
+        if pip_position_value >= 2:
+            divisor = float(10**pip_position_value)
+            if math.isfinite(divisor) and divisor >= 100.0:
+                return divisor
+    return 1.0
 
 
 @dataclass(slots=True)
@@ -692,14 +830,28 @@ class IgApiClient(BaseBrokerClient):
     connect_retry_attempts: int = 4
     connect_retry_base_sec: float = 2.0
     connect_retry_max_sec: float = 30.0
+    position_update_callback: Callable[[dict[str, Any]], None] | None = None
 
     def __post_init__(self) -> None:
         self.identifier = str(self.identifier).strip()
         self.api_key = str(self.api_key).strip().strip('"').strip("'")
         self._lock = threading.RLock()
+        self._connectivity_probe_lock = threading.Lock()
         self._auth_refresh_lock = threading.Lock()
         self._auth_refresh_last_attempt_ts = 0.0
+        self._auth_refresh_last_success_ts = 0.0
         self._auth_refresh_min_interval_sec = 2.0
+        self._runtime_reconnect_lock = threading.Lock()
+        self._runtime_reconnect_last_attempt_ts = 0.0
+        raw_runtime_reconnect_min_interval = (
+            os.getenv("IG_RUNTIME_RECONNECT_MIN_INTERVAL_SEC")
+            or os.getenv("XTB_IG_RUNTIME_RECONNECT_MIN_INTERVAL_SEC")
+            or "2.0"
+        )
+        try:
+            self._runtime_reconnect_min_interval_sec = max(0.5, float(raw_runtime_reconnect_min_interval))
+        except (TypeError, ValueError):
+            self._runtime_reconnect_min_interval_sec = 2.0
         self._connected = False
         self._cst: str | None = None
         self._security_token: str | None = None
@@ -716,9 +868,35 @@ class IgApiClient(BaseBrokerClient):
 
         self._endpoint = (self.endpoint or self._default_endpoint()).rstrip("/")
         self._symbol_spec_cache: dict[str, SymbolSpec] = {}
+        self._symbol_spec_cache_by_epic: dict[tuple[str, str], SymbolSpec] = {}
         self._last_tick_by_symbol: dict[str, float] = {}
         self._tick_cache: dict[str, PriceTick] = {}
+        self._stream_tick_handler: Callable[[PriceTick], None] | None = None
         self._stream_enabled = bool(self.stream_enabled)
+        raw_stream_sdk_enabled = (
+            os.getenv("IG_STREAM_SDK_ENABLED")
+            or os.getenv("XTB_IG_STREAM_SDK_ENABLED")
+            or "true"
+        )
+        self._stream_sdk_enabled = str(raw_stream_sdk_enabled).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._stream_sdk_available = _LightstreamerClient is not None and _LightstreamerSubscription is not None
+        self._stream_use_sdk = bool(self._stream_enabled and self._stream_sdk_enabled and self._stream_sdk_available)
+        self._stream_sdk_client: Any | None = None
+        self._stream_sdk_client_listener: Any | None = None
+        self._stream_sdk_subscriptions: dict[str, Any] = {}
+        self._stream_sdk_subscription_listeners: dict[str, Any] = {}
+        self._stream_sdk_pending_subscriptions: set[str] = set()
+        self._stream_sdk_connected = False
+        self._stream_sdk_status: str | None = None
+        if self._stream_enabled and self._stream_sdk_enabled and not self._stream_sdk_available:
+            logger.debug(
+                "IG stream SDK is not installed; using legacy Lightstreamer transport fallback"
+            )
         raw_epic_search_enabled = (
             os.getenv("IG_EPIC_SEARCH_ENABLED")
             or os.getenv("XTB_IG_EPIC_SEARCH_ENABLED")
@@ -730,21 +908,41 @@ class IgApiClient(BaseBrokerClient):
             "yes",
             "on",
         }
+        raw_epic_failover_enabled = (
+            os.getenv("IG_EPIC_FAILOVER_ENABLED")
+            or os.getenv("XTB_IG_EPIC_FAILOVER_ENABLED")
+            or "true"
+        )
+        self._epic_failover_enabled = str(raw_epic_failover_enabled).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self._price_requests_total = 0
         self._stream_price_hits_total = 0
         self._rest_fallback_hits_total = 0
 
         self._stream_endpoint: str | None = None
-        self._ls_client: "_LsClient | None" = None
-        self._ls_client_listener: _IgClientListener | None = None
-        self._stream_connected: bool = False
+        self._stream_session_id: str | None = None
+        self._stream_control_url: str | None = None
+        self._stream_keepalive_ms: int | None = None
+        self._stream_thread: threading.Thread | None = None
+        self._stream_stop_event = threading.Event()
+        self._stream_http_response: Any | None = None
         self._stream_desired_subscriptions: set[str] = set()
-        self._stream_subscriptions: dict[str, "_LsSubscription"] = {}
+        self._stream_symbol_to_table: dict[str, int] = {}
+        self._stream_table_to_symbol: dict[int, str] = {}
+        self._stream_table_field_values: dict[int, list[str | None]] = {}
+        self._stream_next_table_id = 1
         self._stream_last_error: str | None = None
         self._stream_reconnect_attempts = 0
         self._stream_total_reconnects = 0
         self._stream_last_disconnect_ts: float | None = None
         self._stream_last_reconnect_ts: float | None = None
+        self._stream_next_retry_at: float | None = None
+        self._stream_backoff_base_sec = 0.5
+        self._stream_backoff_max_sec = 30.0
         raw_stream_stale_tick_max_age = (
             os.getenv("IG_STREAM_STALE_TICK_MAX_AGE_SEC")
             or os.getenv("XTB_IG_STREAM_STALE_TICK_MAX_AGE_SEC")
@@ -767,6 +965,16 @@ class IgApiClient(BaseBrokerClient):
         except (TypeError, ValueError):
             self._stream_rest_fallback_min_interval_sec = 30.0
         self._last_stream_rest_fallback_ts_by_symbol: dict[str, float] = {}
+        raw_stream_stagnant_quote_max_age = (
+            os.getenv("IG_STREAM_STAGNANT_QUOTE_MAX_AGE_SEC")
+            or os.getenv("XTB_IG_STREAM_STAGNANT_QUOTE_MAX_AGE_SEC")
+            or "120.0"
+        )
+        try:
+            self._stream_stagnant_quote_max_age_sec = max(0.0, float(raw_stream_stagnant_quote_max_age))
+        except (TypeError, ValueError):
+            self._stream_stagnant_quote_max_age_sec = 120.0
+        self._stream_last_quote_change_ts_by_symbol: dict[str, float] = {}
 
         self._allowance_cooldown_until_ts = 0.0
         self._allowance_cooldown_sec = 1.0
@@ -814,6 +1022,13 @@ class IgApiClient(BaseBrokerClient):
         except (TypeError, ValueError):
             self._invalid_epic_retry_sec = 900.0
         self._invalid_epic_until_ts_by_symbol: dict[str, dict[str, float]] = {}
+        self._invalid_epic_warn_last_ts_by_key: dict[tuple[str, str, str], float] = {}
+        self._epic_remap_warn_last_ts_by_symbol: dict[str, float] = {}
+        self._epic_remap_warn_last_signature_by_symbol: dict[str, tuple[str, str]] = {}
+        self._stream_subscription_retry_not_before_ts_by_symbol: dict[str, float] = {}
+        self._stream_subscription_retry_gap_sec = 1.0
+        self._stream_rest_fallback_block_until_ts_by_symbol: dict[str, float] = {}
+        self._stream_rest_fallback_block_reason_by_symbol: dict[str, str] = {}
         raw_index_pip_fallback_one_point = (
             os.getenv("IG_INDEX_PIP_FALLBACK_ONE_POINT")
             or os.getenv("XTB_IG_INDEX_PIP_FALLBACK_ONE_POINT")
@@ -873,11 +1088,163 @@ class IgApiClient(BaseBrokerClient):
             self._trade_submit_min_interval_sec = 0.75
         self._trade_submit_next_allowed_ts = 0.0
         self._trade_submit_lock = threading.RLock()
+        self._request_context = threading.local()
+
+        raw_rate_limit_enabled = (
+            os.getenv("IG_RATE_LIMIT_ENABLED")
+            or os.getenv("XTB_IG_RATE_LIMIT_ENABLED")
+            or "true"
+        )
+        self._rate_limit_enabled = _as_bool(raw_rate_limit_enabled, True)
+        raw_app_non_trading_limit = (
+            os.getenv("IG_RATE_LIMIT_APP_NON_TRADING_PER_MIN")
+            or os.getenv("XTB_IG_RATE_LIMIT_APP_NON_TRADING_PER_MIN")
+            or "60"
+        )
+        raw_account_non_trading_limit = (
+            os.getenv("IG_RATE_LIMIT_ACCOUNT_NON_TRADING_PER_MIN")
+            or os.getenv("XTB_IG_RATE_LIMIT_ACCOUNT_NON_TRADING_PER_MIN")
+            or "30"
+        )
+        raw_account_trading_limit = (
+            os.getenv("IG_RATE_LIMIT_ACCOUNT_TRADING_PER_MIN")
+            or os.getenv("XTB_IG_RATE_LIMIT_ACCOUNT_TRADING_PER_MIN")
+            or "100"
+        )
+        raw_historical_points_limit = (
+            os.getenv("IG_RATE_LIMIT_HISTORICAL_POINTS_PER_WEEK")
+            or os.getenv("XTB_IG_RATE_LIMIT_HISTORICAL_POINTS_PER_WEEK")
+            or "10000"
+        )
+        try:
+            self._rate_limit_app_non_trading_per_min = max(
+                0,
+                int(float(raw_app_non_trading_limit)),
+            )
+        except (TypeError, ValueError):
+            self._rate_limit_app_non_trading_per_min = 60
+        try:
+            self._rate_limit_account_non_trading_per_min = max(
+                0,
+                int(float(raw_account_non_trading_limit)),
+            )
+        except (TypeError, ValueError):
+            self._rate_limit_account_non_trading_per_min = 30
+        try:
+            self._rate_limit_account_trading_per_min = max(
+                0,
+                int(float(raw_account_trading_limit)),
+            )
+        except (TypeError, ValueError):
+            self._rate_limit_account_trading_per_min = 100
+        try:
+            self._rate_limit_historical_points_per_week = max(
+                0,
+                int(float(raw_historical_points_limit)),
+            )
+        except (TypeError, ValueError):
+            self._rate_limit_historical_points_per_week = 10000
+        self._rate_limit_window_sec = 60.0
+        self._rate_limit_week_window_sec = 7.0 * 24.0 * 60.0 * 60.0
+        self._rate_limit_app_non_trading_requests: deque[float] = deque()
+        self._rate_limit_account_non_trading_requests: deque[float] = deque()
+        self._rate_limit_account_trading_requests: deque[float] = deque()
+        self._rate_limit_historical_points_events: deque[tuple[float, int]] = deque()
+        self._rate_limit_historical_points_week_total = 0
+        self._rate_limit_worker_keys = (
+            "app_non_trading",
+            "account_trading",
+            "account_non_trading",
+            "historical_points",
+        )
+        self._rate_limit_worker_blocked_total: dict[str, int] = {
+            key: 0 for key in self._rate_limit_worker_keys
+        }
+        self._rate_limit_worker_last_request_ts: dict[str, float] = {
+            key: 0.0 for key in self._rate_limit_worker_keys
+        }
+        self._rate_limit_worker_last_block_ts: dict[str, float] = {
+            key: 0.0 for key in self._rate_limit_worker_keys
+        }
+        raw_request_dispatch_enabled = (
+            os.getenv("IG_REQUEST_DISPATCH_ENABLED")
+            or os.getenv("XTB_IG_REQUEST_DISPATCH_ENABLED")
+            or "true"
+        )
+        self._request_dispatch_enabled = _as_bool(raw_request_dispatch_enabled, True)
+        raw_request_dispatch_timeout = (
+            os.getenv("IG_REQUEST_DISPATCH_TIMEOUT_SEC")
+            or os.getenv("XTB_IG_REQUEST_DISPATCH_TIMEOUT_SEC")
+            or "45.0"
+        )
+        try:
+            self._request_dispatch_timeout_sec = max(5.0, float(raw_request_dispatch_timeout))
+        except (TypeError, ValueError):
+            self._request_dispatch_timeout_sec = 45.0
+        self._request_worker_queue_maxsize = 2048
+        self._request_worker_stop_event = threading.Event()
+        self._request_worker_thread_ids: dict[int, str] = {}
+        self._request_worker_threads: dict[str, threading.Thread] = {}
+        self._request_worker_queues: dict[str, Queue[_QueuedRequestJob | None]] = {
+            key: Queue(maxsize=self._request_worker_queue_maxsize) for key in self._rate_limit_worker_keys
+        }
+        raw_historical_http_cache_enabled = (
+            os.getenv("IG_HISTORICAL_HTTP_CACHE_ENABLED")
+            or os.getenv("XTB_IG_HISTORICAL_HTTP_CACHE_ENABLED")
+            or "true"
+        )
+        self._historical_http_cache_enabled = _as_bool(raw_historical_http_cache_enabled, True)
+        raw_historical_http_cache_ttl_sec = (
+            os.getenv("IG_HISTORICAL_HTTP_CACHE_TTL_SEC")
+            or os.getenv("XTB_IG_HISTORICAL_HTTP_CACHE_TTL_SEC")
+            or "600"
+        )
+        try:
+            self._historical_http_cache_ttl_sec = max(1.0, float(raw_historical_http_cache_ttl_sec))
+        except (TypeError, ValueError):
+            self._historical_http_cache_ttl_sec = 600.0
+        raw_historical_http_cache_max_entries = (
+            os.getenv("IG_HISTORICAL_HTTP_CACHE_MAX_ENTRIES")
+            or os.getenv("XTB_IG_HISTORICAL_HTTP_CACHE_MAX_ENTRIES")
+            or "256"
+        )
+        try:
+            self._historical_http_cache_max_entries = max(
+                8,
+                int(float(raw_historical_http_cache_max_entries)),
+            )
+        except (TypeError, ValueError):
+            self._historical_http_cache_max_entries = 256
+        self._historical_http_cache: OrderedDict[str, tuple[float, dict[str, Any], dict[str, str]]] = OrderedDict()
 
         self._account_snapshot_cache: AccountSnapshot | None = None
         self._account_snapshot_cached_at = 0.0
         self._account_snapshot_cache_ttl_sec = 10.0
+        raw_connectivity_status_cache_ttl_sec = (
+            os.getenv("IG_CONNECTIVITY_STATUS_CACHE_TTL_SEC")
+            or os.getenv("XTB_IG_CONNECTIVITY_STATUS_CACHE_TTL_SEC")
+            or "10.0"
+        )
+        try:
+            self._connectivity_status_cache_ttl_sec = max(0.0, float(raw_connectivity_status_cache_ttl_sec))
+        except (TypeError, ValueError):
+            self._connectivity_status_cache_ttl_sec = 10.0
+        raw_connectivity_status_unhealthy_cache_ttl_sec = (
+            os.getenv("IG_CONNECTIVITY_STATUS_UNHEALTHY_CACHE_TTL_SEC")
+            or os.getenv("XTB_IG_CONNECTIVITY_STATUS_UNHEALTHY_CACHE_TTL_SEC")
+            or "2.0"
+        )
+        try:
+            self._connectivity_status_unhealthy_cache_ttl_sec = max(
+                0.0,
+                float(raw_connectivity_status_unhealthy_cache_ttl_sec),
+            )
+        except (TypeError, ValueError):
+            self._connectivity_status_unhealthy_cache_ttl_sec = 2.0
+        self._connectivity_status_cache: ConnectivityStatus | None = None
+        self._connectivity_status_cache_ts = 0.0
         self._account_currency_code: str | None = None
+        self._account_currency_code_lock = threading.Lock()
         self._position_open_sync: dict[str, dict[str, Any]] = {}
         self._position_close_sync: dict[str, dict[str, Any]] = {}
         self._pending_confirm_last_probe_ts: dict[str, float] = {}
@@ -909,11 +1276,14 @@ class IgApiClient(BaseBrokerClient):
     def _normalize_lightstreamer_endpoint(endpoint: str | None) -> str | None:
         if endpoint is None:
             return None
-        value = str(endpoint).strip().rstrip("/")
+        value = str(endpoint).strip()
         if not value:
             return None
         if not value.startswith(("http://", "https://")):
-            value = f"https://{value}"
+            value = f"https://{value.lstrip('/')}"
+        value = value.rstrip("/")
+        if not value.endswith("/lightstreamer"):
+            value = f"{value}/lightstreamer"
         return value
 
     def _default_endpoint(self) -> str:
@@ -951,6 +1321,455 @@ class IgApiClient(BaseBrokerClient):
         return False
 
     @staticmethod
+    def _is_trading_allowance_request(method: str, path: str) -> bool:
+        normalized_path = str(path).split("?", 1)[0]
+        upper_method = str(method).upper().strip()
+        if normalized_path == "/positions/otc" and upper_method in {"POST", "DELETE", "PUT"}:
+            return True
+        if normalized_path.startswith("/positions/otc/") and upper_method in {"PUT", "DELETE"}:
+            return True
+        if normalized_path == "/workingorders/otc" and upper_method in {"POST", "DELETE", "PUT"}:
+            return True
+        if normalized_path.startswith("/workingorders/otc/") and upper_method in {"PUT", "DELETE"}:
+            return True
+        return False
+
+    @staticmethod
+    def _is_historical_price_request(path: str, method: str) -> bool:
+        normalized_path = str(path).split("?", 1)[0]
+        upper_method = str(method).upper().strip()
+        return upper_method == "GET" and normalized_path.startswith("/prices/")
+
+    @staticmethod
+    def _is_position_update_request_path(path: str) -> bool:
+        normalized_path = str(path).split("?", 1)[0]
+        return (
+            normalized_path == "/positions"
+            or normalized_path.startswith("/positions/")
+            or normalized_path.startswith("/confirms/")
+        )
+
+    @staticmethod
+    def _position_update_operation(method: str, path: str, request_payload: dict[str, Any] | None = None) -> str:
+        normalized_path = str(path).split("?", 1)[0]
+        upper_method = str(method).upper().strip()
+        if normalized_path.startswith("/confirms/"):
+            return "confirm"
+        if normalized_path == "/positions/otc" and upper_method == "POST":
+            payload = _as_mapping(request_payload)
+            has_deal_id = bool(str(payload.get("dealId") or "").strip())
+            has_currency_code = bool(str(payload.get("currencyCode") or "").strip())
+            if has_deal_id and not has_currency_code:
+                return "close_position"
+            return "open_position"
+        if normalized_path == "/positions/otc" and upper_method == "DELETE":
+            return "close_position"
+        if normalized_path.startswith("/positions/otc/") and upper_method == "PUT":
+            return "modify_position"
+        if normalized_path == "/positions" and upper_method == "GET":
+            return "positions_snapshot"
+        if normalized_path.startswith("/positions/") and upper_method == "GET":
+            return "position_details"
+        return "position_request"
+
+    @staticmethod
+    def _iter_nested_mappings(value: Any) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, dict):
+                result.append(node)
+                for nested in node.values():
+                    _walk(nested)
+                return
+            if isinstance(node, list):
+                for nested in node:
+                    _walk(nested)
+
+        _walk(value)
+        return result
+
+    @staticmethod
+    def _extract_first_text_from_payload(value: Any, *keys: str) -> str | None:
+        for mapping in IgApiClient._iter_nested_mappings(value):
+            raw = IgApiClient._history_get(mapping, *keys)
+            if raw in (None, ""):
+                continue
+            text = str(raw).strip()
+            if text:
+                return text
+        return None
+
+    @staticmethod
+    def _position_id_from_path(path: str) -> str | None:
+        normalized_path = str(path).split("?", 1)[0]
+        if normalized_path.startswith("/positions/otc/"):
+            value = parse.unquote(normalized_path[len("/positions/otc/") :]).strip()
+            return value or None
+        if normalized_path.startswith("/positions/"):
+            value = parse.unquote(normalized_path[len("/positions/") :]).strip()
+            if value and value.lower() != "otc":
+                return value
+        return None
+
+    @staticmethod
+    def _deal_reference_from_path(path: str) -> str | None:
+        normalized_path = str(path).split("?", 1)[0]
+        if not normalized_path.startswith("/confirms/"):
+            return None
+        value = parse.unquote(normalized_path[len("/confirms/") :]).strip()
+        return value or None
+
+    def _emit_position_update(
+        self,
+        *,
+        method: str,
+        path: str,
+        request_payload: dict[str, Any] | None,
+        query: dict[str, Any] | None,
+        response_payload: dict[str, Any] | None,
+        http_status: int | None,
+        success: bool,
+        error_text: str | None,
+    ) -> None:
+        callback = self.position_update_callback
+        if callback is None:
+            return
+        if not self._is_position_update_request_path(path):
+            return
+
+        normalized_path = str(path).split("?", 1)[0]
+        position_id = (
+            self._position_id_from_path(normalized_path)
+            or self._extract_first_text_from_payload(
+                response_payload,
+                "dealId",
+                "positionId",
+                "position_id",
+            )
+            or self._extract_first_text_from_payload(
+                request_payload,
+                "dealId",
+                "positionId",
+                "position_id",
+            )
+        )
+        deal_reference = (
+            self._deal_reference_from_path(normalized_path)
+            or self._extract_first_text_from_payload(
+                response_payload,
+                "dealReference",
+                "deal_reference",
+                "reference",
+            )
+            or self._extract_first_text_from_payload(
+                request_payload,
+                "dealReference",
+                "deal_reference",
+                "reference",
+            )
+        )
+        epic = (
+            self._extract_first_text_from_payload(request_payload, "epic", "marketEpic")
+            or self._extract_first_text_from_payload(response_payload, "epic", "marketEpic")
+        )
+        symbol = (
+            self._symbol_for_epic(epic) if epic else None
+        ) or self._extract_first_text_from_payload(
+            request_payload,
+            "symbol",
+            "instrumentName",
+        ) or self._extract_first_text_from_payload(
+            response_payload,
+            "symbol",
+            "instrumentName",
+        )
+
+        event_payload: dict[str, Any] = {
+            "ts": time.time(),
+            "source": "ig_rest",
+            "operation": self._position_update_operation(method, normalized_path, request_payload),
+            "method": str(method).upper().strip(),
+            "path": normalized_path,
+            "symbol": str(symbol).strip().upper() if symbol else None,
+            "position_id": position_id,
+            "deal_reference": deal_reference,
+            "http_status": int(http_status) if http_status is not None else None,
+            "success": bool(success),
+            "error_text": str(error_text).strip() if error_text else None,
+            "request": request_payload if request_payload is not None else None,
+            "response": response_payload if response_payload is not None else None,
+        }
+        if isinstance(query, dict) and query:
+            event_payload["query"] = dict(query)
+
+        try:
+            callback(event_payload)
+        except Exception:
+            logger.debug(
+                "IG position update callback failed | method=%s path=%s",
+                str(method).upper(),
+                normalized_path,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _parse_positive_int(value: Any) -> int:
+        try:
+            parsed = int(float(value))
+        except (TypeError, ValueError):
+            return 0
+        return max(0, parsed)
+
+    def _extract_requested_history_points(self, path: str, query: dict[str, Any] | None) -> int:
+        if not self._is_historical_price_request(path, "GET"):
+            return 0
+        candidates: list[Any] = []
+        if isinstance(query, dict):
+            for key in ("max", "numPoints", "pageSize", "count"):
+                if key in query and query.get(key) is not None:
+                    candidates.append(query.get(key))
+        parsed_url = parse.urlsplit(str(path))
+        if parsed_url.query:
+            query_params = parse.parse_qs(parsed_url.query, keep_blank_values=False)
+            for key in ("max", "numPoints", "pageSize", "count"):
+                values = query_params.get(key)
+                if values:
+                    candidates.append(values[-1])
+        for candidate in candidates:
+            points = self._parse_positive_int(candidate)
+            if points > 0:
+                return points
+        return 1
+
+    @staticmethod
+    def _request_window_wait_locked(
+        timestamps: deque[float],
+        limit_per_window: int,
+        now_ts: float,
+        window_sec: float,
+    ) -> float:
+        if limit_per_window <= 0:
+            return float("inf")
+        while timestamps and (now_ts - timestamps[0]) >= window_sec:
+            timestamps.popleft()
+        if len(timestamps) < limit_per_window:
+            return 0.0
+        wait_sec = window_sec - (now_ts - timestamps[0])
+        if not math.isfinite(wait_sec):
+            return 0.0
+        return max(0.0, wait_sec)
+
+    def _prune_historical_points_window_locked(self, now_ts: float) -> None:
+        window_sec = float(self._rate_limit_week_window_sec)
+        while self._rate_limit_historical_points_events:
+            event_ts, points = self._rate_limit_historical_points_events[0]
+            if (now_ts - event_ts) < window_sec:
+                break
+            self._rate_limit_historical_points_events.popleft()
+            self._rate_limit_historical_points_week_total = max(
+                0,
+                int(self._rate_limit_historical_points_week_total) - int(points),
+            )
+
+    def _record_rate_limit_worker_block_locked(self, worker_key: str, now_ts: float) -> None:
+        normalized = str(worker_key).strip().lower()
+        if normalized not in self._rate_limit_worker_blocked_total:
+            return
+        self._rate_limit_worker_blocked_total[normalized] = (
+            int(self._rate_limit_worker_blocked_total.get(normalized, 0)) + 1
+        )
+        self._rate_limit_worker_last_block_ts[normalized] = float(now_ts)
+
+    def _record_rate_limit_worker_request_locked(self, worker_key: str, now_ts: float) -> None:
+        normalized = str(worker_key).strip().lower()
+        if normalized not in self._rate_limit_worker_last_request_ts:
+            return
+        self._rate_limit_worker_last_request_ts[normalized] = float(now_ts)
+
+    def _rate_limit_worker_usage_snapshot_locked(self, now_ts: float) -> list[dict[str, Any]]:
+        self._request_window_wait_locked(
+            self._rate_limit_app_non_trading_requests,
+            int(self._rate_limit_app_non_trading_per_min),
+            now_ts,
+            self._rate_limit_window_sec,
+        )
+        self._request_window_wait_locked(
+            self._rate_limit_account_non_trading_requests,
+            int(self._rate_limit_account_non_trading_per_min),
+            now_ts,
+            self._rate_limit_window_sec,
+        )
+        self._request_window_wait_locked(
+            self._rate_limit_account_trading_requests,
+            int(self._rate_limit_account_trading_per_min),
+            now_ts,
+            self._rate_limit_window_sec,
+        )
+        self._prune_historical_points_window_locked(now_ts)
+
+        app_used = int(len(self._rate_limit_app_non_trading_requests))
+        app_limit = int(self._rate_limit_app_non_trading_per_min)
+        account_non_trading_used = int(len(self._rate_limit_account_non_trading_requests))
+        account_non_trading_limit = int(self._rate_limit_account_non_trading_per_min)
+        trading_used = int(len(self._rate_limit_account_trading_requests))
+        trading_limit = int(self._rate_limit_account_trading_per_min)
+        historical_used = int(self._rate_limit_historical_points_week_total)
+        historical_limit = int(self._rate_limit_historical_points_per_week)
+
+        return [
+            {
+                "worker_key": "app_non_trading",
+                "limit_scope": "per_app",
+                "limit_unit": "requests_per_minute",
+                "limit_value": app_limit,
+                "used_value": app_used,
+                "remaining_value": max(0, app_limit - app_used),
+                "window_sec": float(self._rate_limit_window_sec),
+                "blocked_total": int(self._rate_limit_worker_blocked_total.get("app_non_trading", 0)),
+                "last_request_ts": float(self._rate_limit_worker_last_request_ts.get("app_non_trading", 0.0) or 0.0),
+                "last_block_ts": float(self._rate_limit_worker_last_block_ts.get("app_non_trading", 0.0) or 0.0),
+                "notes": "IG per-app non-trading requests/minute",
+            },
+            {
+                "worker_key": "account_trading",
+                "limit_scope": "per_account",
+                "limit_unit": "requests_per_minute",
+                "limit_value": trading_limit,
+                "used_value": trading_used,
+                "remaining_value": max(0, trading_limit - trading_used),
+                "window_sec": float(self._rate_limit_window_sec),
+                "blocked_total": int(self._rate_limit_worker_blocked_total.get("account_trading", 0)),
+                "last_request_ts": float(self._rate_limit_worker_last_request_ts.get("account_trading", 0.0) or 0.0),
+                "last_block_ts": float(self._rate_limit_worker_last_block_ts.get("account_trading", 0.0) or 0.0),
+                "notes": "IG per-account trading requests/minute",
+            },
+            {
+                "worker_key": "account_non_trading",
+                "limit_scope": "per_account",
+                "limit_unit": "requests_per_minute",
+                "limit_value": account_non_trading_limit,
+                "used_value": account_non_trading_used,
+                "remaining_value": max(0, account_non_trading_limit - account_non_trading_used),
+                "window_sec": float(self._rate_limit_window_sec),
+                "blocked_total": int(self._rate_limit_worker_blocked_total.get("account_non_trading", 0)),
+                "last_request_ts": float(self._rate_limit_worker_last_request_ts.get("account_non_trading", 0.0) or 0.0),
+                "last_block_ts": float(self._rate_limit_worker_last_block_ts.get("account_non_trading", 0.0) or 0.0),
+                "notes": "IG per-account non-trading requests/minute",
+            },
+            {
+                "worker_key": "historical_points",
+                "limit_scope": "per_app",
+                "limit_unit": "points_per_week",
+                "limit_value": historical_limit,
+                "used_value": historical_used,
+                "remaining_value": max(0, historical_limit - historical_used),
+                "window_sec": float(self._rate_limit_week_window_sec),
+                "blocked_total": int(self._rate_limit_worker_blocked_total.get("historical_points", 0)),
+                "last_request_ts": float(self._rate_limit_worker_last_request_ts.get("historical_points", 0.0) or 0.0),
+                "last_block_ts": float(self._rate_limit_worker_last_block_ts.get("historical_points", 0.0) or 0.0),
+                "notes": "IG historical price data points/week",
+            },
+        ]
+
+    def get_rate_limit_workers_snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            now_ts = time.time()
+            return self._rate_limit_worker_usage_snapshot_locked(now_ts)
+
+    def _reserve_request_rate_limit_slot(
+        self,
+        method: str,
+        path: str,
+        query: dict[str, Any] | None,
+    ) -> None:
+        if not self._rate_limit_enabled:
+            return
+        normalized_path = str(path).split("?", 1)[0]
+        upper_method = str(method).upper().strip()
+        is_trading = self._is_trading_allowance_request(upper_method, normalized_path)
+        requested_history_points = (
+            self._extract_requested_history_points(path, query)
+            if self._is_historical_price_request(normalized_path, upper_method)
+            else 0
+        )
+        is_historical = requested_history_points > 0
+        sleep_cap_sec = 0.25
+        while True:
+            sleep_sec = 0.0
+            with self._lock:
+                now_ts = time.time()
+                if is_trading:
+                    trading_wait_sec = self._request_window_wait_locked(
+                        self._rate_limit_account_trading_requests,
+                        int(self._rate_limit_account_trading_per_min),
+                        now_ts,
+                        self._rate_limit_window_sec,
+                    )
+                    sleep_sec = trading_wait_sec
+                    if trading_wait_sec > 0:
+                        self._record_rate_limit_worker_block_locked("account_trading", now_ts)
+                else:
+                    account_non_trading_wait_sec = self._request_window_wait_locked(
+                        self._rate_limit_account_non_trading_requests,
+                        int(self._rate_limit_account_non_trading_per_min),
+                        now_ts,
+                        self._rate_limit_window_sec,
+                    )
+                    app_non_trading_wait_sec = self._request_window_wait_locked(
+                        self._rate_limit_app_non_trading_requests,
+                        int(self._rate_limit_app_non_trading_per_min),
+                        now_ts,
+                        self._rate_limit_window_sec,
+                    )
+                    sleep_sec = max(account_non_trading_wait_sec, app_non_trading_wait_sec)
+                    if account_non_trading_wait_sec > 0:
+                        self._record_rate_limit_worker_block_locked("account_non_trading", now_ts)
+                    if app_non_trading_wait_sec > 0:
+                        self._record_rate_limit_worker_block_locked("app_non_trading", now_ts)
+
+                if not math.isfinite(sleep_sec):
+                    worker_key = "account_trading" if is_trading else "account_non_trading"
+                    raise BrokerError(
+                        "IG local rate limiter blocks all requests for this allowance window "
+                        f"(worker={worker_key}, limit=0)"
+                    )
+                if sleep_sec <= 0:
+                    if requested_history_points > 0 and self._rate_limit_historical_points_per_week > 0:
+                        requested = int(requested_history_points)
+                        weekly_limit = int(self._rate_limit_historical_points_per_week)
+                        if requested > weekly_limit:
+                            self._record_rate_limit_worker_block_locked("historical_points", now_ts)
+                            raise BrokerError(
+                                "IG historical price request exceeds weekly allowance "
+                                f"(requested={requested}, weekly_limit={weekly_limit})"
+                            )
+                        self._prune_historical_points_window_locked(now_ts)
+                        weekly_used = int(self._rate_limit_historical_points_week_total)
+                        if (weekly_used + requested) > weekly_limit:
+                            self._record_rate_limit_worker_block_locked("historical_points", now_ts)
+                            raise BrokerError(
+                                "IG historical price weekly allowance exceeded by local limiter "
+                                f"(used={weekly_used}, requested={requested}, weekly_limit={weekly_limit})"
+                            )
+                    if is_trading:
+                        self._rate_limit_account_trading_requests.append(now_ts)
+                        self._record_rate_limit_worker_request_locked("account_trading", now_ts)
+                    else:
+                        self._rate_limit_account_non_trading_requests.append(now_ts)
+                        self._rate_limit_app_non_trading_requests.append(now_ts)
+                        self._record_rate_limit_worker_request_locked("account_non_trading", now_ts)
+                        self._record_rate_limit_worker_request_locked("app_non_trading", now_ts)
+                    if requested_history_points > 0 and self._rate_limit_historical_points_per_week > 0:
+                        points = int(requested_history_points)
+                        self._rate_limit_historical_points_events.append((now_ts, points))
+                        self._rate_limit_historical_points_week_total += points
+                    if is_historical:
+                        self._record_rate_limit_worker_request_locked("historical_points", now_ts)
+                    return
+            time.sleep(min(sleep_cap_sec, sleep_sec))
+
+    @staticmethod
     def _is_non_critical_rest_request(method: str, path: str) -> bool:
         return not IgApiClient._is_trade_critical_request(method, path)
 
@@ -961,10 +1780,26 @@ class IgApiClient(BaseBrokerClient):
                 return False
             return self._critical_trade_owner_threads.get(thread_id, 0) <= 0
 
+    def _current_thread_has_critical_trade_context(self) -> bool:
+        thread_id = threading.get_ident()
+        with self._lock:
+            return self._critical_trade_owner_threads.get(thread_id, 0) > 0
+
+    def _current_thread_request_critical_bypass(self) -> bool:
+        return bool(getattr(self._request_context, "critical_bypass", False))
+
     def _should_defer_non_critical_request(self, method: str, path: str) -> bool:
         if not self._critical_trade_active_for_other_threads():
             return False
         return self._is_non_critical_rest_request(method, path)
+
+    def _critical_trade_defer_remaining_sec(self) -> float:
+        now = time.time()
+        with self._lock:
+            remaining = max(0.0, self._trade_submit_next_allowed_ts - now)
+            if self._critical_trade_active_total > 0:
+                remaining = max(remaining, float(self._trade_submit_min_interval_sec))
+        return max(0.1, remaining)
 
     @contextmanager
     def _critical_trade_operation(self, operation: str):
@@ -997,6 +1832,274 @@ class IgApiClient(BaseBrokerClient):
                         time.time() + min_interval,
                     )
 
+    def _request_worker_key(self, method: str, path: str) -> str:
+        normalized_path = str(path).split("?", 1)[0]
+        upper_method = str(method).upper().strip()
+        if self._is_historical_price_request(normalized_path, upper_method):
+            return "historical_points"
+        if self._is_trading_allowance_request(upper_method, normalized_path):
+            return "account_trading"
+        if normalized_path.startswith("/accounts"):
+            return "account_non_trading"
+        if normalized_path.startswith("/positions"):
+            return "account_non_trading"
+        if normalized_path.startswith("/workingorders"):
+            return "account_non_trading"
+        if normalized_path.startswith("/confirms/"):
+            return "account_non_trading"
+        if normalized_path.startswith("/history/"):
+            return "account_non_trading"
+        return "app_non_trading"
+
+    def _historical_http_cache_key(
+        self,
+        method: str,
+        path: str,
+        version: str,
+        query: dict[str, Any] | None,
+    ) -> str | None:
+        normalized_path = str(path).split("?", 1)[0]
+        upper_method = str(method).upper().strip()
+        if not self._is_historical_price_request(normalized_path, upper_method):
+            return None
+        normalized_query = {
+            str(key): str(value)
+            for key, value in (query or {}).items()
+            if value is not None
+        }
+        query_blob = json.dumps(normalized_query, sort_keys=True, separators=(",", ":"))
+        return f"{upper_method}|{normalized_path}|v{str(version)}|{query_blob}"
+
+    def _historical_http_cache_get(
+        self,
+        method: str,
+        path: str,
+        version: str,
+        query: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], dict[str, str]] | None:
+        if not self._historical_http_cache_enabled:
+            return None
+        key = self._historical_http_cache_key(method, path, version, query)
+        if not key:
+            return None
+        now = time.time()
+        with self._lock:
+            row = self._historical_http_cache.get(key)
+            if row is None:
+                return None
+            cached_at, body, headers = row
+            if (now - cached_at) > self._historical_http_cache_ttl_sec:
+                self._historical_http_cache.pop(key, None)
+                return None
+            self._historical_http_cache.move_to_end(key)
+            return copy.deepcopy(body), dict(headers)
+
+    def _historical_http_cache_put(
+        self,
+        method: str,
+        path: str,
+        version: str,
+        query: dict[str, Any] | None,
+        body: dict[str, Any],
+        headers: dict[str, str],
+    ) -> None:
+        if not self._historical_http_cache_enabled:
+            return
+        key = self._historical_http_cache_key(method, path, version, query)
+        if not key:
+            return
+        now = time.time()
+        with self._lock:
+            self._historical_http_cache[key] = (now, copy.deepcopy(body), dict(headers))
+            self._historical_http_cache.move_to_end(key)
+            while len(self._historical_http_cache) > self._historical_http_cache_max_entries:
+                self._historical_http_cache.popitem(last=False)
+
+    @staticmethod
+    def _extract_mid_history_price_component(item: dict[str, Any], field_name: str) -> float | None:
+        price_component = _as_mapping(item.get(field_name))
+        bid = _as_float(price_component.get("bid"), float("nan"))
+        ask = _as_float(price_component.get("ask"), float("nan"))
+        last_traded = _as_float(price_component.get("lastTraded"), float("nan"))
+        if math.isfinite(bid) and math.isfinite(ask):
+            return (bid + ask) / 2.0
+        if math.isfinite(last_traded):
+            return float(last_traded)
+        if math.isfinite(bid):
+            return float(bid)
+        if math.isfinite(ask):
+            return float(ask)
+        fallback = _as_float(item.get(field_name), float("nan"))
+        if math.isfinite(fallback):
+            return float(fallback)
+        return None
+
+    @staticmethod
+    def _extract_mid_close_from_history_price_item(item: dict[str, Any]) -> float | None:
+        return IgApiClient._extract_mid_history_price_component(item, "closePrice")
+
+    @staticmethod
+    def _extract_timestamp_from_history_price_item(item: dict[str, Any]) -> float | None:
+        for key in ("snapshotTimeUTC", "snapshotTime", "updateTimeUTC", "updateTime"):
+            parsed = _parse_datetime_to_unix_seconds(item.get(key))
+            if parsed is not None and parsed > 0:
+                return parsed
+        return None
+
+    def fetch_recent_price_history(
+        self,
+        symbol: str,
+        *,
+        resolution: str = "MINUTE",
+        points: int = 120,
+    ) -> list[tuple[float, float, float | None, float | None, float | None, float | None]]:
+        upper = str(symbol).strip().upper()
+        if not upper:
+            return []
+        try:
+            requested_points = int(points)
+        except (TypeError, ValueError):
+            requested_points = 120
+        requested_points = max(2, min(requested_points, 2000))
+        requested_resolution = str(resolution or "MINUTE").strip().upper() or "MINUTE"
+        query = {"resolution": requested_resolution, "max": requested_points}
+        attempts = self._epic_attempt_order(upper)
+        for epic in attempts:
+            try:
+                body, _ = self._request(
+                    "GET",
+                    f"/prices/{epic}",
+                    version="3",
+                    auth=True,
+                    query=query,
+                )
+            except BrokerError as exc:
+                if self._is_epic_unavailable_error_text(str(exc)):
+                    continue
+                raise
+            prices_raw = body.get("prices")
+            prices = prices_raw if isinstance(prices_raw, list) else []
+            if not prices:
+                continue
+
+            parsed_rows: dict[float, tuple[float, float | None, float | None, float | None, float | None]] = {}
+            for raw_item in prices:
+                item = _as_mapping(raw_item)
+                ts = self._extract_timestamp_from_history_price_item(item)
+                if ts is None:
+                    continue
+                close = self._extract_mid_close_from_history_price_item(item)
+                if close is None or not math.isfinite(close) or close <= 0:
+                    continue
+                open_price = self._extract_mid_history_price_component(item, "openPrice")
+                high_price = self._extract_mid_history_price_component(item, "highPrice")
+                low_price = self._extract_mid_history_price_component(item, "lowPrice")
+                volume_raw = _as_float(item.get("lastTradedVolume"), float("nan"))
+                volume: float | None = None
+                if math.isfinite(volume_raw) and volume_raw > 0:
+                    volume = float(volume_raw)
+                parsed_rows[float(ts)] = (
+                    float(close),
+                    volume,
+                    float(open_price) if open_price is not None and math.isfinite(open_price) and open_price > 0 else None,
+                    float(high_price) if high_price is not None and math.isfinite(high_price) and high_price > 0 else None,
+                    float(low_price) if low_price is not None and math.isfinite(low_price) and low_price > 0 else None,
+                )
+
+            if not parsed_rows:
+                continue
+            self._activate_epic(upper, epic)
+            ordered: list[tuple[float, float, float | None, float | None, float | None, float | None]] = []
+            for ts in sorted(parsed_rows.keys()):
+                close, volume, open_price, high_price, low_price = parsed_rows[ts]
+                ordered.append((float(ts), float(close), volume, open_price, high_price, low_price))
+            return ordered
+        return []
+
+    def _ensure_request_workers_started(self) -> None:
+        if not self._request_dispatch_enabled:
+            return
+        with self._lock:
+            self._ensure_request_workers_started_locked()
+
+    def _ensure_request_workers_started_locked(self) -> None:
+        if not self._request_dispatch_enabled:
+            return
+        self._request_worker_stop_event.clear()
+        for worker_key in self._rate_limit_worker_keys:
+            thread = self._request_worker_threads.get(worker_key)
+            if thread is not None and thread.is_alive():
+                continue
+            worker_queue = self._request_worker_queues.setdefault(
+                worker_key,
+                Queue(maxsize=self._request_worker_queue_maxsize),
+            )
+            worker_thread = threading.Thread(
+                target=self._request_worker_loop,
+                args=(worker_key, worker_queue),
+                name=f"ig-req-{worker_key}",
+                daemon=True,
+            )
+            self._request_worker_threads[worker_key] = worker_thread
+            worker_thread.start()
+
+    def _stop_request_workers_locked(self) -> list[threading.Thread]:
+        threads = [thread for thread in self._request_worker_threads.values() if thread is not None]
+        if not threads:
+            return []
+        self._request_worker_stop_event.set()
+        for worker_key in self._rate_limit_worker_keys:
+            worker_queue = self._request_worker_queues.get(worker_key)
+            if worker_queue is None:
+                continue
+            try:
+                worker_queue.put(None, timeout=0.1)
+            except Full:
+                logger.warning("IG request worker queue remained full during shutdown: %s", worker_key)
+        self._request_worker_threads = {}
+        return threads
+
+    def _request_worker_loop(
+        self,
+        worker_key: str,
+        worker_queue: Queue[_QueuedRequestJob | None],
+    ) -> None:
+        thread_id = threading.get_ident()
+        with self._lock:
+            self._request_worker_thread_ids[thread_id] = str(worker_key)
+        try:
+            while not self._request_worker_stop_event.is_set():
+                try:
+                    job = worker_queue.get(timeout=0.2)
+                except Empty:
+                    continue
+                if job is None:
+                    worker_queue.task_done()
+                    break
+                try:
+                    prior_bypass = self._current_thread_request_critical_bypass()
+                    self._request_context.critical_bypass = bool(job.critical_bypass)
+                    job.result = self._request_direct(
+                        job.method,
+                        job.path,
+                        payload=job.payload,
+                        version=job.version,
+                        auth=job.auth,
+                        extra_headers=job.extra_headers,
+                        query=job.query,
+                        _retry_on_auth_failure=job.retry_on_auth_failure,
+                        _critical_bypass=bool(job.critical_bypass),
+                    )
+                except Exception as exc:  # pragma: no cover - forwarded to caller
+                    job.error = exc
+                finally:
+                    self._request_context.critical_bypass = prior_bypass
+                    job.done.set()
+                    worker_queue.task_done()
+        finally:
+            with self._lock:
+                self._request_worker_thread_ids.pop(thread_id, None)
+
     def _request(
         self,
         method: str,
@@ -1009,15 +2112,125 @@ class IgApiClient(BaseBrokerClient):
         query: dict[str, Any] | None = None,
         _retry_on_auth_failure: bool = True,
     ) -> tuple[dict[str, Any], dict[str, str]]:
-        if auth and not self._connected:
-            raise BrokerError("IG API client is not connected")
-        if auth and self._should_defer_non_critical_request(method, path):
+        if not self._request_dispatch_enabled:
+            return self._request_direct(
+                method,
+                path,
+                payload=payload,
+                version=version,
+                auth=auth,
+                extra_headers=extra_headers,
+                query=query,
+                _retry_on_auth_failure=_retry_on_auth_failure,
+                _critical_bypass=self._current_thread_request_critical_bypass(),
+            )
+
+        current_thread_id = threading.get_ident()
+        with self._lock:
+            current_worker_key = self._request_worker_thread_ids.get(current_thread_id)
+        if current_worker_key:
+            return self._request_direct(
+                method,
+                path,
+                payload=payload,
+                version=version,
+                auth=auth,
+                extra_headers=extra_headers,
+                query=query,
+                _retry_on_auth_failure=_retry_on_auth_failure,
+            )
+
+        worker_key = self._request_worker_key(method, path)
+        self._ensure_request_workers_started()
+        with self._lock:
+            worker_queue = self._request_worker_queues.get(worker_key)
+        if worker_queue is None:
+            return self._request_direct(
+                method,
+                path,
+                payload=payload,
+                version=version,
+                auth=auth,
+                extra_headers=extra_headers,
+                query=query,
+                _retry_on_auth_failure=_retry_on_auth_failure,
+            )
+
+        job = _QueuedRequestJob(
+            method=str(method),
+            path=str(path),
+            payload=payload,
+            version=str(version),
+            auth=bool(auth),
+            extra_headers=dict(extra_headers) if isinstance(extra_headers, dict) else extra_headers,
+            query=dict(query) if isinstance(query, dict) else query,
+            retry_on_auth_failure=bool(_retry_on_auth_failure),
+            critical_bypass=self._current_thread_has_critical_trade_context(),
+        )
+        try:
+            worker_queue.put(
+                job,
+                timeout=min(0.5, max(0.05, float(self._request_dispatch_timeout_sec))),
+            )
+        except Full as exc:
+            raise BrokerError(
+                "IG request dispatch queue full "
+                f"(worker={worker_key}, method={str(method).upper()}, path={str(path).split('?', 1)[0]})"
+            ) from exc
+        dispatch_timeout_sec = max(
+            5.0,
+            float(self._request_dispatch_timeout_sec),
+        )
+        if not job.done.wait(timeout=dispatch_timeout_sec):
+            raise BrokerError(
+                "IG request dispatch timeout "
+                f"(worker={worker_key}, method={str(method).upper()}, path={str(path).split('?', 1)[0]})"
+            )
+        if job.error is not None:
+            raise job.error
+        if job.result is None:
+            raise BrokerError(
+                "IG request dispatch returned no result "
+                f"(worker={worker_key}, method={str(method).upper()}, path={str(path).split('?', 1)[0]})"
+            )
+        return job.result
+
+    def _request_direct(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        version: str = "1",
+        auth: bool = True,
+        extra_headers: dict[str, str] | None = None,
+        query: dict[str, Any] | None = None,
+        _retry_on_auth_failure: bool = True,
+        _retry_on_transient_http: bool = True,
+        _retry_on_network_error: bool = True,
+        _critical_bypass: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        if auth and not self._is_connected():
+            if not self._maybe_reconnect_after_disconnected(method=method, path=path):
+                raise BrokerError("IG API client is not connected")
+        is_historical_request = self._is_historical_price_request(path, method)
+        # Keep historical weekly limiter authoritative even on HTTP cache hits.
+        if is_historical_request:
+            self._reserve_request_rate_limit_slot(method, path, query)
+        cached_response = self._historical_http_cache_get(method, path, version, query)
+        if cached_response is not None:
+            return cached_response
+        allow_critical_bypass = bool(_critical_bypass or self._current_thread_request_critical_bypass())
+        if auth and (not allow_critical_bypass) and self._should_defer_non_critical_request(method, path):
             normalized_path = str(path).split("?", 1)[0]
+            remaining_sec = self._critical_trade_defer_remaining_sec()
             raise BrokerError(
                 "IG non-critical REST request deferred: "
                 f"critical_trade_operation_active method={str(method).upper()} path={normalized_path} "
-                "(1.0s remaining)"
+                f"({remaining_sec:.1f}s remaining)"
             )
+        if not is_historical_request:
+            self._reserve_request_rate_limit_slot(method, path, query)
 
         base = self._endpoint + path
         if query:
@@ -1036,14 +2249,9 @@ class IgApiClient(BaseBrokerClient):
         if payload is not None:
             data_bytes = json.dumps(payload).encode("utf-8")
 
-        actual_method = method.upper()
-        if actual_method == "DELETE" and data_bytes is not None:
-            actual_method = "POST"
-            headers["_method"] = "DELETE"
-
         req = request.Request(
             url=base,
-            method=actual_method,
+            method=method.upper(),
             data=data_bytes,
             headers=headers,
         )
@@ -1066,6 +2274,31 @@ class IgApiClient(BaseBrokerClient):
                     else:
                         body = {"data": parsed}
                 response_headers = {k: v for k, v in resp.headers.items()}
+                self._historical_http_cache_put(
+                    method,
+                    path,
+                    version,
+                    query,
+                    body,
+                    response_headers,
+                )
+                http_status_raw = getattr(resp, "status", None)
+                http_status: int | None = None
+                if http_status_raw is not None:
+                    try:
+                        http_status = int(http_status_raw)
+                    except (TypeError, ValueError):
+                        http_status = None
+                self._emit_position_update(
+                    method=method,
+                    path=path,
+                    request_payload=payload,
+                    query=query,
+                    response_payload=body,
+                    http_status=http_status,
+                    success=True,
+                    error_text=None,
+                )
                 return body, response_headers
         except error.HTTPError as exc:
             error_body = ""
@@ -1074,13 +2307,37 @@ class IgApiClient(BaseBrokerClient):
             except Exception:
                 pass
             error_message = f"IG API {method.upper()} {path} failed: {exc.code} {exc.reason} {error_body}"
+            normalized_path = str(path).split("?", 1)[0]
+            error_payload: dict[str, Any] | None = None
+            if error_body.strip():
+                try:
+                    parsed_error_payload = json.loads(error_body)
+                except Exception:
+                    parsed_error_payload = None
+                if isinstance(parsed_error_payload, dict):
+                    error_payload = parsed_error_payload
+            self._emit_position_update(
+                method=method,
+                path=path,
+                request_payload=payload,
+                query=query,
+                response_payload=error_payload,
+                http_status=int(exc.code),
+                success=False,
+                error_text=error_message,
+            )
+            if self._is_allowance_error_text(error_message):
+                self._maybe_start_allowance_cooldown(
+                    error_message,
+                    f"{method.upper()} {normalized_path}",
+                )
             if (
                 auth
                 and _retry_on_auth_failure
                 and self._is_auth_token_invalid_error_text(error_message)
                 and self._maybe_refresh_auth_session_after_failure(method=method, path=path, error_text=error_message)
             ):
-                return self._request(
+                return self._request_direct(
                     method,
                     path,
                     payload=payload,
@@ -1089,12 +2346,68 @@ class IgApiClient(BaseBrokerClient):
                     extra_headers=extra_headers,
                     query=query,
                     _retry_on_auth_failure=False,
+                    _retry_on_transient_http=_retry_on_transient_http,
+                    _retry_on_network_error=_retry_on_network_error,
+                )
+            # Retry once on transient 5xx responses. Do not retry 429/allowance
+            # failures here; repeating the same request only burns more quota.
+            if int(exc.code) in _RETRYABLE_HTTP_STATUS_CODES and _retry_on_transient_http:
+                retry_delay = min(2.0, max(0.5, self.timeout_sec * 0.1))
+                logger.warning(
+                    "IG API transient HTTP %d on %s %s, retrying in %.1fs",
+                    exc.code, method.upper(), path, retry_delay,
+                )
+                time.sleep(retry_delay)
+                return self._request_direct(
+                    method,
+                    path,
+                    payload=payload,
+                    version=version,
+                    auth=auth,
+                    extra_headers=extra_headers,
+                    query=query,
+                    _retry_on_auth_failure=_retry_on_auth_failure,
+                    _retry_on_transient_http=False,
+                    _retry_on_network_error=_retry_on_network_error,
+                    _critical_bypass=_critical_bypass,
                 )
             raise BrokerError(
                 error_message
             ) from exc
         except error.URLError as exc:
-            raise BrokerError(f"IG API {method.upper()} {path} failed: {exc.reason}") from exc
+            error_message = f"IG API {method.upper()} {path} failed: {exc.reason}"
+            self._emit_position_update(
+                method=method,
+                path=path,
+                request_payload=payload,
+                query=query,
+                response_payload=None,
+                http_status=None,
+                success=False,
+                error_text=error_message,
+            )
+            # Retry once on network errors (connection reset, timeout, etc.)
+            if _retry_on_network_error:
+                retry_delay = min(2.0, max(0.5, self.timeout_sec * 0.1))
+                logger.warning(
+                    "IG API network error on %s %s: %s, retrying in %.1fs",
+                    method.upper(), path, exc.reason, retry_delay,
+                )
+                time.sleep(retry_delay)
+                return self._request_direct(
+                    method,
+                    path,
+                    payload=payload,
+                    version=version,
+                    auth=auth,
+                    extra_headers=extra_headers,
+                    query=query,
+                    _retry_on_auth_failure=_retry_on_auth_failure,
+                    _retry_on_transient_http=_retry_on_transient_http,
+                    _retry_on_network_error=False,
+                    _critical_bypass=_critical_bypass,
+                )
+            raise BrokerError(error_message) from exc
 
     @staticmethod
     def _is_auth_token_invalid_error_text(text: str) -> bool:
@@ -1105,6 +2418,19 @@ class IgApiClient(BaseBrokerClient):
             "error.security.account-token-invalid",
             "error.security.account-token-missing",
             "error.public-api.failure.missing.credentials",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _is_retryable_close_request_error_text(text: str) -> bool:
+        lowered = str(text or "").lower()
+        markers = (
+            # IG gateway failed to parse DELETE body.
+            "validation.null-not-allowed.request",
+            # POST /positions/otc was interpreted as open position (method override not applied).
+            "error.service.marketdata.position.notional.details.null.error",
+            "error.service.create.otc.position.instrument.invalid",
+            "error.service.marketdata.position.details.null.error",
         )
         return any(marker in lowered for marker in markers)
 
@@ -1126,27 +2452,72 @@ class IgApiClient(BaseBrokerClient):
             now_ts = time.time()
             # Avoid reconnect storm across worker threads.
             if (now_ts - self._auth_refresh_last_attempt_ts) < self._auth_refresh_min_interval_sec:
-                return True
+                return (now_ts - self._auth_refresh_last_success_ts) < self._auth_refresh_min_interval_sec
             self._auth_refresh_last_attempt_ts = now_ts
             logger.warning(
                 "IG auth tokens invalid during %s %s, attempting session refresh",
                 str(method).upper(),
                 normalized_path,
             )
+            original_connect_retry_attempts = self.connect_retry_attempts
             try:
+                # Keep auth recovery bounded to a single login cycle; repeated
+                # POST /session retries under load tend to amplify allowance storms.
+                self.connect_retry_attempts = 1
                 self.connect()
             except Exception as refresh_exc:
                 logger.warning(
-                    "IG session refresh failed after auth error on %s %s: %s | original_error=%s",
+                    "IG session refresh failed on %s %s: %s | original_error=%s",
                     str(method).upper(),
                     normalized_path,
                     refresh_exc,
                     error_text,
                 )
                 return False
+            finally:
+                self.connect_retry_attempts = original_connect_retry_attempts
+            self._auth_refresh_last_success_ts = time.time()
             return True
         finally:
             self._auth_refresh_lock.release()
+
+    def _maybe_reconnect_after_disconnected(self, *, method: str, path: str) -> bool:
+        normalized_path = str(path).split("?", 1)[0]
+        if normalized_path.startswith("/session"):
+            return False
+
+        if not self._runtime_reconnect_lock.acquire(blocking=False):
+            return self._is_connected()
+        try:
+            if self._is_connected():
+                return True
+
+            now_ts = time.time()
+            if (now_ts - self._runtime_reconnect_last_attempt_ts) < self._runtime_reconnect_min_interval_sec:
+                return False
+            self._runtime_reconnect_last_attempt_ts = now_ts
+            logger.warning(
+                "IG request while disconnected during %s %s, attempting runtime reconnect",
+                str(method).upper(),
+                normalized_path,
+            )
+            try:
+                self.connect()
+            except Exception as reconnect_exc:
+                logger.warning(
+                    "IG runtime reconnect failed after disconnected request on %s %s: %s",
+                    str(method).upper(),
+                    normalized_path,
+                    reconnect_exc,
+                )
+                return False
+            return self._is_connected()
+        finally:
+            self._runtime_reconnect_lock.release()
+
+    def _is_connected(self) -> bool:
+        with self._lock:
+            return bool(self._connected)
 
     def _epic_for_symbol(self, symbol: str) -> str:
         upper = symbol.upper().strip()
@@ -1179,6 +2550,130 @@ class IgApiClient(BaseBrokerClient):
             )
         )
 
+    @staticmethod
+    def _is_stream_subscription_invalid_group_error_text(text: str | None) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return False
+        return "invalid group" in lowered or lowered.startswith("error:21:")
+
+    def _promote_stream_subscription_epic_after_invalid_group(
+        self,
+        symbol: str,
+        failed_epic: str,
+        *,
+        reason: str,
+    ) -> str | None:
+        upper_symbol = str(symbol).upper().strip()
+        normalized_failed = str(failed_epic).upper().strip()
+        if not upper_symbol or not normalized_failed:
+            return None
+
+        self._mark_epic_temporarily_invalid(upper_symbol, normalized_failed, reason=reason)
+
+        current_ts = time.time()
+        for candidate in self._epic_attempt_order(upper_symbol):
+            if candidate == normalized_failed:
+                continue
+            if self._is_epic_temporarily_invalid(upper_symbol, candidate, now_ts=current_ts):
+                continue
+            self._activate_epic(upper_symbol, candidate, log_warning=False)
+            self._clear_stream_rest_fallback_block(upper_symbol)
+            self._schedule_stream_subscription_retry(upper_symbol)
+            logger.warning(
+                "IG stream epic failover queued for %s: %s -> %s (retry_in=%.1fs %s)",
+                upper_symbol,
+                normalized_failed,
+                candidate,
+                self._stream_subscription_retry_gap_sec,
+                reason,
+            )
+            return candidate
+        self._mark_stream_rest_fallback_block(upper_symbol, reason=reason)
+        return None
+
+    def _stream_subscription_retry_remaining(self, symbol: str, *, now_ts: float | None = None) -> float:
+        upper = str(symbol).upper().strip()
+        if not upper:
+            return 0.0
+        current_ts = time.time() if now_ts is None else float(now_ts)
+        with self._lock:
+            until_ts = float(self._stream_subscription_retry_not_before_ts_by_symbol.get(upper, 0.0))
+            remaining = until_ts - current_ts
+            if remaining > 0:
+                return remaining
+            self._stream_subscription_retry_not_before_ts_by_symbol.pop(upper, None)
+            return 0.0
+
+    def _schedule_stream_subscription_retry(self, symbol: str, delay_sec: float | None = None) -> None:
+        upper = str(symbol).upper().strip()
+        if not upper:
+            return
+        normalized_delay = self._stream_subscription_retry_gap_sec if delay_sec is None else float(delay_sec)
+        if not math.isfinite(normalized_delay):
+            normalized_delay = self._stream_subscription_retry_gap_sec
+        normalized_delay = max(0.0, normalized_delay)
+        with self._lock:
+            self._stream_subscription_retry_not_before_ts_by_symbol[upper] = max(
+                float(self._stream_subscription_retry_not_before_ts_by_symbol.get(upper, 0.0)),
+                time.time() + normalized_delay,
+            )
+
+    def _clear_stream_subscription_retry(self, symbol: str) -> None:
+        upper = str(symbol).upper().strip()
+        if not upper:
+            return
+        with self._lock:
+            self._stream_subscription_retry_not_before_ts_by_symbol.pop(upper, None)
+
+    def _stream_rest_fallback_block_remaining(self, symbol: str, *, now_ts: float | None = None) -> float:
+        upper = str(symbol).upper().strip()
+        if not upper:
+            return 0.0
+        current_ts = time.time() if now_ts is None else float(now_ts)
+        with self._lock:
+            until_ts = float(self._stream_rest_fallback_block_until_ts_by_symbol.get(upper, 0.0))
+            remaining = until_ts - current_ts
+            if remaining > 0:
+                return remaining
+            self._stream_rest_fallback_block_until_ts_by_symbol.pop(upper, None)
+            self._stream_rest_fallback_block_reason_by_symbol.pop(upper, None)
+            return 0.0
+
+    def _stream_rest_fallback_block_reason(self, symbol: str) -> str | None:
+        upper = str(symbol).upper().strip()
+        if not upper:
+            return None
+        with self._lock:
+            reason = str(self._stream_rest_fallback_block_reason_by_symbol.get(upper, "")).strip()
+        return reason or None
+
+    def _mark_stream_rest_fallback_block(self, symbol: str, *, reason: str | None = None) -> None:
+        upper = str(symbol).upper().strip()
+        if not upper:
+            return
+        cooldown_sec = max(30.0, float(self._invalid_epic_retry_sec))
+        until_ts = time.time() + cooldown_sec
+        with self._lock:
+            self._stream_rest_fallback_block_until_ts_by_symbol[upper] = max(
+                float(self._stream_rest_fallback_block_until_ts_by_symbol.get(upper, 0.0)),
+                until_ts,
+            )
+            normalized_reason = str(reason or "").strip()
+            if normalized_reason:
+                self._stream_rest_fallback_block_reason_by_symbol[upper] = normalized_reason
+
+    def _clear_stream_rest_fallback_block(self, symbol: str) -> None:
+        upper = str(symbol).upper().strip()
+        if not upper:
+            return
+        with self._lock:
+            self._clear_stream_rest_fallback_block_locked(upper)
+
+    def _clear_stream_rest_fallback_block_locked(self, upper: str) -> None:
+        self._stream_rest_fallback_block_until_ts_by_symbol.pop(upper, None)
+        self._stream_rest_fallback_block_reason_by_symbol.pop(upper, None)
+
     def _is_epic_temporarily_invalid(
         self,
         symbol: str,
@@ -1210,16 +2705,25 @@ class IgApiClient(BaseBrokerClient):
             return
         cooldown_sec = max(30.0, float(self._invalid_epic_retry_sec))
         until_ts = time.time() + cooldown_sec
+        normalized_reason = str(reason or "n/a").strip() or "n/a"
+        should_log = False
         with self._lock:
             symbol_invalid = self._invalid_epic_until_ts_by_symbol.setdefault(upper_symbol, {})
             symbol_invalid[upper_epic] = max(float(symbol_invalid.get(upper_epic, 0.0)), until_ts)
-        logger.warning(
-            "IG epic marked temporarily invalid for %s: %s (cooldown=%.0fs reason=%s)",
-            upper_symbol,
-            upper_epic,
-            cooldown_sec,
-            str(reason or "n/a"),
-        )
+            warn_key = (upper_symbol, upper_epic, normalized_reason)
+            last_warn_ts = float(self._invalid_epic_warn_last_ts_by_key.get(warn_key, 0.0))
+            warn_interval_sec = max(300.0, min(cooldown_sec, 900.0))
+            if (time.time() - last_warn_ts) >= warn_interval_sec:
+                self._invalid_epic_warn_last_ts_by_key[warn_key] = time.time()
+                should_log = True
+        if should_log:
+            logger.warning(
+                "IG epic marked temporarily invalid for %s: %s (cooldown=%.0fs reason=%s)",
+                upper_symbol,
+                upper_epic,
+                cooldown_sec,
+                normalized_reason,
+            )
 
     def _clear_epic_temporarily_invalid(self, symbol: str, epic: str) -> None:
         upper_symbol = str(symbol).upper().strip()
@@ -1242,6 +2746,18 @@ class IgApiClient(BaseBrokerClient):
         with self._lock:
             active = str(self._epics.get(upper) or "").strip().upper()
             candidates = list(self._epic_candidates.get(upper, []))
+
+        if not self._epic_failover_enabled:
+            if active:
+                return [active]
+            first_candidate = _first_non_empty_text(tuple(candidates))
+            if first_candidate is not None:
+                return [first_candidate]
+            defaults = DEFAULT_IG_EPIC_CANDIDATES.get(upper, [])
+            first_default = _first_non_empty_text(tuple(defaults))
+            if first_default is not None:
+                return [first_default]
+            return []
 
         defaults = DEFAULT_IG_EPIC_CANDIDATES.get(upper, [])
         candidates.extend(str(epic).strip().upper() for epic in defaults)
@@ -1341,30 +2857,20 @@ class IgApiClient(BaseBrokerClient):
             score += 30
         if upper_symbol == "WTI" and any(token in upper_epic for token in ("WTI", "CL", "CRUDE", "OIL")):
             score += 30
-        if upper_symbol in {"BTC", "ETH", "LTC", "SOL", "XRP", "DOGE"} and (
+        commodity_hints = COMMODITY_EPIC_HINTS.get(upper_symbol)
+        if commodity_hints is not None and any(token in upper_epic for token in commodity_hints):
+            score += 30
+        crypto_base = _crypto_symbol_base(upper_symbol)
+        if crypto_base is not None and (
             upper_symbol in upper_epic
-            or upper_symbol + "USD" in upper_epic
-            or (
-                upper_symbol == "DOGE" and "DOGUSD" in upper_epic
-            )
-            or (
-                upper_symbol == "BTC" and "BITCOIN" in upper_epic
-            )
-            or (
-                upper_symbol == "ETH" and "ETHEREUM" in upper_epic
-            )
-            or (
-                upper_symbol == "LTC" and "LITECOIN" in upper_epic
-            )
-            or (
-                upper_symbol == "SOL" and "SOLANA" in upper_epic
-            )
-            or (
-                upper_symbol == "XRP" and "RIPPLE" in upper_epic
-            )
-            or (
-                upper_symbol == "DOGE" and "DOGECOIN" in upper_epic
-            )
+            or crypto_base + "USD" in upper_epic
+            or (crypto_base == "DOGE" and "DOGUSD" in upper_epic)
+            or (crypto_base == "BTC" and "BITCOIN" in upper_epic)
+            or (crypto_base == "ETH" and "ETHEREUM" in upper_epic)
+            or (crypto_base == "LTC" and "LITECOIN" in upper_epic)
+            or (crypto_base == "SOL" and "SOLANA" in upper_epic)
+            or (crypto_base == "XRP" and "RIPPLE" in upper_epic)
+            or (crypto_base == "DOGE" and "DOGECOIN" in upper_epic)
         ):
             score += 30
         if upper_symbol in {"AAPL", "MSFT"} and upper_epic.startswith(("UA.", "SA.")):
@@ -1385,7 +2891,7 @@ class IgApiClient(BaseBrokerClient):
         elif upper == "XAUUSD":
             terms.extend(["GOLD", "XAU/USD"])
 
-        if len(upper) == 6 and upper.isalpha():
+        if _is_fx_pair_symbol(upper):
             terms.append(f"{upper[:3]}/{upper[3:]}")
 
         seen: set[str] = set()
@@ -1437,6 +2943,8 @@ class IgApiClient(BaseBrokerClient):
         return deduped
 
     def _extend_epic_candidates_from_search(self, symbol: str) -> list[str]:
+        if not self._epic_failover_enabled:
+            return []
         if not self._epic_search_enabled:
             return []
         upper = symbol.upper().strip()
@@ -1455,7 +2963,7 @@ class IgApiClient(BaseBrokerClient):
             ordered = [epic for epic in ordered if epic != active]
         return ordered
 
-    def _activate_epic(self, symbol: str, epic: str) -> None:
+    def _activate_epic(self, symbol: str, epic: str, *, log_warning: bool = True) -> None:
         upper = symbol.upper().strip()
         normalized = str(epic).strip().upper()
         if not normalized:
@@ -1479,19 +2987,29 @@ class IgApiClient(BaseBrokerClient):
                 if not symbol_invalid:
                     self._invalid_epic_until_ts_by_symbol.pop(upper, None)
             epic_changed = bool(previous and previous != normalized)
+            self._stream_subscription_retry_not_before_ts_by_symbol.pop(upper, None)
             if epic_changed:
                 self._symbol_spec_cache.pop(upper, None)
 
                 # Force re-subscribe only when epic mapping actually changed.
-                old_sub = self._stream_subscriptions.pop(upper, None)
-                if old_sub is not None and self._ls_client is not None:
-                    try:
-                        self._ls_client.unsubscribe(old_sub)
-                    except Exception:
-                        pass
+                table_id = self._stream_symbol_to_table.pop(upper, None)
+                if table_id is not None:
+                    self._stream_table_to_symbol.pop(table_id, None)
+                    self._stream_table_field_values.pop(table_id, None)
 
-        if previous and previous != normalized:
-            logger.warning("IG epic remapped for %s: %s -> %s", upper, previous, normalized)
+        if log_warning and previous and previous != normalized:
+            should_log = False
+            current_ts = time.time()
+            with self._lock:
+                signature = (str(previous).strip().upper(), normalized)
+                prior_signature = self._epic_remap_warn_last_signature_by_symbol.get(upper)
+                prior_warn_ts = float(self._epic_remap_warn_last_ts_by_symbol.get(upper, 0.0))
+                if signature != prior_signature or (current_ts - prior_warn_ts) >= 300.0:
+                    self._epic_remap_warn_last_signature_by_symbol[upper] = signature
+                    self._epic_remap_warn_last_ts_by_symbol[upper] = current_ts
+                    should_log = True
+            if should_log:
+                logger.warning("IG epic remapped for %s: %s -> %s", upper, previous, normalized)
 
     def _request_market_details_with_epic_failover(self, symbol: str) -> tuple[str, dict[str, Any]]:
         upper = symbol.upper().strip()
@@ -1529,7 +3047,7 @@ class IgApiClient(BaseBrokerClient):
                 raise
 
         dynamic_attempts: list[str] = []
-        if last_epic_unavailable is not None:
+        if self._epic_failover_enabled and (last_epic_unavailable is not None or not attempts):
             dynamic_attempts = [
                 epic for epic in self._extend_epic_candidates_from_search(upper) if epic not in attempts
             ]
@@ -1630,7 +3148,7 @@ class IgApiClient(BaseBrokerClient):
     def _default_lot_min_fallback(symbol: str, epic: str) -> tuple[float, str]:
         upper_symbol = str(symbol).upper().strip()
         upper_epic = str(epic).upper().strip()
-        if len(upper_symbol) == 6 and upper_symbol.isalpha() and upper_epic.startswith("CS.D."):
+        if _is_fx_pair_symbol(upper_symbol) and upper_epic.startswith("CS.D."):
             return 0.5, "fallback_fx_0.5"
         if _is_index_symbol(upper_symbol, upper_epic):
             return 0.1, "fallback_index_0.1"
@@ -1644,22 +3162,31 @@ class IgApiClient(BaseBrokerClient):
         if cached:
             return cached
 
-        try:
-            body, _ = self._request("GET", "/accounts", version="1", auth=True)
-        except BrokerError:
-            return None
-
-        accounts_raw = body.get("accounts")
-        accounts = accounts_raw if isinstance(accounts_raw, list) else []
-        if not accounts:
-            return None
-
-        selected = self._select_account_from_list([_as_mapping(acc) for acc in accounts], self.account_id)
-        currency = self._extract_account_currency(selected)
-        if currency:
+        with self._account_currency_code_lock:
             with self._lock:
-                self._account_currency_code = currency
-        return currency
+                cached = str(self._account_currency_code or "").strip().upper()
+            if cached:
+                return cached
+
+            try:
+                body, _ = self._request("GET", "/accounts", version="1", auth=True)
+            except BrokerError:
+                return None
+
+            accounts_raw = body.get("accounts")
+            accounts = accounts_raw if isinstance(accounts_raw, list) else []
+            if not accounts:
+                return None
+
+            selected = self._select_account_from_list([_as_mapping(acc) for acc in accounts], self.account_id)
+            currency = self._extract_account_currency(selected)
+            if currency:
+                with self._lock:
+                    self._account_currency_code = currency
+            return currency
+
+    def get_account_currency_code(self) -> str | None:
+        return self._get_account_currency_code()
 
     def _order_currency_attempts(
         self,
@@ -1691,16 +3218,25 @@ class IgApiClient(BaseBrokerClient):
         deal_currencies = [code for code in deal_currencies if _normalize_currency_code(code) is not None]
 
         attempts: list[str] = []
+        if deal_currencies:
+            # IG restricts currencyCode to instrument currencies. Avoid guaranteed rejects
+            # by preferring only explicit market currencies when they are known.
+            if account_currency and account_currency in deal_currencies:
+                attempts.append(account_currency)
+            if default_currency and default_currency in deal_currencies:
+                attempts.append(default_currency)
+            attempts.extend(deal_currencies)
+            return _dedupe_epics([code for code in attempts if code])
+
         if account_currency:
             attempts.append(account_currency)
         if default_currency:
             attempts.append(default_currency)
-        attempts.extend(deal_currencies)
         if not attempts:
             attempts.extend(["USD", "EUR"])
         # If market metadata has no currencies and account currency is single-source,
         # probe one major alternative for robustness.
-        if len(attempts) == 1 and not deal_currencies and not default_currency:
+        if len(attempts) == 1 and not default_currency:
             if attempts[0] == "EUR":
                 attempts.append("USD")
             elif attempts[0] == "USD":
@@ -1743,7 +3279,30 @@ class IgApiClient(BaseBrokerClient):
         return normalized in {
             "MINIMUM_ORDER_SIZE_ERROR",
             "MINIMUM_ORDER_SIZE",
+            "ORDER_SIZE_INCREMENT_ERROR",
+            "SIZE_INCREMENT",
+            "ERROR.SERVICE.OTC.INVALID_SIZE",
+            "ERROR.SERVICE.OTC.INVALID.SIZE",
         }
+
+    @staticmethod
+    def _is_minimum_order_size_error_text(error_text: str) -> bool:
+        lowered = str(error_text or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "minimum_order_size_error",
+                "minimum order size",
+                "size below minimum requirement",
+                "order_size_increment_error",
+                "size_increment",
+                "order size must be traded in set increments",
+                "set increments",
+                "invalid_size",
+                "invalid.size",
+                "invalid size",
+            )
+        )
 
     @staticmethod
     def _infer_min_lot_after_reject(
@@ -1779,7 +3338,7 @@ class IgApiClient(BaseBrokerClient):
 
         inferred = stepped_required
         for candidate in ladder:
-            if candidate + 1e-12 >= stepped_required:
+            if candidate + FLOAT_ROUNDING_TOLERANCE >= stepped_required:
                 inferred = max(stepped_required, candidate)
                 break
         precision = max(3, _precision_from_step(step))
@@ -1796,7 +3355,7 @@ class IgApiClient(BaseBrokerClient):
     ) -> float:
         previous = float(spec.lot_min)
         updated = max(previous, float(new_lot_min))
-        if updated <= previous + 1e-12:
+        if updated <= previous + FLOAT_ROUNDING_TOLERANCE:
             return previous
         spec.lot_min = updated
         spec.lot_max = max(float(spec.lot_max), updated)
@@ -1823,13 +3382,14 @@ class IgApiClient(BaseBrokerClient):
             return None
 
         with self._lock:
-            cached_spec = self._symbol_spec_cache.get(upper_symbol)
-            if cached_spec is None:
-                self._symbol_spec_cache[upper_symbol] = candidate_spec
-                cached_spec = candidate_spec
+            cached_spec = self._get_or_seed_cached_symbol_spec_for_epic_locked(
+                upper_symbol,
+                upper_epic,
+                seed_spec=candidate_spec,
+            )
 
             before = float(cached_spec.lot_min)
-            if candidate_min <= before + 1e-12:
+            if candidate_min <= before + FLOAT_ROUNDING_TOLERANCE:
                 return None
 
             cached_spec.lot_min = candidate_min
@@ -1887,6 +3447,72 @@ class IgApiClient(BaseBrokerClient):
         attempted = max(0.0, float(attempted_volume))
         if attempted <= 0:
             return None
+        reason_code = str(reason or "").strip().upper()
+
+        if reason_code in {"ORDER_SIZE_INCREMENT_ERROR", "SIZE_INCREMENT"}:
+            with self._lock:
+                cached_spec = self._get_or_seed_cached_symbol_spec_for_epic_locked(
+                    upper_symbol,
+                    upper_epic,
+                    seed_spec=candidate_spec,
+                )
+
+                candidate_before_step = float(candidate_spec.lot_step)
+                cached_before_step = float(cached_spec.lot_step)
+                promoted_step = max(0.001, candidate_before_step, cached_before_step)
+                # On non-FX CFDs IG commonly rejects sub-minimum fractional increments.
+                # Keep volume step at least as coarse as minimum deal size.
+                if _is_non_fx_cfd_symbol(upper_symbol, upper_epic):
+                    promoted_step = max(
+                        promoted_step,
+                        float(candidate_spec.lot_min),
+                        float(cached_spec.lot_min),
+                    )
+
+                step_changed = False
+                if promoted_step > candidate_before_step + FLOAT_ROUNDING_TOLERANCE:
+                    candidate_spec.lot_step = promoted_step
+                    candidate_spec.lot_precision = max(
+                        int(candidate_spec.lot_precision),
+                        _precision_from_step(promoted_step),
+                    )
+                    candidate_metadata = candidate_spec.metadata if isinstance(candidate_spec.metadata, dict) else {}
+                    candidate_metadata["lot_step_source"] = "adaptive_reject_order_size_increment"
+                    candidate_metadata["lot_step_update_reason"] = "ORDER_SIZE_INCREMENT_ERROR"
+                    candidate_metadata["lot_step_update_epic"] = upper_epic
+                    candidate_metadata["lot_step_update_attempted"] = attempted
+                    candidate_metadata["lot_step_update_ts"] = time.time()
+                    candidate_spec.metadata = candidate_metadata
+                    step_changed = True
+
+                if promoted_step > cached_before_step + FLOAT_ROUNDING_TOLERANCE:
+                    cached_spec.lot_step = promoted_step
+                    cached_spec.lot_precision = max(
+                        int(cached_spec.lot_precision),
+                        _precision_from_step(promoted_step),
+                    )
+                    cached_metadata = cached_spec.metadata if isinstance(cached_spec.metadata, dict) else {}
+                    cached_metadata["lot_step_source"] = "adaptive_reject_order_size_increment"
+                    cached_metadata["lot_step_update_reason"] = "ORDER_SIZE_INCREMENT_ERROR"
+                    cached_metadata["lot_step_update_epic"] = upper_epic
+                    cached_metadata["lot_step_update_attempted"] = attempted
+                    cached_metadata["lot_step_update_ts"] = time.time()
+                    cached_spec.metadata = cached_metadata
+                    step_changed = True
+
+            if not step_changed:
+                return None
+
+            logger.warning(
+                "IG adaptive lot_step update for %s after increment reject: %.6f/%.6f -> %.6f (attempted=%.6f epic=%s)",
+                upper_symbol,
+                candidate_before_step,
+                cached_before_step,
+                promoted_step,
+                attempted,
+                upper_epic,
+            )
+            return max(float(candidate_spec.lot_min), float(cached_spec.lot_min))
 
         inferred = self._infer_min_lot_after_reject(
             upper_symbol,
@@ -1897,10 +3523,11 @@ class IgApiClient(BaseBrokerClient):
         )
 
         with self._lock:
-            cached_spec = self._symbol_spec_cache.get(upper_symbol)
-            if cached_spec is None:
-                self._symbol_spec_cache[upper_symbol] = candidate_spec
-                cached_spec = candidate_spec
+            cached_spec = self._get_or_seed_cached_symbol_spec_for_epic_locked(
+                upper_symbol,
+                upper_epic,
+                seed_spec=candidate_spec,
+            )
 
             before = min(float(candidate_spec.lot_min), float(cached_spec.lot_min))
             self._apply_adaptive_lot_min(
@@ -1919,7 +3546,7 @@ class IgApiClient(BaseBrokerClient):
             )
             after = max(float(candidate_spec.lot_min), float(cached_spec.lot_min))
 
-        if after <= before + 1e-12:
+        if after <= before + FLOAT_ROUNDING_TOLERANCE:
             return None
 
         logger.warning(
@@ -1932,71 +3559,6 @@ class IgApiClient(BaseBrokerClient):
             upper_epic,
         )
         return after
-
-    # ------------------------------------------------------------------
-    # Adaptive lot_step correction after "set increments" rejection.
-    # ------------------------------------------------------------------
-
-    _COMMON_LOT_STEPS: tuple[float, ...] = (0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
-
-    def _adapt_lot_step_after_increment_reject(
-        self,
-        symbol: str,
-        epic: str,
-        candidate_spec: SymbolSpec,
-        attempted_volume: float,
-    ) -> None:
-        """Infer the correct lot_step after a 'set increments' rejection.
-
-        When the broker rejects with "Order size must be traded in set
-        increments", the current lot_step is wrong.  We try common step
-        values and pick the smallest one that the attempted volume is NOT
-        a valid multiple of (meaning it would have been rounded).
-        """
-        upper_symbol = str(symbol).strip().upper()
-        upper_epic = str(epic).strip().upper()
-        current_step = float(candidate_spec.lot_step)
-        attempted = float(attempted_volume)
-
-        inferred_step = current_step
-        for step in self._COMMON_LOT_STEPS:
-            if step <= current_step:
-                continue
-            remainder = attempted / step
-            if abs(remainder - round(remainder)) > 1e-9:
-                # attempted is NOT a multiple of this step — this is likely the real step.
-                inferred_step = step
-                break
-
-        if inferred_step <= current_step:
-            # Fallback: just double the current step.
-            inferred_step = min(10.0, current_step * 2.0)
-
-        with self._lock:
-            cached_spec = self._symbol_spec_cache.get(upper_symbol)
-            specs_to_update = [candidate_spec]
-            if cached_spec is not None and cached_spec is not candidate_spec:
-                specs_to_update.append(cached_spec)
-
-            for spec in specs_to_update:
-                old_step = float(spec.lot_step)
-                if inferred_step > old_step:
-                    spec.lot_step = inferred_step
-                    spec.lot_precision = max(0, _precision_from_step(inferred_step))
-                    metadata = spec.metadata if isinstance(spec.metadata, dict) else {}
-                    metadata["lot_step_source"] = "adaptive_increment_reject"
-                    metadata["lot_step_update_attempted"] = attempted
-                    metadata["lot_step_update_ts"] = time.time()
-
-        logger.warning(
-            "IG adaptive lot_step update for %s after increment reject: %.4f -> %.4f "
-            "(attempted=%.4f epic=%s)",
-            upper_symbol,
-            current_step,
-            inferred_step,
-            attempted,
-            upper_epic,
-        )
 
     def _wait_for_deal_confirm(self, deal_reference: str) -> dict[str, Any] | None:
         deadline = time.time() + max(1.0, self.confirm_timeout_sec)
@@ -2076,10 +3638,17 @@ class IgApiClient(BaseBrokerClient):
             or "FAILED TO RETRIEVE PRICE INFORMATION FOR THIS CURRENCY" in combined
         ):
             return "INSTRUMENT_NOT_TRADEABLE_IN_THIS_CURRENCY"
+        if (
+            "ORDER SIZE MUST BE TRADED IN SET INCREMENTS" in combined
+            or "SET INCREMENTS" in combined
+            or "SIZE_INCREMENT" in combined
+            or "INVALID_SIZE" in combined
+            or "INVALID.SIZE" in combined
+            or "INVALID SIZE" in combined
+        ):
+            return "ORDER_SIZE_INCREMENT_ERROR"
         if "MINIMUM ORDER SIZE" in combined or "SIZE BELOW MINIMUM REQUIREMENT" in combined:
             return "MINIMUM_ORDER_SIZE_ERROR"
-        if "TRADED IN SET INCREMENTS" in combined or "SIZE INCREMENT" in combined:
-            return "DEAL_SIZE_INCREMENT_ERROR"
         if "ATTACHED ORDER LEVEL" in combined or "STOP TOO CLOSE" in combined:
             return "ATTACHED_ORDER_LEVEL_ERROR"
         if "MARKET NOT AVAILABLE" in combined:
@@ -2160,6 +3729,7 @@ class IgApiClient(BaseBrokerClient):
         scaling_factor = _as_float(instrument.get("scalingFactor"), 1.0)
         if scaling_factor <= 0:
             scaling_factor = 1.0
+        pip_position = instrument.get("pipPosition")
 
         one_pip_means = _as_float(instrument.get("onePipMeans"), 0.0)
         pip_size = 0.0
@@ -2175,7 +3745,7 @@ class IgApiClient(BaseBrokerClient):
         if pip_size <= 0:
             pip_decimals = max(0, decimal_places - 1)
             pip_size = float(10 ** (-pip_decimals))
-        pip_size = max(pip_size, quote_step, 1e-9)
+        pip_size = max(pip_size, quote_step, FLOAT_COMPARISON_TOLERANCE)
         # Some index epics (notably US500 variants) expose decimal places that imply
         # a sub-point pip fallback (0.1). For strategy/risk sizing we treat index pip
         # as 1.0 point unless IG provides explicit onePipMeans.
@@ -2192,22 +3762,52 @@ class IgApiClient(BaseBrokerClient):
         value_per_pip = _as_float(instrument.get("valuePerPip"), 0.0)
         value_of_one_point = _as_float(instrument.get("valueOfOnePoint"), 0.0)
         value_per_point = _as_float(instrument.get("valuePerPoint"), 0.0)
+        contract_size = _as_float(instrument.get("contractSize"), 1.0)
 
         tick_value = value_of_one_pip
         tick_value_source = "valueOfOnePip"
+        tick_value_kind = "pip"
         if tick_value <= 0:
             tick_value = value_per_pip
             tick_value_source = "valuePerPip"
+            tick_value_kind = "pip"
         if tick_value <= 0:
             tick_value = value_of_one_point
             tick_value_source = "valueOfOnePoint"
+            tick_value_kind = "point"
         if tick_value <= 0:
             tick_value = value_per_point
             tick_value_source = "valuePerPoint"
+            tick_value_kind = "point"
         if tick_value <= 0:
             tick_value = 1.0
             tick_value_source = "default_1.0"
-
+            tick_value_kind = "fallback"
+        tick_value_rescale_ratio: float | None = None
+        # IG market-details are inconsistent across non-FX CFDs:
+        # - some energy markets expose `valueOfOnePip` with an explicit
+        #   `onePipMeans` smaller than a full point (e.g. 0.01 for WTI), and the
+        #   raw pip value then double-counts contractSize;
+        # - index / spot-metal contracts often expose `valueOfOnePip` already as
+        #   the tradable contract point-value (`US100` = 100, `US30` = 10, etc.).
+        #
+        # Blindly dividing every pip-valued non-FX CFD by contractSize makes risk
+        # sizing 10-100x too small while margin still uses the full contract
+        # notional. Only normalize when IG gives an explicit fractional
+        # `onePipMeans`, which is the pattern used by scaled energy contracts.
+        if (
+            tick_value > 0
+            and contract_size > 1.0
+            and tick_value_kind == "pip"
+            and _is_non_fx_cfd_symbol(symbol, epic)
+            and one_pip_means > 0.0
+            and one_pip_means < 1.0
+        ):
+            implied_ratio = tick_value / contract_size
+            if math.isfinite(implied_ratio) and implied_ratio > 0:
+                tick_value_rescale_ratio = contract_size
+                tick_value = implied_ratio
+                tick_value_source = f"{tick_value_source}_normalized_by_contractSize"
         deal_currencies, default_currency = self._extract_deal_currencies(instrument, body)
         min_deal = _as_mapping(dealing_rules.get("minDealSize"))
         lot_min_value = _as_float(min_deal.get("value"), 0.0)
@@ -2218,11 +3818,29 @@ class IgApiClient(BaseBrokerClient):
             lot_min, lot_min_source = self._default_lot_min_fallback(symbol, epic)
         max_deal = _as_mapping(dealing_rules.get("maxDealSize"))
         lot_max = _as_float(max_deal.get("value"), 100.0)
-        # NOTE: minStepDistance is about stop/limit ORDER distance (in points),
-        # NOT about deal SIZE increments.  Derive lot_step from lot_min precision.
         min_step = _as_mapping(dealing_rules.get("minStepDistance"))
-        _min_step_distance_value = _as_float(min_step.get("value"), 0.0)  # kept for metadata
-        lot_step = _step_from_min(lot_min)
+        step = _as_float(min_step.get("value"), 0.0)
+        if step <= 0:
+            lot_step = 0.01 if lot_min < 1.0 else 0.1
+            lot_step_source = "fallback_by_lot_min"
+        else:
+            lot_step = min(1.0, step)
+            lot_step_source = "minStepDistance"
+        # Some markets expose minStepDistance for stop distances (points), not
+        # for volume increment. Keep volume step from becoming coarser than min size.
+        if lot_min > 0 and lot_min < lot_step:
+            lot_step = lot_min
+            lot_step_source = "capped_by_lot_min"
+        # For non-FX CFDs, sub-minimum fractional sizes are commonly invalid on IG.
+        if _is_non_fx_cfd_symbol(symbol, epic) and lot_min > 0 and lot_step + FLOAT_ROUNDING_TOLERANCE < lot_min:
+            lot_step = lot_min
+            lot_step_source = "promoted_to_lot_min_non_fx"
+        lot_step = max(0.001, lot_step)
+        lot_precision = max(
+            2,
+            _precision_from_step(lot_step),
+            _precision_from_step(max(0.001, lot_min)),
+        )
         min_stop = _as_mapping(dealing_rules.get("minNormalStopOrLimitDistance"))
         min_stop_value = _as_float(min_stop.get("value"), 0.0)
         min_stop_unit = str(min_stop.get("unit") or "").upper()
@@ -2250,7 +3868,6 @@ class IgApiClient(BaseBrokerClient):
         )
         quote_id = str(snapshot.get("quoteId") or "").strip()
 
-        contract_size = _as_float(instrument.get("contractSize"), 1.0)
         margin_factor = _as_float(instrument.get("marginFactor"), 0.0)
         margin_factor_unit = str(instrument.get("marginFactorUnit") or "").upper()
         leverage = _as_float(instrument.get("leverage"), 0.0)
@@ -2258,24 +3875,36 @@ class IgApiClient(BaseBrokerClient):
             symbol=symbol,
             pip_size=pip_size,
             one_pip_means=one_pip_means,
+            scaling_factor=scaling_factor,
+            pip_position=_as_float(pip_position, 0.0) if pip_position is not None else None,
         )
+        if (
+            tick_value_rescale_ratio is not None
+            and margin_price_scale_divisor <= 1.0
+            and _is_non_fx_cfd_symbol(symbol, epic)
+        ):
+            margin_price_scale_divisor = tick_value_rescale_ratio
 
         spec = SymbolSpec(
             symbol=symbol,
             tick_size=pip_size,
-            tick_value=max(tick_value, 1e-9),
+            tick_value=max(tick_value, FLOAT_COMPARISON_TOLERANCE),
             contract_size=contract_size,
             lot_min=max(0.001, lot_min),
             lot_max=max(lot_min, lot_max),
-            lot_step=max(0.001, lot_step),
+            lot_step=lot_step,
+            min_stop_distance_price=(min_stop_distance_price if min_stop_distance_price > 0 else None),
+            one_pip_means=(one_pip_means if one_pip_means > 0 else None),
             price_precision=precision,
-            lot_precision=max(2, _precision_from_step(max(0.001, lot_step))),
+            lot_precision=lot_precision,
             metadata={
                 "broker": "ig",
                 "epic": epic,
+                "epic_variant": _epic_variant_key(epic),
                 "quote_step": quote_step,
                 "decimal_places_factor": decimal_places,
                 "scaling_factor": scaling_factor,
+                "pip_position": pip_position,
                 "one_pip_means": one_pip_means,
                 "pip_size_source": pip_size_source,
                 "value_of_one_pip": value_of_one_pip,
@@ -2283,10 +3912,12 @@ class IgApiClient(BaseBrokerClient):
                 "value_of_one_point": value_of_one_point,
                 "value_per_point": value_per_point,
                 "tick_value_source": tick_value_source,
+                "tick_value_kind": tick_value_kind,
+                "tick_value_rescale_ratio": tick_value_rescale_ratio,
                 "deal_currencies": deal_currencies,
                 "default_currency_code": default_currency,
                 "lot_min_source": lot_min_source,
-                "min_step_distance_raw": _min_step_distance_value,
+                "lot_step_source": lot_step_source,
                 "min_stop_distance_value": min_stop_value,
                 "min_stop_distance_unit": min_stop_unit,
                 "min_stop_distance_price": min_stop_distance_price,
@@ -2300,32 +3931,11 @@ class IgApiClient(BaseBrokerClient):
                 "margin_factor_unit": margin_factor_unit,
                 "leverage": leverage,
                 "margin_price_scale_divisor": margin_price_scale_divisor,
+                "expiry": str(instrument.get("expiry") or "").strip(),
             },
         )
         if cache_symbol:
-            with self._lock:
-                old_spec = self._symbol_spec_cache.get(upper)
-                if old_spec is not None:
-                    old_meta = old_spec.metadata if isinstance(old_spec.metadata, dict) else {}
-                    # Preserve adaptive lot_step learned from broker rejections.
-                    if old_meta.get("lot_step_source") == "adaptive_increment_reject":
-                        adaptive_step = float(old_spec.lot_step)
-                        if adaptive_step > float(spec.lot_step):
-                            spec.lot_step = adaptive_step
-                            spec.lot_precision = max(0, _precision_from_step(adaptive_step))
-                            new_meta = spec.metadata if isinstance(spec.metadata, dict) else {}
-                            new_meta["lot_step_source"] = "adaptive_increment_reject"
-                            new_meta["lot_step_adaptive_preserved"] = True
-                    # Preserve adaptive lot_min learned from broker rejections.
-                    old_lot_min_source = str(old_meta.get("lot_min_source") or "")
-                    if old_lot_min_source.startswith("adaptive_reject_"):
-                        adaptive_min = float(old_spec.lot_min)
-                        if adaptive_min > float(spec.lot_min):
-                            spec.lot_min = adaptive_min
-                            new_meta = spec.metadata if isinstance(spec.metadata, dict) else {}
-                            new_meta["lot_min_source"] = old_lot_min_source
-                            new_meta["lot_min_adaptive_preserved"] = True
-                self._symbol_spec_cache[upper] = spec
+            self._cache_symbol_spec_entry(upper, spec, promote_symbol_cache=True)
         return spec
 
     def _get_symbol_spec_with_body_for_epic(self, symbol: str, epic: str) -> tuple[SymbolSpec, dict[str, Any]]:
@@ -2339,8 +3949,65 @@ class IgApiClient(BaseBrokerClient):
         spec, _ = self._get_symbol_spec_with_body_for_epic(symbol, epic)
         return spec
 
+    @staticmethod
+    def _normalize_symbol_spec_cache_symbol(symbol: str) -> str:
+        return str(symbol).upper().strip()
+
+    @staticmethod
+    def _normalize_symbol_spec_cache_epic(epic: str) -> str:
+        return str(epic).upper().strip()
+
+    def _cache_symbol_spec_entry(
+        self,
+        symbol: str,
+        spec: SymbolSpec,
+        *,
+        promote_symbol_cache: bool = True,
+    ) -> None:
+        upper_symbol = self._normalize_symbol_spec_cache_symbol(symbol)
+        if not upper_symbol:
+            return
+        metadata = spec.metadata if isinstance(spec.metadata, dict) else {}
+        upper_epic = self._normalize_symbol_spec_cache_epic(metadata.get("epic") or "")
+        with self._lock:
+            if promote_symbol_cache:
+                self._symbol_spec_cache[upper_symbol] = spec
+            if upper_epic:
+                self._symbol_spec_cache_by_epic[(upper_symbol, upper_epic)] = spec
+
+    def _get_cached_symbol_spec_for_epic(self, symbol: str, epic: str) -> SymbolSpec | None:
+        upper_symbol = self._normalize_symbol_spec_cache_symbol(symbol)
+        upper_epic = self._normalize_symbol_spec_cache_epic(epic)
+        if not upper_symbol or not upper_epic:
+            return None
+        with self._lock:
+            return self._symbol_spec_cache_by_epic.get((upper_symbol, upper_epic))
+
+    def _get_or_seed_cached_symbol_spec_for_epic_locked(
+        self,
+        symbol: str,
+        epic: str,
+        *,
+        seed_spec: SymbolSpec,
+    ) -> SymbolSpec:
+        upper_symbol = self._normalize_symbol_spec_cache_symbol(symbol)
+        upper_epic = self._normalize_symbol_spec_cache_epic(epic)
+        cached_spec = self._symbol_spec_cache_by_epic.get((upper_symbol, upper_epic))
+        if cached_spec is None:
+            self._symbol_spec_cache_by_epic[(upper_symbol, upper_epic)] = seed_spec
+            cached_spec = seed_spec
+        current_symbol_spec = self._symbol_spec_cache.get(upper_symbol)
+        current_symbol_epic = ""
+        if current_symbol_spec is not None and isinstance(current_symbol_spec.metadata, dict):
+            current_symbol_epic = self._normalize_symbol_spec_cache_epic(
+                current_symbol_spec.metadata.get("epic") or "",
+            )
+        if current_symbol_spec is None or current_symbol_epic == upper_epic:
+            self._symbol_spec_cache[upper_symbol] = cached_spec
+        return cached_spec
+
     def _get_cached_symbol_spec(self, symbol: str) -> SymbolSpec | None:
-        upper = str(symbol).upper().strip()
+        upper = self._normalize_symbol_spec_cache_symbol(symbol)
         with self._lock:
             return self._symbol_spec_cache.get(upper)
 
@@ -2354,6 +4021,7 @@ class IgApiClient(BaseBrokerClient):
     ) -> SymbolSpec:
         metadata = dict(base_spec.metadata) if isinstance(base_spec.metadata, dict) else {}
         metadata["epic"] = str(epic).strip().upper()
+        metadata["epic_variant"] = _epic_variant_key(epic)
         metadata["spec_origin"] = str(origin).strip() or "cached_clone"
         return SymbolSpec(
             symbol=str(symbol).upper(),
@@ -2363,6 +4031,16 @@ class IgApiClient(BaseBrokerClient):
             lot_min=float(base_spec.lot_min),
             lot_max=float(base_spec.lot_max),
             lot_step=float(base_spec.lot_step),
+            min_stop_distance_price=(
+                float(base_spec.min_stop_distance_price)
+                if base_spec.min_stop_distance_price is not None
+                else None
+            ),
+            one_pip_means=(
+                float(base_spec.one_pip_means)
+                if base_spec.one_pip_means is not None
+                else None
+            ),
             price_precision=int(base_spec.price_precision),
             lot_precision=int(base_spec.lot_precision),
             metadata=metadata,
@@ -2395,6 +4073,7 @@ class IgApiClient(BaseBrokerClient):
             metadata={
                 "broker": "ig",
                 "epic": upper_epic,
+                "epic_variant": _epic_variant_key(upper_epic),
                 "lot_min_source": lot_min_source,
                 "spec_origin": "critical_fallback",
             },
@@ -2410,27 +4089,48 @@ class IgApiClient(BaseBrokerClient):
     ) -> tuple[SymbolSpec, dict[str, Any]]:
         if allow_market_details:
             return self._get_symbol_spec_with_body_for_epic(symbol, epic)
-        if reference_spec is not None:
+        cached_for_epic = self._get_cached_symbol_spec_for_epic(symbol, epic)
+        if cached_for_epic is not None:
             return (
                 self._clone_symbol_spec_for_epic(
                     symbol,
                     epic,
-                    reference_spec,
-                    origin="critical_cached_reference",
+                    cached_for_epic,
+                    origin="critical_cached_epic",
                 ),
                 {},
             )
+        if reference_spec is not None:
+            reference_metadata = (
+                reference_spec.metadata
+                if isinstance(reference_spec.metadata, dict)
+                else {}
+            )
+            reference_epic = str(reference_metadata.get("epic") or "").strip().upper()
+            if reference_epic == str(epic).strip().upper():
+                return (
+                    self._clone_symbol_spec_for_epic(
+                        symbol,
+                        epic,
+                        reference_spec,
+                        origin="critical_cached_reference",
+                    ),
+                    {},
+                )
         cached = self._get_cached_symbol_spec(symbol)
         if cached is not None:
-            return (
-                self._clone_symbol_spec_for_epic(
-                    symbol,
-                    epic,
-                    cached,
-                    origin="critical_cached_symbol",
-                ),
-                {},
-            )
+            cached_metadata = cached.metadata if isinstance(cached.metadata, dict) else {}
+            cached_epic = str(cached_metadata.get("epic") or "").strip().upper()
+            if cached_epic == str(epic).strip().upper():
+                return (
+                    self._clone_symbol_spec_for_epic(
+                        symbol,
+                        epic,
+                        cached,
+                        origin="critical_cached_symbol",
+                    ),
+                    {},
+                )
         return self._build_fallback_symbol_spec_for_epic(symbol, epic), {}
 
     def _extract_close_sync_from_confirm(self, position_id: str, confirm: dict[str, Any]) -> dict[str, Any]:
@@ -2447,7 +4147,9 @@ class IgApiClient(BaseBrokerClient):
         if realized != 0.0 or "profit" in confirm:
             sync["realized_pnl"] = realized
 
-        profit_currency = str(confirm.get("profitCurrency") or "").strip()
+        profit_currency = _normalize_currency_code(confirm.get("profitCurrency")) or str(
+            confirm.get("profitCurrency") or ""
+        ).strip()
         if profit_currency:
             sync["pnl_currency"] = profit_currency
 
@@ -2514,6 +4216,113 @@ class IgApiClient(BaseBrokerClient):
                     stale_invalid_symbols.append(symbol)
             for symbol in stale_invalid_symbols:
                 self._invalid_epic_until_ts_by_symbol.pop(symbol, None)
+
+            stale_stream_block_symbols = [
+                symbol
+                for symbol, until_ts in self._stream_rest_fallback_block_until_ts_by_symbol.items()
+                if _as_float(until_ts, 0.0) <= now_ts
+            ]
+            for symbol in stale_stream_block_symbols:
+                self._stream_rest_fallback_block_until_ts_by_symbol.pop(symbol, None)
+                self._stream_rest_fallback_block_reason_by_symbol.pop(symbol, None)
+
+    def _cache_close_sync_payload(self, position_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        cached_payload = dict(payload)
+        cached_payload["_cache_ts"] = time.time()
+        with self._lock:
+            self._position_close_sync[str(position_id)] = cached_payload
+        return cached_payload
+
+    @staticmethod
+    def _close_sync_has_factual_details(payload: dict[str, Any] | None) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        return any(payload.get(key) is not None for key in ("close_price", "realized_pnl", "closed_at"))
+
+    @staticmethod
+    def _close_sync_has_realized_pnl(payload: dict[str, Any] | None) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        return payload.get("realized_pnl") is not None
+
+    @staticmethod
+    def _close_sync_candidate_identity(payload: dict[str, Any]) -> tuple[Any, ...]:
+        close_deal_id = str(payload.get("close_deal_id") or "").strip()
+        if close_deal_id:
+            return ("deal", close_deal_id)
+        history_reference = str(payload.get("history_reference") or payload.get("deal_reference") or "").strip()
+        closed_at = _as_float(payload.get("closed_at"), 0.0)
+        close_price = payload.get("close_price")
+        realized_pnl = payload.get("realized_pnl")
+        return (
+            "value",
+            history_reference,
+            round(closed_at, 3) if closed_at > 0 else 0.0,
+            round(_as_float(close_price, 0.0), 10) if close_price is not None else None,
+            round(_as_float(realized_pnl, 0.0), 10) if realized_pnl is not None else None,
+        )
+
+    @staticmethod
+    def _aggregate_close_sync_candidates(
+        position_id: str,
+        source: str,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if not candidates:
+            return None
+        deduped: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            deduped[IgApiClient._close_sync_candidate_identity(candidate)] = dict(candidate)
+        ordered = list(deduped.values())
+        if not ordered:
+            return None
+
+        def sort_key(candidate: dict[str, Any]) -> tuple[int, float, int, int]:
+            closed_at = _as_float(candidate.get("closed_at"), 0.0)
+            has_price = 1 if candidate.get("close_price") is not None else 0
+            has_pnl = 1 if candidate.get("realized_pnl") is not None else 0
+            return (1 if closed_at > 0 else 0, closed_at, has_price, has_pnl)
+
+        latest = max(ordered, key=sort_key)
+        aggregate = dict(latest)
+        aggregate["position_id"] = position_id
+        aggregate["source"] = source
+
+        realized_pnls = [_as_float(candidate.get("realized_pnl"), float("nan")) for candidate in ordered]
+        realized_pnls = [value for value in realized_pnls if value == value]
+        if realized_pnls:
+            aggregate["realized_pnl"] = float(sum(realized_pnls))
+
+        closed_ats = [_as_float(candidate.get("closed_at"), 0.0) for candidate in ordered]
+        closed_ats = [value for value in closed_ats if value > 0]
+        if closed_ats:
+            aggregate["closed_at"] = max(closed_ats)
+
+        match_rank = 0
+        for candidate in ordered:
+            if str(candidate.get("history_match_mode") or "").strip().lower() == "position_id":
+                match_rank = 2
+                break
+            if str(candidate.get("history_match_mode") or "").strip().lower() == "deal_reference":
+                match_rank = max(match_rank, 1)
+        if match_rank == 2:
+            aggregate["history_match_mode"] = "position_id"
+        elif match_rank == 1:
+            aggregate["history_match_mode"] = "deal_reference"
+
+        currencies = {
+            str(candidate.get("pnl_currency") or "").strip().upper()
+            for candidate in ordered
+            if str(candidate.get("pnl_currency") or "").strip()
+        }
+        if len(currencies) == 1:
+            aggregate["pnl_currency"] = next(iter(currencies))
+
+        if len(ordered) > 1:
+            aggregate["partial_close_count"] = len(ordered) - 1
+        return aggregate
 
     @staticmethod
     def _iter_history_transaction_items(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2622,7 +4431,7 @@ class IgApiClient(BaseBrokerClient):
             return False
         for key in ("reference", "dealReference"):
             value = IgApiClient._history_get(item, key)
-            if value is not None and _sanitize_deal_reference(str(value).strip()) == target:
+            if value is not None and _deal_reference_matches(target, str(value).strip()):
                 return True
 
         affected = IgApiClient._history_get(item, "affectedDeals")
@@ -2632,7 +4441,7 @@ class IgApiClient(BaseBrokerClient):
                     continue
                 for key in ("reference", "dealReference"):
                     value = IgApiClient._history_get(row, key)
-                    if value is not None and _sanitize_deal_reference(str(value).strip()) == target:
+                    if value is not None and _deal_reference_matches(target, str(value).strip()):
                         return True
         return False
 
@@ -2640,9 +4449,6 @@ class IgApiClient(BaseBrokerClient):
         # Explicit close-only numeric fields.
         explicit_close_level = _as_float(self._history_get(item, "closeLevel"), float("nan"))
         if explicit_close_level == explicit_close_level and explicit_close_level > 0:
-            return True
-        explicit_transaction_price = _as_float(self._history_get(item, "transactionPrice"), float("nan"))
-        if explicit_transaction_price == explicit_transaction_price and explicit_transaction_price > 0:
             return True
         if self._extract_realized_pnl_from_history_item(item) is not None:
             return True
@@ -2669,30 +4475,97 @@ class IgApiClient(BaseBrokerClient):
         return False
 
     @staticmethod
+    def _history_item_is_rejected(item: dict[str, Any]) -> bool:
+        def _is_reject_text(value: Any) -> bool:
+            text = str(value or "").strip().upper()
+            if not text:
+                return False
+            return (
+                "REJECT" in text
+                or "FAILED" in text
+                or text in {"ERROR", "INVALID"}
+            )
+
+        candidate_sources: list[dict[str, Any]] = [item]
+        details = _as_mapping(IgApiClient._history_get(item, "details"))
+        if details:
+            candidate_sources.append(details)
+        candidate_sources.extend(IgApiClient._history_item_actions(item))
+
+        for source in candidate_sources:
+            for key in (
+                "actionStatus",
+                "status",
+                "dealStatus",
+                "orderStatus",
+                "result",
+                "summary",
+                "description",
+                "activityType",
+            ):
+                if _is_reject_text(IgApiClient._history_get(source, key)):
+                    return True
+        return False
+
+    @staticmethod
+    def _extract_numeric_amount(value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            for key in ("amount", "value", "profitAndLoss", "profit", "pnl"):
+                if key not in value:
+                    continue
+                parsed = IgApiClient._extract_numeric_amount(value.get(key))
+                if parsed is not None:
+                    return parsed
+            return None
+        if isinstance(value, list):
+            for item in value:
+                parsed = IgApiClient._extract_numeric_amount(item)
+                if parsed is not None:
+                    return parsed
+            return None
+
+        parsed = _as_float(value, float("nan"))
+        if parsed == parsed:
+            return parsed
+
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace(",", "").replace("€", "").replace("$", "").replace("£", "").replace("#", "")
+        if normalized.startswith("(") and normalized.endswith(")"):
+            normalized = f"-{normalized[1:-1]}"
+        matched = re.search(r"[-+]?\d+(?:\.\d+)?", normalized)
+        if not matched:
+            return None
+        parsed = _as_float(matched.group(0), float("nan"))
+        if parsed == parsed:
+            return parsed
+        return None
+
+    @staticmethod
     def _extract_realized_pnl_from_history_item(item: dict[str, Any]) -> float | None:
-        direct_keys = (
-            "profitAndLoss",
-            "profit",
-            "pnl",
-        )
-        for key in direct_keys:
-            value = IgApiClient._history_get(item, key)
-            if value is None:
-                continue
-            if isinstance(value, dict):
-                for subkey in ("amount", "value"):
-                    parsed = _as_float(IgApiClient._history_get(value, subkey), float("nan"))
-                    if parsed == parsed:
-                        return parsed
-                continue
-            parsed = _as_float(value, float("nan"))
-            if parsed == parsed:
-                return parsed
+        direct_keys = ("profitAndLoss", "profit", "pnl")
+        candidate_sources: list[dict[str, Any]] = [item]
+        details = _as_mapping(IgApiClient._history_get(item, "details"))
+        if details:
+            candidate_sources.append(details)
+        candidate_sources.extend(IgApiClient._history_item_actions(item))
+
+        for source in candidate_sources:
+            for key in direct_keys:
+                value = IgApiClient._history_get(source, key)
+                parsed = IgApiClient._extract_numeric_amount(value)
+                if parsed is not None:
+                    return parsed
         return None
 
     @staticmethod
     def _extract_close_price_from_history_item(item: dict[str, Any]) -> float | None:
-        for key in ("closeLevel", "level", "price", "transactionPrice"):
+        # Prefer explicit close fields first; fallback to "level" for history rows
+        # that only expose generic execution level for close events.
+        for key in ("closeLevel", "transactionPrice", "closePrice", "closingPrice", "level"):
             parsed = _as_float(IgApiClient._history_get(item, key), float("nan"))
             if parsed == parsed and parsed > 0:
                 return parsed
@@ -2795,7 +4668,11 @@ class IgApiClient(BaseBrokerClient):
         if realized_pnl is not None:
             sync["realized_pnl"] = realized_pnl
 
-        currency = str(
+        currency = _normalize_currency_code(
+            self._history_get(item, "currency")
+            or self._history_get(item, "profitCurrency")
+            or self._history_get(item, "currencyIsoCode")
+        ) or str(
             self._history_get(item, "currency")
             or self._history_get(item, "profitCurrency")
             or self._history_get(item, "currencyIsoCode")
@@ -2822,6 +4699,58 @@ class IgApiClient(BaseBrokerClient):
             sync["closed_at"] = closed_at
         return sync
 
+    @staticmethod
+    def _history_item_contains_close_deal_id(item: dict[str, Any], close_deal_id: str) -> bool:
+        target = str(close_deal_id or "").strip()
+        if not target:
+            return False
+        for key in ("dealId", "affectedDealId"):
+            value = IgApiClient._history_get(item, key)
+            if value is not None and str(value).strip() == target:
+                return True
+        for action in IgApiClient._history_item_actions(item):
+            for key in ("dealId", "affectedDealId"):
+                value = IgApiClient._history_get(action, key)
+                if value is not None and str(value).strip() == target:
+                    return True
+        return False
+
+    @staticmethod
+    def _history_item_matches_close_signature(
+        item: dict[str, Any],
+        *,
+        close_price: float | None,
+        closed_at: float | None,
+        symbol: str | None,
+        tick_size: float | None,
+    ) -> bool:
+        candidate_close_price = IgApiClient._extract_close_price_from_history_item(item)
+        candidate_closed_at = IgApiClient._extract_history_closed_at(item)
+        if (
+            close_price is None
+            or close_price <= 0.0
+            or candidate_close_price is None
+            or candidate_closed_at is None
+            or closed_at is None
+            or closed_at <= 0.0
+        ):
+            return False
+        price_tolerance = max(
+            abs(float(tick_size or 0.0)),
+            abs(float(close_price)) * 1e-6,
+            1e-6,
+        )
+        if abs(float(candidate_close_price) - float(close_price)) > price_tolerance:
+            return False
+        if abs(float(candidate_closed_at) - float(closed_at)) > 300.0:
+            return False
+        normalized_symbol = str(symbol or "").strip().upper()
+        if normalized_symbol:
+            candidate_symbol = IgApiClient._extract_symbol_from_history_item(item)
+            if candidate_symbol and candidate_symbol != normalized_symbol:
+                return False
+        return True
+
     def _fetch_close_sync_from_history(
         self,
         position_id: str,
@@ -2829,6 +4758,10 @@ class IgApiClient(BaseBrokerClient):
         deal_reference: str | None = None,
         opened_at: float | None = None,
         symbol: str | None = None,
+        close_deal_id: str | None = None,
+        close_price: float | None = None,
+        closed_at: float | None = None,
+        tick_size: float | None = None,
     ) -> dict[str, Any] | None:
         now_utc = datetime.now(timezone.utc)
         from_utc = now_utc - timedelta(hours=48)
@@ -2836,11 +4769,20 @@ class IgApiClient(BaseBrokerClient):
         max_pages = 5
         raw_reference_target = str(deal_reference or "").strip()
         reference_target = _sanitize_deal_reference(raw_reference_target) if raw_reference_target else ""
+        close_deal_target = str(close_deal_id or "").strip()
+        close_price_target = _as_float(close_price, float("nan"))
+        if close_price_target != close_price_target or close_price_target <= 0.0:
+            close_price_target = 0.0
+        closed_at_target = _as_float(closed_at, float("nan"))
+        if closed_at_target != closed_at_target or closed_at_target <= 0.0:
+            closed_at_target = 0.0
+        tick_size_target = _as_float(tick_size, float("nan"))
+        if tick_size_target != tick_size_target or tick_size_target <= 0.0:
+            tick_size_target = 0.0
         opened_at_value = _as_float(opened_at, 0.0) if opened_at is not None else 0.0
         normalized_symbol = str(symbol or "").strip().upper()
 
-        best_payload: dict[str, Any] | None = None
-        best_sort_key: tuple[int, int, float, int, int] | None = None
+        matched_candidates: list[dict[str, Any]] = []
 
         query_modes: list[dict[str, Any]] = [
             {
@@ -2875,11 +4817,23 @@ class IgApiClient(BaseBrokerClient):
                 had_any_items = True
 
                 for item in items:
+                    if self._history_item_is_rejected(item):
+                        continue
                     match_mode: str | None = None
                     if self._item_contains_position_id(item, position_id):
                         match_mode = "position_id"
                     elif reference_target and self._item_contains_deal_reference(item, reference_target):
                         match_mode = "deal_reference"
+                    elif close_deal_target and self._history_item_contains_close_deal_id(item, close_deal_target):
+                        match_mode = "close_deal_id"
+                    elif self._history_item_matches_close_signature(
+                        item,
+                        close_price=(close_price_target if close_price_target > 0.0 else None),
+                        closed_at=(closed_at_target if closed_at_target > 0.0 else None),
+                        symbol=normalized_symbol or None,
+                        tick_size=(tick_size_target if tick_size_target > 0.0 else None),
+                    ):
+                        match_mode = "close_signature"
                     if match_mode is None:
                         continue
                     if not self._history_item_has_close_evidence(item):
@@ -2899,23 +4853,68 @@ class IgApiClient(BaseBrokerClient):
                     ):
                         continue
 
-                    mode_rank = 2 if match_mode == "position_id" else 1
-                    has_closed_at = 1 if candidate_closed_at > 0 else 0
-                    has_price = 1 if candidate.get("close_price") is not None else 0
-                    has_pnl = 1 if candidate.get("realized_pnl") is not None else 0
-                    sort_key = (mode_rank, has_closed_at, candidate_closed_at, has_price, has_pnl)
-                    if best_sort_key is None or sort_key > best_sort_key:
-                        best_sort_key = sort_key
-                        best_payload = candidate
+                    matched_candidates.append(candidate)
 
                 if len(items) < page_size:
                     break
-            if best_payload is not None:
-                return best_payload
+            if matched_candidates:
+                return self._aggregate_close_sync_candidates(
+                    position_id,
+                    "ig_history_transactions",
+                    matched_candidates,
+                )
             if had_any_items:
                 continue
 
-        return best_payload
+        return self._aggregate_close_sync_candidates(
+            position_id,
+            "ig_history_transactions",
+            matched_candidates,
+        )
+
+    def _complete_close_sync_from_activity_hints(
+        self,
+        position_id: str,
+        activity_payload: dict[str, Any] | None,
+        *,
+        deal_reference: str | None = None,
+        opened_at: float | None = None,
+        symbol: str | None = None,
+        tick_size: float | None = None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(activity_payload, dict):
+            return activity_payload
+        if self._close_sync_has_realized_pnl(activity_payload):
+            return activity_payload
+        hinted_history = self._fetch_close_sync_from_history(
+            position_id,
+            deal_reference=deal_reference,
+            opened_at=opened_at,
+            symbol=symbol,
+            close_deal_id=str(activity_payload.get("close_deal_id") or "").strip() or None,
+            close_price=_as_float(activity_payload.get("close_price"), float("nan")),
+            closed_at=_as_float(activity_payload.get("closed_at"), float("nan")),
+            tick_size=tick_size,
+        )
+        if not isinstance(hinted_history, dict):
+            return activity_payload
+        merged = dict(activity_payload)
+        for key in (
+            "close_price",
+            "realized_pnl",
+            "pnl_currency",
+            "history_reference",
+            "deal_reference",
+            "close_deal_id",
+            "closed_at",
+            "history_match_mode",
+        ):
+            value = hinted_history.get(key)
+            if value not in (None, ""):
+                merged[key] = value
+        if self._close_sync_has_realized_pnl(hinted_history):
+            merged["source"] = str(hinted_history.get("source") or "ig_history_transactions")
+        return merged
 
     @staticmethod
     def _iter_history_activity_items(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2962,11 +4961,11 @@ class IgApiClient(BaseBrokerClient):
             return False
         details = _as_mapping(IgApiClient._history_get(item, "details"))
         detail_reference = str(IgApiClient._history_get(details, "dealReference") or "").strip()
-        if detail_reference and _sanitize_deal_reference(detail_reference) == target:
+        if detail_reference and _deal_reference_matches(target, detail_reference):
             return True
         for action in IgApiClient._history_item_actions(item):
             action_reference = str(IgApiClient._history_get(action, "dealReference") or "").strip()
-            if action_reference and _sanitize_deal_reference(action_reference) == target:
+            if action_reference and _deal_reference_matches(target, action_reference):
                 return True
         return False
 
@@ -2986,17 +4985,19 @@ class IgApiClient(BaseBrokerClient):
         details = _as_mapping(self._history_get(item, "details"))
         actions = self._history_item_actions(item)
 
-        close_price = self._extract_close_price_from_history_item(item)
+        close_price: float | None = None
+        for action in actions:
+            action_type = str(self._history_get(action, "actionType") or "").strip().upper()
+            if "CLOSE" not in action_type and action_type not in {"POSITION_PARTIALLY_CLOSED", "POSITION_CLOSED"}:
+                continue
+            parsed = _as_float(self._history_get(action, "level"), float("nan"))
+            if parsed == parsed and parsed > 0:
+                close_price = parsed
+                break
         if close_price is None:
-            close_price = _as_float(self._history_get(details, "level"), float("nan"))
-            if close_price != close_price or close_price <= 0:
-                close_price = None
+            close_price = self._extract_close_price_from_history_item(item)
         if close_price is None:
-            for action in actions:
-                parsed = _as_float(self._history_get(action, "level"), float("nan"))
-                if parsed == parsed and parsed > 0:
-                    close_price = parsed
-                    break
+            close_price = self._extract_close_price_from_history_item(details)
         if close_price is not None:
             sync["close_price"] = close_price
 
@@ -3006,7 +5007,12 @@ class IgApiClient(BaseBrokerClient):
         if realized_pnl is not None:
             sync["realized_pnl"] = realized_pnl
 
-        currency = str(
+        currency = _normalize_currency_code(
+            self._history_get(item, "currency")
+            or self._history_get(details, "currency")
+            or self._history_get(item, "profitCurrency")
+            or self._history_get(item, "currencyIsoCode")
+        ) or str(
             self._history_get(item, "currency")
             or self._history_get(details, "currency")
             or self._history_get(item, "profitCurrency")
@@ -3071,8 +5077,7 @@ class IgApiClient(BaseBrokerClient):
         opened_at_value = _as_float(opened_at, 0.0) if opened_at is not None else 0.0
         normalized_symbol = str(symbol or "").strip().upper()
 
-        best_payload: dict[str, Any] | None = None
-        best_sort_key: tuple[int, int, float, int, int] | None = None
+        matched_candidates: list[dict[str, Any]] = []
         endpoint_versions = ("3", "2")
         for version in endpoint_versions:
             query_modes: list[dict[str, Any]] = []
@@ -3133,6 +5138,8 @@ class IgApiClient(BaseBrokerClient):
                     had_any_items = True
 
                     for item in items:
+                        if self._history_item_is_rejected(item):
+                            continue
                         match_mode: str | None = None
                         if self._activity_item_contains_position_id(item, position_id):
                             match_mode = "position_id"
@@ -3157,24 +5164,23 @@ class IgApiClient(BaseBrokerClient):
                         ):
                             continue
 
-                        mode_rank = 2 if match_mode == "position_id" else 1
-                        has_closed_at = 1 if candidate_closed_at > 0 else 0
-                        has_price = 1 if candidate.get("close_price") is not None else 0
-                        has_pnl = 1 if candidate.get("realized_pnl") is not None else 0
-                        sort_key = (mode_rank, has_closed_at, candidate_closed_at, has_price, has_pnl)
-                        if best_sort_key is None or sort_key > best_sort_key:
-                            best_sort_key = sort_key
-                            best_payload = candidate
+                        matched_candidates.append(candidate)
 
                     if len(items) < page_size:
                         break
-                if best_payload is not None:
-                    return best_payload
+                if matched_candidates:
+                    return self._aggregate_close_sync_candidates(
+                        position_id,
+                        "ig_history_activity",
+                        matched_candidates,
+                    )
                 if had_any_items:
                     continue
-            if best_payload is not None:
-                break
-        return best_payload
+        return self._aggregate_close_sync_candidates(
+            position_id,
+            "ig_history_activity",
+            matched_candidates,
+        )
 
     @staticmethod
     def _is_position_not_found_error_text(text: str) -> bool:
@@ -3224,22 +5230,89 @@ class IgApiClient(BaseBrokerClient):
         deal_reference: str | None = None,
         opened_at: float | None = None,
         symbol: str | None = None,
+        tick_size: float | None = None,
+        include_history: bool = True,
         **_: Any,
     ) -> dict[str, Any] | None:
         self._maybe_cleanup_internal_caches()
         key = str(position_id)
         with self._lock:
-            payload = self._position_close_sync.pop(key, None)
-        if payload is not None:
-            return dict(payload)
+            cached_payload = self._position_close_sync.get(key)
+        if isinstance(cached_payload, dict):
+            payload = dict(cached_payload)
+            source = str(payload.get("source") or "").strip().lower()
+            if source != "ig_confirm" and self._close_sync_has_factual_details(payload):
+                if include_history and not self._close_sync_has_realized_pnl(payload):
+                    with self._lock:
+                        self._position_close_sync.pop(key, None)
+                else:
+                    return payload
+            if source == "ig_confirm":
+                close_complete = payload.get("close_complete")
+                if isinstance(close_complete, bool) and (not close_complete):
+                    with self._lock:
+                        self._position_close_sync.pop(key, None)
+                    return payload
+                open_state = self._probe_position_open_state_by_deal_id(key)
+                if open_state is True:
+                    return None
+                if include_history:
+                    history_payload = self._fetch_close_sync_from_history(
+                        key,
+                        deal_reference=deal_reference,
+                        opened_at=opened_at,
+                        symbol=symbol,
+                        tick_size=tick_size,
+                    )
+                    if history_payload is None:
+                        history_payload = self._fetch_close_sync_from_activity(
+                            key,
+                            deal_reference=deal_reference,
+                            opened_at=opened_at,
+                            symbol=symbol,
+                        )
+                        history_payload = self._complete_close_sync_from_activity_hints(
+                            key,
+                            history_payload,
+                            deal_reference=deal_reference,
+                            opened_at=opened_at,
+                            symbol=symbol,
+                            tick_size=tick_size,
+                        )
+                    if history_payload is not None:
+                        if open_state is False:
+                            history_payload["position_found"] = False
+                        with self._lock:
+                            self._position_close_sync.pop(key, None)
+                        if self._close_sync_has_realized_pnl(history_payload):
+                            return self._cache_close_sync_payload(key, history_payload)
+                        return history_payload
+                if open_state is False:
+                    payload["position_found"] = False
+                    with self._lock:
+                        self._position_close_sync.pop(key, None)
+                    return payload
+                return None
+            with self._lock:
+                self._position_close_sync.pop(key, None)
+            return payload
         open_state = self._probe_position_open_state_by_deal_id(key)
         if open_state is True:
+            return None
+        if not include_history:
+            if open_state is False:
+                return {
+                    "position_id": key,
+                    "source": "ig_positions_deal_id",
+                    "position_found": False,
+                }
             return None
         history_payload = self._fetch_close_sync_from_history(
             key,
             deal_reference=deal_reference,
             opened_at=opened_at,
             symbol=symbol,
+            tick_size=tick_size,
         )
         if history_payload is None:
             history_payload = self._fetch_close_sync_from_activity(
@@ -3247,6 +5320,14 @@ class IgApiClient(BaseBrokerClient):
                 deal_reference=deal_reference,
                 opened_at=opened_at,
                 symbol=symbol,
+            )
+            history_payload = self._complete_close_sync_from_activity_hints(
+                key,
+                history_payload,
+                deal_reference=deal_reference,
+                opened_at=opened_at,
+                symbol=symbol,
+                tick_size=tick_size,
             )
         if history_payload is None:
             if open_state is False:
@@ -3258,6 +5339,8 @@ class IgApiClient(BaseBrokerClient):
             return None
         if open_state is False:
             history_payload["position_found"] = False
+        if self._close_sync_has_realized_pnl(history_payload):
+            return self._cache_close_sync_payload(key, history_payload)
         return history_payload
 
     def get_position_open_sync(self, position_id: str) -> dict[str, Any] | None:
@@ -3265,9 +5348,67 @@ class IgApiClient(BaseBrokerClient):
         key = str(position_id)
         with self._lock:
             payload = self._position_open_sync.pop(key, None)
-        if payload is None:
+        if payload is not None:
+            return dict(payload)
+
+        # Best-effort fallback: confirm payload can be sparse in some IG environments.
+        # Query open positions by deal id to retrieve factual stop/limit/open levels.
+        cooldown_remaining = self._allowance_cooldown_remaining()
+        if cooldown_remaining > 0:
             return None
-        return dict(payload)
+        try:
+            body, _ = self._request("GET", "/positions", version="2", auth=True)
+            self._reset_allowance_cooldown()
+        except BrokerError as exc:
+            self._maybe_start_allowance_cooldown(str(exc), "open sync fallback")
+            return None
+
+        for row in self._extract_open_positions_rows(body):
+            position_payload = _as_mapping(row.get("position"))
+            deal_id = str(
+                position_payload.get("dealId")
+                or position_payload.get("positionId")
+                or row.get("dealId")
+                or ""
+            ).strip()
+            if not deal_id or deal_id != key:
+                continue
+
+            sync_payload: dict[str, Any] = {
+                "position_id": key,
+                "source": "ig_positions_deal_id",
+            }
+            open_price = _as_float(
+                position_payload.get("level")
+                or position_payload.get("openLevel")
+                or row.get("level"),
+                0.0,
+            )
+            stop_loss = _as_float(position_payload.get("stopLevel"), 0.0)
+            take_profit = _as_float(position_payload.get("limitLevel"), 0.0)
+            deal_reference = str(
+                position_payload.get("dealReference")
+                or position_payload.get("reference")
+                or row.get("dealReference")
+                or row.get("reference")
+                or ""
+            ).strip()
+            if open_price > 0:
+                sync_payload["open_price"] = open_price
+            if stop_loss > 0:
+                sync_payload["stop_loss"] = stop_loss
+            if take_profit > 0:
+                sync_payload["take_profit"] = take_profit
+            if deal_reference:
+                sync_payload["deal_reference"] = deal_reference
+            return sync_payload
+        return None
+
+    def mark_symbol_guaranteed_stop_required(self, symbol: str, source: str | None = None) -> None:
+        self._mark_symbol_guaranteed_stop_required(
+            symbol,
+            source=str(source or "runtime"),
+        )
 
     def get_public_api_backoff_remaining_sec(self) -> float:
         return self._allowance_cooldown_remaining()
@@ -3285,6 +5426,9 @@ class IgApiClient(BaseBrokerClient):
         if not math.isfinite(remaining) or remaining <= 0:
             return 0.0
         return remaining
+
+    def get_stream_rest_fallback_block_remaining_sec(self, symbol: str) -> float:
+        return self._stream_rest_fallback_block_remaining(symbol)
 
     def _fetch_open_confirm_once(self, deal_reference: str) -> dict[str, Any] | None:
         reference = str(deal_reference).strip()
@@ -3339,9 +5483,7 @@ class IgApiClient(BaseBrokerClient):
 
     def _symbol_for_epic(self, epic: str, preferred_symbols: list[str] | None = None) -> str | None:
         candidates = self._symbols_for_epic(epic, preferred_symbols=preferred_symbols)
-        if not candidates:
-            return None
-        return candidates[0]
+        return next((candidate for candidate in candidates if str(candidate).strip()), None)
 
     @staticmethod
     def _extract_open_positions_rows(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3375,16 +5517,28 @@ class IgApiClient(BaseBrokerClient):
                 return numeric_ts
 
             text = str(raw).strip()
+            iso_text = text.replace("Z", "+00:00") if text.endswith("Z") else text
+            try:
+                parsed = datetime.fromisoformat(iso_text)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.timestamp()
+            except ValueError:
+                pass
             for fmt in (
                 "%Y-%m-%dT%H:%M:%S",
                 "%Y-%m-%dT%H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%f%z",
                 "%Y-%m-%d %H:%M:%S",
                 "%Y/%m/%d %H:%M:%S",
                 "%Y/%m/%d %H:%M:%S %Z",
             ):
                 try:
                     parsed = datetime.strptime(text, fmt)
-                    return parsed.replace(tzinfo=timezone.utc).timestamp()
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    return parsed.timestamp()
                 except ValueError:
                     continue
         return now_ts
@@ -3486,7 +5640,9 @@ class IgApiClient(BaseBrokerClient):
                 or row.get("reference")
             )
             normalized_reference = _sanitize_deal_reference(str(raw_reference or ""))
-            managed_by_reference = bool(normalized_reference) and normalized_reference in known_references
+            managed_by_reference = bool(normalized_reference) and any(
+                _deal_reference_matches(reference, normalized_reference) for reference in known_references
+            )
             managed_by_known_id = bool(deal_id) and deal_id in known_ids
 
             epic = str(
@@ -3529,8 +5685,13 @@ class IgApiClient(BaseBrokerClient):
                 continue
 
             managed_by_pending_position_id = bool(deal_id) and deal_id in pending_position_ids
-            managed_by_pending_reference = bool(normalized_reference) and normalized_reference in pending_by_reference
             pending_match = pending_by_reference.get(normalized_reference) if normalized_reference else None
+            if pending_match is None and normalized_reference:
+                for pending_reference, candidate_pending in pending_by_reference.items():
+                    if _deal_reference_matches(pending_reference, normalized_reference):
+                        pending_match = candidate_pending
+                        break
+            managed_by_pending_reference = pending_match is not None
             if pending_match is not None and not pending_match.position_id:
                 pending_match.position_id = deal_id
                 pending_position_ids.add(deal_id)
@@ -3556,6 +5717,8 @@ class IgApiClient(BaseBrokerClient):
                 take_profit=take_profit,
                 opened_at=opened_at,
                 status="open",
+                epic=epic or None,
+                epic_variant=_epic_variant_key(epic) if epic else None,
             )
 
         return restored
@@ -3721,6 +5884,7 @@ class IgApiClient(BaseBrokerClient):
             ask=ask,
             timestamp=tick_ts,
             volume=volume if volume > 0 else None,
+            received_at=now_ts,
         )
 
     @staticmethod
@@ -3762,8 +5926,16 @@ class IgApiClient(BaseBrokerClient):
         with self._lock:
             already_marked = upper in self._guaranteed_stop_required_symbols
             self._guaranteed_stop_required_symbols.add(upper)
-            spec = self._symbol_spec_cache.get(upper)
-            if spec is not None:
+            cached_specs: list[SymbolSpec] = []
+            symbol_spec = self._symbol_spec_cache.get(upper)
+            if symbol_spec is not None:
+                cached_specs.append(symbol_spec)
+            cached_specs.extend(
+                spec
+                for (cached_symbol, _), spec in self._symbol_spec_cache_by_epic.items()
+                if cached_symbol == upper and spec not in cached_specs
+            )
+            for spec in cached_specs:
                 metadata = spec.metadata if isinstance(spec.metadata, dict) else {}
                 metadata["guaranteed_stop_required"] = True
                 metadata["guaranteed_stop_required_source"] = source
@@ -3829,7 +6001,7 @@ class IgApiClient(BaseBrokerClient):
         tolerance_pips = float(self._open_level_tolerance_pips)
         if not math.isfinite(tolerance_pips) or tolerance_pips <= 0:
             return None
-        distance = tolerance_pips * max(float(spec.tick_size), 1e-9)
+        distance = tolerance_pips * max(float(spec.tick_size), FLOAT_COMPARISON_TOLERANCE)
         if side == Side.BUY:
             return float(_normalize_price_ceil_for_spec(spec, float(entry) + distance))
         return float(_normalize_price_floor_for_spec(spec, float(entry) - distance))
@@ -3862,6 +6034,112 @@ class IgApiClient(BaseBrokerClient):
         sync["stop_loss"] = confirmed_stop if confirmed_stop > 0 else stop_loss
         sync["take_profit"] = confirmed_take if confirmed_take > 0 else take_profit
         return sync
+
+    def _cache_open_sync_payload(self, position_id: str, sync_payload: dict[str, Any]) -> None:
+        payload = dict(sync_payload)
+        payload["_cache_ts"] = time.time()
+        with self._lock:
+            self._position_open_sync[str(position_id)] = payload
+
+    def _recover_open_position_after_confirm_timeout(
+        self,
+        *,
+        symbol: str,
+        side: Side,
+        volume: float,
+        epic: str,
+        deal_reference: str,
+        fallback_open_price: float,
+        fallback_stop_loss: float,
+        fallback_take_profit: float,
+        direction: str,
+        currency_code: str,
+        auto_discovered: bool = False,
+    ) -> str:
+        late_reject_error: BrokerError | None = None
+        late_confirm = self._fetch_open_confirm_once(deal_reference)
+        if late_confirm is not None:
+            late_status = str(late_confirm.get("dealStatus") or "").strip().upper()
+            late_reason = self._confirm_rejection_reason(late_confirm)
+            if late_status == "ACCEPTED":
+                position_id = str(late_confirm.get("dealId") or "").strip()
+                if position_id:
+                    self._reset_allowance_cooldown()
+                    self._activate_epic(symbol, epic)
+                    if auto_discovered:
+                        logger.warning(
+                            "IG open_position epic auto-discovered for %s: using %s",
+                            str(symbol).upper(),
+                            epic,
+                        )
+                    sync_payload = self._build_open_sync_payload(
+                        position_id,
+                        late_confirm,
+                        deal_reference=deal_reference,
+                        open_price=float(fallback_open_price),
+                        stop_loss=float(fallback_stop_loss),
+                        take_profit=float(fallback_take_profit),
+                        epic=epic,
+                    )
+                    self._cache_open_sync_payload(position_id, sync_payload)
+                    return position_id
+            elif late_status == "REJECTED":
+                self._maybe_start_allowance_cooldown(late_reason, "trade open confirm timeout")
+                if self._is_instrument_invalid_error_text(late_reason):
+                    self._mark_epic_temporarily_invalid(symbol, epic, reason=late_reason)
+                confirm_summary = self._compact_confirm_payload(late_confirm)
+                late_reject_error = BrokerError(
+                    "IG deal rejected after confirm timeout: "
+                    f"{late_reason or 'UNKNOWN'} | epic={epic} direction={direction} "
+                    f"size={float(volume):g} currency={currency_code} "
+                    f"stop={float(fallback_stop_loss):g} limit={float(fallback_take_profit):g} "
+                    f"confirm={confirm_summary}"
+                )
+
+        recovered_open = self._recover_open_position_after_rejected_confirm(
+            symbol=symbol,
+            side=side,
+            volume=float(volume),
+            epic=epic,
+            deal_reference=deal_reference,
+            fallback_open_price=float(fallback_open_price),
+            fallback_stop_loss=float(fallback_stop_loss),
+            fallback_take_profit=float(fallback_take_profit),
+        )
+        if recovered_open is not None:
+            self._reset_allowance_cooldown()
+            recovered_position_id = str(recovered_open.get("position_id") or "").strip()
+            if recovered_position_id:
+                self._activate_epic(symbol, epic)
+                if auto_discovered:
+                    logger.warning(
+                        "IG open_position epic auto-discovered for %s: using %s",
+                        str(symbol).upper(),
+                        epic,
+                    )
+                sync_payload = self._build_open_sync_payload(
+                    recovered_position_id,
+                    None,
+                    deal_reference=str(recovered_open.get("deal_reference") or deal_reference).strip(),
+                    open_price=float(recovered_open.get("open_price") or 0.0),
+                    stop_loss=float(recovered_open.get("stop_loss") or fallback_stop_loss),
+                    take_profit=float(recovered_open.get("take_profit") or fallback_take_profit),
+                    epic=str(recovered_open.get("epic") or epic),
+                )
+                sync_payload["source"] = str(
+                    recovered_open.get("source") or "ig_positions_after_confirm_timeout"
+                )
+                self._cache_open_sync_payload(recovered_position_id, sync_payload)
+                return recovered_position_id
+
+        if late_reject_error is not None:
+            raise late_reject_error
+        raise BrokerError(
+            "IG open position confirm timed out before dealId was available; "
+            f"pending recovery required | deal_reference={deal_reference} epic={epic} "
+            f"direction={direction} size={float(volume):g} currency={currency_code} "
+            f"stop={float(fallback_stop_loss):g} limit={float(fallback_take_profit):g}"
+        )
 
     def _recover_open_position_after_rejected_confirm(
         self,
@@ -3904,7 +6182,7 @@ class IgApiClient(BaseBrokerClient):
                     or row.get("dealReference")
                     or row.get("reference")
                 )
-                if _sanitize_deal_reference(str(raw_reference or "")) != normalized_reference:
+                if not _deal_reference_matches(normalized_reference, str(raw_reference or "")):
                     continue
 
                 deal_id = str(
@@ -3989,8 +6267,8 @@ class IgApiClient(BaseBrokerClient):
         if entry_price is None or entry_price <= 0 or reference_spec is None:
             return candidate_entry, requested_stop_loss, requested_take_profit
 
-        reference_tick = max(float(reference_spec.tick_size), 1e-9)
-        candidate_tick_size = max(float(candidate_spec.tick_size), 1e-9)
+        reference_tick = max(float(reference_spec.tick_size), FLOAT_COMPARISON_TOLERANCE)
+        candidate_tick_size = max(float(candidate_spec.tick_size), FLOAT_COMPARISON_TOLERANCE)
         stop_distance_points = abs(float(entry_price) - float(requested_stop_loss)) / reference_tick
         take_distance_points = abs(float(requested_take_profit) - float(entry_price)) / reference_tick
 
@@ -4036,68 +6314,408 @@ class IgApiClient(BaseBrokerClient):
 
         return candidate_entry, stop_loss, take_profit
 
-    # ------------------------------------------------------------------
-    # Lightstreamer streaming (official library)
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _decode_stream_field(encoded: str, previous: str | None) -> str | None:
+        if encoded == "":
+            return previous
+        if encoded == "$":
+            return ""
+        if encoded == "#":
+            return None
+        if encoded.startswith("$$") or encoded.startswith("##"):
+            return encoded[1:]
+        if encoded[0] in {"$", "#"}:
+            return encoded[1:]
+        return encoded
+
+    @staticmethod
+    def _read_stream_line(stream_response: Any) -> str | None:
+        raw = stream_response.readline()
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            text = raw.decode("utf-8", errors="replace")
+        else:
+            text = str(raw)
+        if text == "":
+            return None
+        return text.rstrip("\r\n")
+
+    def _stream_backoff_delay(self, attempt: int) -> float:
+        if attempt <= 0:
+            return self._stream_backoff_base_sec
+        return min(self._stream_backoff_max_sec, self._stream_backoff_base_sec * (2 ** (attempt - 1)))
+
+    def _resolve_stream_control_url(self, control_address: str | None) -> str | None:
+        stream_endpoint = self._stream_endpoint
+        if not stream_endpoint:
+            return None
+        if not control_address:
+            return f"{stream_endpoint}/control.txt"
+
+        raw = control_address.strip().rstrip("/")
+        if not raw:
+            return f"{stream_endpoint}/control.txt"
+
+        parsed_addr = parse.urlparse(raw)
+        if parsed_addr.scheme:
+            base = raw
+        else:
+            stream_scheme = parse.urlparse(stream_endpoint).scheme or "https"
+            base = f"{stream_scheme}://{raw}"
+
+        base = base.rstrip("/")
+        if not base.endswith("/lightstreamer"):
+            base = f"{base}/lightstreamer"
+        return f"{base}/control.txt"
+
+    def _mark_stream_disconnected_locked(self, error_text: str | None, schedule_retry: bool = True) -> None:
+        response = self._stream_http_response
+        self._stream_http_response = None
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+        self._stream_session_id = None
+        self._stream_control_url = None
+        self._stream_keepalive_ms = None
+        self._stream_symbol_to_table.clear()
+        self._stream_table_to_symbol.clear()
+        self._stream_table_field_values.clear()
+        self._stream_last_disconnect_ts = time.time()
+
+        if error_text:
+            self._stream_last_error = error_text
+
+        if schedule_retry:
+            self._stream_reconnect_attempts += 1
+            delay = self._stream_backoff_delay(self._stream_reconnect_attempts)
+            self._stream_next_retry_at = time.time() + delay
+        else:
+            self._stream_reconnect_attempts = 0
+            self._stream_next_retry_at = None
+
+    def _mark_stream_connected_locked(
+        self,
+        session_id: str,
+        control_url: str | None,
+        keepalive_ms: int | None,
+    ) -> None:
+        was_reconnect = self._stream_last_disconnect_ts is not None
+        self._stream_session_id = session_id
+        self._stream_control_url = control_url
+        self._stream_keepalive_ms = keepalive_ms
+        self._stream_last_error = None
+        self._stream_reconnect_attempts = 0
+        self._stream_next_retry_at = None
+        self._stream_last_reconnect_ts = time.time()
+
+        if was_reconnect:
+            self._stream_total_reconnects += 1
+            logger.warning(
+                "IG Lightstreamer reconnected | total_reconnects=%s",
+                self._stream_total_reconnects,
+            )
+
+    def _on_stream_sdk_status_change(self, status: str) -> None:
+        normalized = str(status or "").strip()
+        lowered = normalized.lower()
+        now_ts = time.time()
+        should_resubscribe = False
+
+        with self._lock:
+            was_connected = bool(self._stream_sdk_connected)
+            is_connected = lowered.startswith("connected")
+            self._stream_sdk_status = normalized or None
+            self._stream_sdk_connected = is_connected
+            if is_connected:
+                self._stream_session_id = "lightstreamer_sdk"
+                self._stream_control_url = None
+                self._stream_keepalive_ms = None
+                self._stream_last_error = None
+                self._stream_reconnect_attempts = 0
+                self._stream_next_retry_at = None
+                self._stream_last_reconnect_ts = now_ts
+                if was_connected:
+                    return
+                if self._stream_last_disconnect_ts is not None:
+                    self._stream_total_reconnects += 1
+                    logger.warning(
+                        "IG Lightstreamer SDK reconnected | total_reconnects=%s",
+                        self._stream_total_reconnects,
+                    )
+                should_resubscribe = True
+            else:
+                self._stream_session_id = None
+                self._stream_control_url = None
+                self._stream_keepalive_ms = None
+                if normalized:
+                    self._stream_last_error = f"sdk_status:{lowered}"
+                self._stream_symbol_to_table.clear()
+                self._stream_table_to_symbol.clear()
+                self._stream_table_field_values.clear()
+                if was_connected:
+                    self._stream_last_disconnect_ts = now_ts
+                    self._stream_reconnect_attempts += 1
+                    delay = self._stream_backoff_delay(self._stream_reconnect_attempts)
+                    self._stream_next_retry_at = now_ts + delay
+
+        if should_resubscribe:
+            self._resubscribe_desired_symbols()
+
+    def _on_stream_sdk_server_error(self, code: int, message: str) -> None:
+        with self._lock:
+            self._stream_last_error = f"sdk_server_error:{code}:{message}"
+            self._stream_sdk_connected = False
+            self._stream_session_id = None
+
+    def _ensure_stream_sdk_symbol_table_locked(self, upper: str) -> int:
+        self._stream_sdk_pending_subscriptions.discard(upper)
+        table_id = self._stream_symbol_to_table.get(upper)
+        if table_id is None:
+            table_id = self._stream_next_table_id
+            self._stream_next_table_id += 1
+            self._stream_symbol_to_table[upper] = table_id
+            self._stream_table_to_symbol[table_id] = upper
+            self._stream_table_field_values[table_id] = [None] * len(LIGHTSTREAMER_PRICE_FIELDS)
+        self._stream_last_error = None
+        return table_id
+
+    def _on_stream_sdk_subscription(self, symbol: str) -> None:
+        upper = str(symbol).upper()
+        with self._lock:
+            self._clear_stream_rest_fallback_block_locked(upper)
+            self._ensure_stream_sdk_symbol_table_locked(upper)
+
+    def _on_stream_sdk_unsubscription(self, symbol: str) -> None:
+        upper = str(symbol).upper()
+        with self._lock:
+            self._stream_sdk_pending_subscriptions.discard(upper)
+            table_id = self._stream_symbol_to_table.pop(upper, None)
+            if table_id is not None:
+                self._stream_table_to_symbol.pop(table_id, None)
+                self._stream_table_field_values.pop(table_id, None)
+
+    def _on_stream_sdk_subscription_error(self, symbol: str, code: int, message: str) -> None:
+        upper = str(symbol).upper()
+        reason = f"error:{code}:{message}"
+        failed_epic = ""
+        with self._lock:
+            self._stream_sdk_pending_subscriptions.discard(upper)
+            self._stream_sdk_subscriptions.pop(upper, None)
+            self._stream_sdk_subscription_listeners.pop(upper, None)
+            table_id = self._stream_symbol_to_table.pop(upper, None)
+            if table_id is not None:
+                self._stream_table_to_symbol.pop(table_id, None)
+                self._stream_table_field_values.pop(table_id, None)
+            self._stream_last_error = f"subscription_failed:{upper}:{reason}"
+            failed_epic = str(self._epics.get(upper) or "").strip().upper()
+
+        if not self._is_stream_subscription_invalid_group_error_text(reason):
+            return
+
+        next_epic = self._promote_stream_subscription_epic_after_invalid_group(
+            upper,
+            failed_epic,
+            reason=f"stream_subscription:{reason}",
+        )
+        if next_epic:
+            return
+
+    @staticmethod
+    def _stream_sdk_value(update: Any, field_name: str) -> str | None:
+        getter = getattr(update, "getValue", None)
+        if callable(getter):
+            try:
+                value = getter(field_name)
+            except Exception:
+                value = None
+            if value is not None:
+                return str(value)
+        fields_getter = getattr(update, "getFields", None)
+        if callable(fields_getter):
+            try:
+                fields = fields_getter()
+            except Exception:
+                fields = None
+            if isinstance(fields, dict):
+                value = fields.get(field_name)
+                if value is not None:
+                    return str(value)
+        return None
+
+    def _on_stream_sdk_item_update(self, symbol: str, update: Any) -> None:
+        upper = str(symbol).upper()
+        with self._lock:
+            self._clear_stream_rest_fallback_block_locked(upper)
+            table_id = self._ensure_stream_sdk_symbol_table_locked(upper)
+            previous_values = list(
+                self._stream_table_field_values.get(table_id, [None] * len(LIGHTSTREAMER_PRICE_FIELDS))
+            )
+        decoded = list(previous_values)
+        for idx, field_name in enumerate(LIGHTSTREAMER_PRICE_FIELDS):
+            value = self._stream_sdk_value(update, field_name)
+            if value is not None:
+                decoded[idx] = value
+        with self._lock:
+            if table_id is not None:
+                self._stream_table_field_values[table_id] = decoded
+        self._update_tick_from_stream_fields(upper, decoded)
+
+    def _start_stream_sdk_locked(self) -> None:
+        if _LightstreamerClient is None or _LightstreamerSubscription is None:
+            self._stream_last_error = "lightstreamer_sdk_not_installed"
+            return
+        if self._stream_sdk_client is not None:
+            return
+        if not self._stream_endpoint:
+            self._stream_last_error = "lightstreamer_endpoint_missing"
+            return
+        if not self.account_id:
+            self._stream_last_error = "lightstreamer_account_id_missing"
+            return
+        if not self._cst or not self._security_token:
+            self._stream_last_error = "lightstreamer_auth_tokens_missing"
+            return
+
+        try:
+            client = _LightstreamerClient(self._stream_endpoint, LIGHTSTREAMER_ADAPTER_SET)
+            client.connectionDetails.setUser(self.account_id)
+            client.connectionDetails.setPassword(f"CST-{self._cst}|XST-{self._security_token}")
+            listener = _IgLightstreamerClientListener(self)
+            client.addListener(listener)
+            self._stream_sdk_client = client
+            self._stream_sdk_client_listener = listener
+            self._stream_sdk_connected = False
+            self._stream_sdk_status = "connecting"
+            client.connect()
+        except Exception as exc:
+            self._stream_sdk_client = None
+            self._stream_sdk_client_listener = None
+            self._stream_sdk_connected = False
+            self._stream_sdk_status = None
+            self._stream_last_error = f"sdk_connect_failed:{exc}"
+
+    def _stop_stream_sdk_locked(self) -> None:
+        client = self._stream_sdk_client
+        listener = self._stream_sdk_client_listener
+        subscriptions = list(self._stream_sdk_subscriptions.values())
+        self._stream_sdk_client = None
+        self._stream_sdk_client_listener = None
+        self._stream_sdk_subscriptions.clear()
+        self._stream_sdk_subscription_listeners.clear()
+        self._stream_sdk_pending_subscriptions.clear()
+        self._stream_sdk_connected = False
+        self._stream_sdk_status = None
+        self._stream_session_id = None
+        self._stream_control_url = None
+        self._stream_keepalive_ms = None
+        self._stream_symbol_to_table.clear()
+        self._stream_table_to_symbol.clear()
+        self._stream_table_field_values.clear()
+        if client is None:
+            return
+        for subscription in subscriptions:
+            try:
+                client.unsubscribe(subscription)
+            except Exception:
+                pass
+        if listener is not None:
+            try:
+                client.removeListener(listener)
+            except Exception:
+                pass
+        try:
+            client.disconnect()
+        except Exception:
+            pass
 
     def _start_stream_thread_locked(self) -> None:
         if not self._stream_enabled:
             self._stream_last_error = "stream_disabled_by_config"
             return
-        if not _HAS_LIGHTSTREAMER:
-            self._stream_last_error = "lightstreamer_client_lib_not_installed"
-            logger.warning("lightstreamer-client-lib not installed; streaming disabled")
+        if self._stream_use_sdk:
+            self._start_stream_sdk_locked()
             return
-        if self._ls_client is not None:
+        thread = self._stream_thread
+        if thread is not None and thread.is_alive():
             return
-        endpoint = self._stream_endpoint
-        if not endpoint:
+        if not self._stream_endpoint:
             self._stream_last_error = "lightstreamer_endpoint_missing"
             return
-        account_id = self.account_id
-        cst = self._cst
-        security_token = self._security_token
-        if not account_id or not cst or not security_token:
-            self._stream_last_error = "lightstreamer_auth_tokens_missing"
-            return
 
-        client = _LsClient(endpoint, "")
-        client.connectionDetails.setUser(account_id)
-        client.connectionDetails.setPassword(f"CST-{cst}|XST-{security_token}")
-        client.connectionOptions.setRetryDelay(5000)
-        client.connectionOptions.setFirstRetryMaxDelay(2000)
-
-        listener = _IgClientListener(self)
-        client.addListener(listener)
-        self._ls_client = client
-        self._ls_client_listener = listener
-        client.connect()
-        logger.info(
-            "IG Lightstreamer connecting | endpoint=%s account=%s",
-            endpoint,
-            account_id,
+        self._stream_stop_event.clear()
+        self._stream_thread = threading.Thread(
+            target=self._stream_loop,
+            name="ig-lightstreamer-stream",
+            daemon=True,
         )
+        self._stream_thread.start()
 
-    def _stop_stream_thread_locked(self) -> None:
-        client = self._ls_client
-        self._ls_client = None
-        self._ls_client_listener = None
-        self._stream_connected = False
-        self._stream_subscriptions.clear()
-        if client is not None:
-            try:
-                client.disconnect()
-            except Exception:
-                pass
+    def _stop_stream_thread_locked(self) -> threading.Thread | None:
+        if self._stream_use_sdk:
+            self._stop_stream_sdk_locked()
+            return None
+        self._stream_stop_event.set()
+        self._mark_stream_disconnected_locked(None, schedule_retry=False)
+        thread = self._stream_thread
+        self._stream_thread = None
+        if thread is threading.current_thread():
+            return None
+        return thread
+
+    def _send_stream_control(self, control_url: str, params: dict[str, Any]) -> tuple[bool, str]:
+        req = request.Request(
+            url=control_url,
+            method="POST",
+            data=self._form_body(params),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Accept": "text/plain",
+            },
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout_sec) as resp:
+                payload = resp.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            return False, str(exc)
+
+        lines = [line.strip() for line in payload.replace("\r", "\n").split("\n") if line.strip()]
+        if not lines:
+            return False, "empty_control_response"
+
+        first = lines[0]
+        if first == "OK":
+            return True, "ok"
+        if first == "SYNC ERROR":
+            return False, "sync_error"
+        if first == "ERROR":
+            code = lines[1] if len(lines) > 1 else "unknown"
+            message = lines[2] if len(lines) > 2 else "unknown"
+            return False, f"error:{code}:{message}"
+        return False, first
 
     def _subscribe_symbol(self, symbol: str) -> bool:
+        if self._stream_use_sdk:
+            with self._lock:
+                sdk_client_ready = self._stream_sdk_client is not None
+            if sdk_client_ready:
+                return self._subscribe_symbol_sdk(symbol)
         upper = symbol.upper()
+
         with self._lock:
-            if upper in self._stream_subscriptions:
+            if upper in self._stream_symbol_to_table:
                 return True
-            client = self._ls_client
-            if client is None or not self._stream_connected:
+            session_id = self._stream_session_id
+            control_url = self._stream_control_url
+            account_id = self.account_id
+            if not session_id or not control_url or not account_id:
                 return False
+            table_id = self._stream_next_table_id
+            self._stream_next_table_id += 1
+
         try:
             epic = self._epic_for_symbol(upper)
         except Exception as exc:
@@ -4105,31 +6723,137 @@ class IgApiClient(BaseBrokerClient):
                 self._stream_last_error = f"epic_resolution_failed:{upper}:{exc}"
             return False
 
-        sub = _LsSubscription("MERGE", [f"MARKET:{epic}"], list(IG_LS_PRICE_FIELDS))
-        sub.setRequestedSnapshot("yes")
-        listener = _IgSubscriptionListener(self, upper)
-        sub.addListener(listener)
-        try:
-            client.subscribe(sub)
-        except Exception as exc:
+        attempted_epics: set[str] = set()
+        final_reason = "unknown"
+
+        while True:
+            normalized_epic = str(epic).strip().upper()
+            if not normalized_epic or normalized_epic in attempted_epics:
+                break
+            attempted_epics.add(normalized_epic)
+
+            item = f"PRICE:{account_id}:{normalized_epic}"
+            # Lightstreamer field lists are space-separated (+ encoded in form body).
+            schema = " ".join(LIGHTSTREAMER_PRICE_SUBSCRIPTION_FIELDS)
+            ok, reason = self._send_stream_control(
+                control_url,
+                {
+                    "LS_session": session_id,
+                    "LS_table": table_id,
+                    "LS_op": "add",
+                    "LS_data_adapter": LIGHTSTREAMER_PRICE_ADAPTER,
+                    "LS_id": item,
+                    "LS_schema": schema,
+                    "LS_mode": "MERGE",
+                    "LS_snapshot": "true",
+                },
+            )
+            if ok:
+                self._activate_epic(upper, normalized_epic)
+                self._clear_stream_rest_fallback_block(upper)
+
+                with self._lock:
+                    if session_id != self._stream_session_id:
+                        return False
+                    self._stream_symbol_to_table[upper] = table_id
+                    self._stream_table_to_symbol[table_id] = upper
+                    self._stream_table_field_values[table_id] = [None] * len(LIGHTSTREAMER_PRICE_FIELDS)
+                return True
+
+            final_reason = str(reason or "unknown")
+            if reason == "sync_error":
+                with self._lock:
+                    self._stream_last_error = f"subscription_failed:{upper}:{final_reason}"
+                    self._mark_stream_disconnected_locked("stream_sync_error", schedule_retry=True)
+                return False
+
+            if self._is_stream_subscription_invalid_group_error_text(reason):
+                next_epic = self._promote_stream_subscription_epic_after_invalid_group(
+                    upper,
+                    normalized_epic,
+                    reason=f"stream_subscription:{final_reason}",
+                )
+                if next_epic:
+                    return False
+
+            break
+
+        if self._is_stream_subscription_invalid_group_error_text(final_reason):
+            self._mark_stream_rest_fallback_block(upper, reason=f"stream_subscription:{final_reason}")
+        with self._lock:
+            self._stream_last_error = f"subscription_failed:{upper}:{final_reason}"
+        return False
+
+    def _subscribe_symbol_sdk(self, symbol: str) -> bool:
+        if _LightstreamerSubscription is None:
             with self._lock:
-                self._stream_last_error = f"subscription_failed:{upper}:{exc}"
+                self._stream_last_error = "lightstreamer_sdk_not_installed"
             return False
 
+        upper = str(symbol).upper()
         with self._lock:
-            self._stream_subscriptions[upper] = sub
-        return True
+            client = self._stream_sdk_client
+            account_id = self.account_id
+            if upper in self._stream_symbol_to_table:
+                return True
+            if upper in self._stream_sdk_pending_subscriptions:
+                return True
+            if upper in self._stream_sdk_subscriptions:
+                return True
+            if client is None or not account_id:
+                return False
+
+        try:
+            epic = self._epic_for_symbol(upper)
+        except Exception as exc:
+            with self._lock:
+                self._stream_last_error = f"epic_resolution_failed:{upper}:{exc}"
+            return False
+
+        item = f"PRICE:{account_id}:{epic}"
+        try:
+            subscription = _LightstreamerSubscription(
+                "MERGE",
+                [item],
+                list(LIGHTSTREAMER_PRICE_SUBSCRIPTION_FIELDS),
+            )
+            subscription.setDataAdapter(LIGHTSTREAMER_PRICE_ADAPTER)
+            subscription.setRequestedSnapshot("yes")
+            listener = _IgLightstreamerSubscriptionListener(self, upper)
+            subscription.addListener(listener)
+            with self._lock:
+                self._stream_sdk_subscriptions[upper] = subscription
+                self._stream_sdk_subscription_listeners[upper] = listener
+                self._stream_sdk_pending_subscriptions.add(upper)
+            client.subscribe(subscription)
+            return True
+        except Exception as exc:
+            with self._lock:
+                self._stream_sdk_pending_subscriptions.discard(upper)
+                self._stream_sdk_subscriptions.pop(upper, None)
+                self._stream_sdk_subscription_listeners.pop(upper, None)
+                self._stream_last_error = f"subscription_failed:{upper}:{exc}"
+            return False
 
     def _ensure_stream_subscription(self, symbol: str) -> bool:
         if not self._stream_enabled:
             return False
         upper = symbol.upper()
+        block_remaining = self._stream_rest_fallback_block_remaining(upper)
+        retry_remaining = self._stream_subscription_retry_remaining(upper)
         with self._lock:
             self._stream_desired_subscriptions.add(upper)
-            already_subscribed = upper in self._stream_subscriptions
-            stream_ready = self._stream_connected
+            already_subscribed = upper in self._stream_symbol_to_table
+            if self._stream_use_sdk:
+                stream_ready = self._stream_sdk_client is not None
+            else:
+                stream_ready = bool(self._stream_session_id and self._stream_control_url)
         if already_subscribed:
             return True
+        if block_remaining > 0:
+            return False
+        if retry_remaining > 0:
+            return False
         if not stream_ready:
             return False
         return self._subscribe_symbol(upper)
@@ -4138,16 +6862,42 @@ class IgApiClient(BaseBrokerClient):
         with self._lock:
             desired = sorted(self._stream_desired_subscriptions)
         for symbol in desired:
-            try:
-                self._subscribe_symbol(symbol)
-            except Exception as exc:
-                logger.warning("IG Lightstreamer re-subscribe failed for %s: %s", symbol, exc)
+            self._ensure_stream_subscription(symbol)
 
-    def _update_tick_from_stream_update(
-        self, symbol: str, bid_raw: str | None, ask_raw: str | None, ts_raw: str | None,
-    ) -> None:
-        bid = _as_float(bid_raw, 0.0)
-        ask = _as_float(ask_raw, 0.0)
+    def set_stream_tick_handler(self, handler: Callable[[PriceTick], None] | None) -> None:
+        with self._lock:
+            self._stream_tick_handler = handler if callable(handler) else None
+
+    def _emit_stream_tick(self, tick: PriceTick) -> None:
+        with self._lock:
+            handler = self._stream_tick_handler
+        if handler is None:
+            return
+        try:
+            handler(self._clone_tick(tick))
+        except Exception:
+            logger.debug("Stream tick handler failed", exc_info=True)
+
+    def _update_tick_from_stream_fields(self, symbol: str, field_values: list[str | None]) -> None:
+        field_map: dict[str, str | None] = {}
+        for idx, name in enumerate(LIGHTSTREAMER_PRICE_FIELDS):
+            field_map[name] = field_values[idx] if idx < len(field_values) else None
+
+        def _first_positive_field(*names: str) -> float:
+            for name in names:
+                parsed = _as_float(field_map.get(name), 0.0)
+                if parsed > 0:
+                    return parsed
+            return 0.0
+
+        bid = _first_positive_field("BIDPRICE1", "BID")
+        ask = _first_positive_field("ASKPRICE1", "OFR", "OFFER")
+        timestamp_raw: str | None = None
+        for key in ("TIMESTAMP", "UTM", "UPDATE_TIME"):
+            raw = field_map.get(key)
+            if raw not in (None, ""):
+                timestamp_raw = raw
+                break
 
         if bid <= 0 and ask <= 0:
             return
@@ -4157,39 +6907,253 @@ class IgApiClient(BaseBrokerClient):
             ask = bid
 
         now_ts = time.time()
-        tick_ts = self._parse_ts({"updateTimeUTC": ts_raw}, now_ts)
+        tick_ts = self._parse_ts({"updateTimeUTC": timestamp_raw}, now_ts)
 
-        tick = PriceTick(symbol=symbol, bid=bid, ask=ask, timestamp=tick_ts)
+        tick = PriceTick(
+            symbol=symbol,
+            bid=bid,
+            ask=ask,
+            timestamp=tick_ts,
+            received_at=now_ts,
+        )
         with self._lock:
+            previous_tick = self._tick_cache.get(symbol)
+            quote_changed = (
+                previous_tick is None
+                or abs(float(previous_tick.bid) - bid) > FLOAT_ROUNDING_TOLERANCE
+                or abs(float(previous_tick.ask) - ask) > FLOAT_ROUNDING_TOLERANCE
+            )
+            if quote_changed or symbol not in self._stream_last_quote_change_ts_by_symbol:
+                self._stream_last_quote_change_ts_by_symbol[symbol] = now_ts
             self._tick_cache[symbol] = tick
             self._last_tick_by_symbol[symbol] = tick_ts
+        self._emit_stream_tick(tick)
 
-    def _refresh_stream_auth(self) -> None:
-        """Refresh IG auth tokens and update LightstreamerClient credentials."""
-        try:
-            self._maybe_refresh_auth_session_after_failure(
-                method="STREAM", path="/lightstreamer", error_text="stream_auth_rejected",
-            )
-        except Exception as exc:
-            logger.warning("IG stream auth refresh failed: %s", exc)
-            return
+    def _is_stream_quote_stagnant_locked(self, symbol: str, now_ts: float) -> bool:
+        max_age = float(self._stream_stagnant_quote_max_age_sec)
+        if max_age <= 0:
+            return False
+        changed_at = self._stream_last_quote_change_ts_by_symbol.get(symbol)
+        if changed_at is None:
+            return False
+        return (now_ts - changed_at) > max_age
+
+    def _handle_lightstreamer_table_update(self, table_id: int, raw_values: str) -> bool:
         with self._lock:
-            client = self._ls_client
+            symbol = self._stream_table_to_symbol.get(table_id)
+            previous_values = list(
+                self._stream_table_field_values.get(table_id, [None] * len(LIGHTSTREAMER_PRICE_FIELDS))
+            )
+
+        if symbol is None:
+            return True
+
+        encoded_values = raw_values.split("|")
+        decoded: list[str | None] = []
+        for idx in range(len(LIGHTSTREAMER_PRICE_FIELDS)):
+            prev = previous_values[idx] if idx < len(previous_values) else None
+            encoded = encoded_values[idx] if idx < len(encoded_values) else ""
+            decoded.append(self._decode_stream_field(encoded, prev))
+
+        with self._lock:
+            self._stream_table_field_values[table_id] = decoded
+
+        self._update_tick_from_stream_fields(symbol, decoded)
+        return True
+
+    def _handle_stream_line(self, line: str) -> bool:
+        if line == "" or line == "PROBE":
+            return True
+
+        if line.startswith("Preamble"):
+            return True
+
+        if line.startswith(("ERROR", "END", "LOOP", "SYNC ERROR")):
+            logger.warning("IG Lightstreamer control event: %s", line)
+            return False
+
+        if line.startswith("U,"):
+            # Some servers may emit TLCP-style updates; try to read table id and pipe payload.
+            parts = line.split(",", 3)
+            if len(parts) >= 4:
+                try:
+                    table_id = int(parts[1])
+                except ValueError:
+                    return True
+                return self._handle_lightstreamer_table_update(table_id, parts[3])
+            return True
+
+        if "|" in line and "," in line:
+            prefix, values = line.split("|", 1)
+            prefix_parts = prefix.split(",")
+            if len(prefix_parts) >= 2 and prefix_parts[0].isdigit() and prefix_parts[1].isdigit():
+                return self._handle_lightstreamer_table_update(int(prefix_parts[0]), values)
+        elif "|" in line:
+            # Some servers emit table updates as "<table>|<values>" in MERGE mode.
+            prefix, values = line.split("|", 1)
+            if prefix.isdigit():
+                return self._handle_lightstreamer_table_update(int(prefix), values)
+
+        if ",EOS" in line or ",OV" in line:
+            return True
+
+        return True
+
+    def _open_stream_session(self) -> Any:
+        with self._lock:
+            stream_endpoint = self._stream_endpoint
+            account_id = self.account_id
             cst = self._cst
             security_token = self._security_token
-        if client and cst and security_token:
+
+        if not stream_endpoint:
+            raise BrokerError("lightstreamer_endpoint_missing")
+        if not account_id:
+            raise BrokerError("lightstreamer_account_id_missing")
+        if not cst or not security_token:
+            raise BrokerError("lightstreamer_auth_tokens_missing")
+
+        create_url = f"{stream_endpoint}/create_session.txt"
+        body = self._form_body(
+            {
+                "LS_op2": "create",
+                "LS_cid": LIGHTSTREAMER_CID,
+                "LS_adapter_set": LIGHTSTREAMER_ADAPTER_SET,
+                "LS_user": account_id,
+                "LS_password": f"CST-{cst}|XST-{security_token}",
+                "LS_keepalive_millis": 5000,
+                "LS_content_length": 50000000,
+            }
+        )
+
+        req = request.Request(
+            url=create_url,
+            method="POST",
+            data=body,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Accept": "text/plain",
+            },
+        )
+
+        timeout = max(self.stream_read_timeout_sec, self.timeout_sec)
+        return request.urlopen(req, timeout=timeout)
+
+    _STREAM_MAX_RECONNECT_ATTEMPTS = 50
+
+    def _stream_loop(self) -> None:
+        while not self._stream_stop_event.is_set():
+            with self._lock:
+                if not self._connected:
+                    return
+                retry_at = self._stream_next_retry_at
+                reconnect_attempts = self._stream_reconnect_attempts
+
+            # Circuit breaker: stop reconnecting after too many consecutive failures
+            if reconnect_attempts >= self._STREAM_MAX_RECONNECT_ATTEMPTS:
+                logger.error(
+                    "IG Lightstreamer circuit breaker: %d consecutive reconnect failures, "
+                    "stopping stream loop. REST fallback remains active.",
+                    reconnect_attempts,
+                )
+                return
+
+            now = time.time()
+            if retry_at is not None and now < retry_at:
+                self._stream_stop_event.wait(max(0.1, retry_at - now))
+                continue
+
+            stream_response: Any | None = None
             try:
-                client.connectionDetails.setPassword(f"CST-{cst}|XST-{security_token}")
+                stream_response = self._open_stream_session()
+                first_line = self._read_stream_line(stream_response)
+                if first_line != "OK":
+                    raise BrokerError(f"stream_create_failed:{first_line}")
+
+                session_id: str | None = None
+                control_address: str | None = None
+                keepalive_ms: int | None = None
+
+                while not self._stream_stop_event.is_set():
+                    header_line = self._read_stream_line(stream_response)
+                    if header_line is None:
+                        raise BrokerError("stream_header_unexpected_eof")
+                    if header_line == "":
+                        break
+                    if ":" not in header_line:
+                        continue
+                    key, value = header_line.split(":", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key == "SessionId":
+                        session_id = value
+                    elif key == "ControlAddress":
+                        control_address = value
+                    elif key == "KeepaliveMillis":
+                        try:
+                            keepalive_ms = int(value)
+                        except ValueError:
+                            keepalive_ms = None
+
+                if not session_id:
+                    raise BrokerError("stream_session_id_missing")
+
+                control_url = self._resolve_stream_control_url(control_address)
+                with self._lock:
+                    self._stream_http_response = stream_response
+                    self._mark_stream_connected_locked(session_id, control_url, keepalive_ms)
+
+                self._resubscribe_desired_symbols()
+
+                while not self._stream_stop_event.is_set():
+                    line = self._read_stream_line(stream_response)
+                    if line is None:
+                        raise BrokerError("stream_eof")
+                    handled = self._handle_stream_line(line)
+                    if handled:
+                        continue
+                    raise BrokerError(f"stream_control_message:{line}")
+
             except Exception as exc:
-                logger.warning("IG stream auth credential update failed: %s", exc)
+                if self._stream_stop_event.is_set():
+                    break
+                with self._lock:
+                    self._mark_stream_disconnected_locked(str(exc), schedule_retry=True)
+                    retry_in = (
+                        max(0.1, (self._stream_next_retry_at or time.time()) - time.time())
+                        if self._stream_next_retry_at is not None
+                        else self._stream_backoff_base_sec
+                    )
+                logger.warning("IG Lightstreamer degraded, switching to REST fallback: %s", exc)
+                self._stream_stop_event.wait(retry_in)
+            finally:
+                if stream_response is not None:
+                    try:
+                        stream_response.close()
+                    except Exception:
+                        pass
 
     def _get_cached_tick_locked(self, symbol: str, max_age_sec: float) -> PriceTick | None:
         tick = self._tick_cache.get(symbol)
         if tick is None:
             return None
-        if max_age_sec > 0 and (time.time() - tick.timestamp) > max_age_sec:
+        freshness_ts = float(getattr(tick, "received_at", tick.timestamp) or tick.timestamp)
+        if max_age_sec > 0 and (time.time() - freshness_ts) > max_age_sec:
             return None
-        return tick
+        return self._clone_tick(tick)
+
+    @staticmethod
+    def _clone_tick(tick: PriceTick) -> PriceTick:
+        volume = float(tick.volume) if tick.volume is not None else None
+        received_at = getattr(tick, "received_at", None)
+        return PriceTick(
+            symbol=str(tick.symbol),
+            bid=float(tick.bid),
+            ask=float(tick.ask),
+            timestamp=float(tick.timestamp),
+            volume=volume,
+            received_at=(float(received_at) if received_at is not None else None),
+        )
 
     @staticmethod
     def _is_allowance_error_text(text: str) -> bool:
@@ -4249,7 +7213,7 @@ class IgApiClient(BaseBrokerClient):
                 float(self._rest_market_min_interval_max_sec),
                 max(previous + 0.2, previous * 1.4),
             )
-            if target <= (previous + 1e-9):
+            if target <= (previous + FLOAT_COMPARISON_TOLERANCE):
                 return
             self.rest_market_min_interval_sec = target
         logger.warning(
@@ -4325,6 +7289,8 @@ class IgApiClient(BaseBrokerClient):
             self._connected = False
             self._cst = None
             self._security_token = None
+            self._connectivity_status_cache = None
+            self._connectivity_status_cache_ts = 0.0
 
     def connect(self) -> None:
         # Ensure login starts from a clean auth state.
@@ -4477,33 +7443,52 @@ class IgApiClient(BaseBrokerClient):
                 time.sleep(max(0.1, delay_sec))
 
     def close(self) -> None:
+        stream_thread_to_join: threading.Thread | None = None
+        request_threads_to_join: list[threading.Thread] = []
         with self._lock:
-            self._stop_stream_thread_locked()
+            stream_thread_to_join = self._stop_stream_thread_locked()
 
-        with self._lock:
-            was_connected = self._connected
+        if stream_thread_to_join is not None and stream_thread_to_join.is_alive():
+            stream_thread_to_join.join(timeout=2.0)
+
         try:
-            if was_connected:
+            if self._connected:
                 self._request("DELETE", "/session", version="1", auth=True)
         except Exception:
             pass
         finally:
             with self._lock:
+                request_threads_to_join = self._stop_request_workers_locked()
                 self._connected = False
                 self._cst = None
                 self._security_token = None
                 self._tick_cache.clear()
                 self._last_tick_by_symbol.clear()
                 self._stream_desired_subscriptions.clear()
-                self._stream_subscriptions.clear()
                 self._stream_last_error = None
                 self._stream_endpoint = None
                 self._account_snapshot_cache = None
                 self._account_snapshot_cached_at = 0.0
+                self._connectivity_status_cache = None
+                self._connectivity_status_cache_ts = 0.0
                 self._position_open_sync.clear()
                 self._position_close_sync.clear()
                 self._epic_unavailable_until_ts_by_symbol.clear()
                 self._last_stream_rest_fallback_ts_by_symbol.clear()
+                self._request_worker_thread_ids.clear()
+                self._historical_http_cache.clear()
+                self._stream_sdk_client = None
+                self._stream_sdk_client_listener = None
+                self._stream_sdk_subscriptions.clear()
+                self._stream_sdk_subscription_listeners.clear()
+                self._stream_sdk_pending_subscriptions.clear()
+                self._stream_sdk_connected = False
+                self._stream_sdk_status = None
+                self._stream_tick_handler = None
+
+        for thread in request_threads_to_join:
+            if thread.is_alive():
+                thread.join(timeout=2.0)
 
     def _get_price_rest(self, symbol: str) -> PriceTick:
         upper = symbol.upper()
@@ -4566,10 +7551,59 @@ class IgApiClient(BaseBrokerClient):
             if tick is None:
                 raise last_missing_quote_error
 
+        tick_for_cache = self._clone_tick(tick)
         with self._lock:
-            self._tick_cache[upper] = tick
-            self._last_tick_by_symbol[upper] = tick.timestamp
-        return tick
+            self._tick_cache[upper] = tick_for_cache
+            self._last_tick_by_symbol[upper] = tick_for_cache.timestamp
+        return self._clone_tick(tick_for_cache)
+
+    def get_price_stream_only(self, symbol: str, wait_timeout_sec: float = 0.0) -> PriceTick | None:
+        upper = symbol.upper()
+        with self._lock:
+            stream_enabled = self._stream_enabled
+            fresh_tick_max_age_sec = max(0.5, float(self.stream_tick_max_age_sec))
+        if not stream_enabled:
+            return None
+
+        self._ensure_stream_subscription(upper)
+        wait_timeout = min(1.0, self.timeout_sec, max(0.0, float(wait_timeout_sec)))
+        deadline = time.time() + wait_timeout
+        stream_alive = False
+
+        while True:
+            with self._lock:
+                cached = self._get_cached_tick_locked(upper, self.stream_tick_max_age_sec)
+                stream_alive = bool(self._stream_session_id)
+                stream_quote_stagnant = (
+                    cached is not None and self._is_stream_quote_stagnant_locked(upper, time.time())
+                )
+            if cached is not None:
+                if not stream_quote_stagnant:
+                    with self._lock:
+                        self._price_requests_total += 1
+                        self._stream_price_hits_total += 1
+                    return cached
+                break
+            if wait_timeout <= 0 or time.time() >= deadline:
+                break
+            if not stream_alive:
+                break
+            time.sleep(0.05)
+
+        if stream_alive:
+            with self._lock:
+                stale_cached = self._get_cached_tick_locked(upper, fresh_tick_max_age_sec)
+                stream_quote_stagnant = (
+                    stale_cached is not None and self._is_stream_quote_stagnant_locked(upper, time.time())
+                )
+            if stale_cached is not None:
+                if not stream_quote_stagnant:
+                    with self._lock:
+                        self._price_requests_total += 1
+                        self._stream_price_hits_total += 1
+                    return stale_cached
+
+        return None
 
     def get_price(self, symbol: str) -> PriceTick:
         upper = symbol.upper()
@@ -4577,6 +7611,7 @@ class IgApiClient(BaseBrokerClient):
             self._price_requests_total += 1
             stream_enabled = self._stream_enabled
             stale_tick_max_age_sec = self._stream_stale_tick_max_age_sec
+            fresh_tick_max_age_sec = max(0.5, float(self.stream_tick_max_age_sec))
         if stream_enabled:
             self._ensure_stream_subscription(upper)
 
@@ -4585,21 +7620,43 @@ class IgApiClient(BaseBrokerClient):
             while time.time() < deadline:
                 with self._lock:
                     cached = self._get_cached_tick_locked(upper, self.stream_tick_max_age_sec)
-                    stream_alive = self._stream_connected
+                    stream_alive = bool(self._stream_session_id)
+                    stream_quote_stagnant = (
+                        cached is not None and self._is_stream_quote_stagnant_locked(upper, time.time())
+                    )
                 if cached is not None:
-                    with self._lock:
-                        self._stream_price_hits_total += 1
-                    return cached
+                    if not stream_quote_stagnant:
+                        with self._lock:
+                            self._stream_price_hits_total += 1
+                        return cached
+                    break
                 if not stream_alive:
                     break
                 time.sleep(0.05)
             if stream_alive:
                 with self._lock:
-                    stale_cached = self._get_cached_tick_locked(upper, stale_tick_max_age_sec)
+                    stale_cached = self._get_cached_tick_locked(upper, fresh_tick_max_age_sec)
+                    stream_quote_stagnant = (
+                        stale_cached is not None and self._is_stream_quote_stagnant_locked(upper, time.time())
+                    )
                 if stale_cached is not None:
-                    with self._lock:
-                        self._stream_price_hits_total += 1
-                    return stale_cached
+                    if not stream_quote_stagnant:
+                        with self._lock:
+                            self._stream_price_hits_total += 1
+                        return stale_cached
+
+            blocked_remaining = self._stream_rest_fallback_block_remaining(upper)
+            if blocked_remaining > 0:
+                with self._lock:
+                    cached = self._get_cached_tick_locked(upper, max_age_sec=stale_tick_max_age_sec)
+                if cached is not None:
+                    return cached
+                block_reason = self._stream_rest_fallback_block_reason(upper) or "stream_subscription_unavailable"
+                raise BrokerError(
+                    "IG stream subscription unavailable for "
+                    f"{upper}; REST fallback disabled ({blocked_remaining:.1f}s remaining) "
+                    f"| reason={block_reason}"
+                )
 
         cooldown_remaining = self._allowance_cooldown_remaining_for_market_data()
         if cooldown_remaining > 0:
@@ -4614,7 +7671,7 @@ class IgApiClient(BaseBrokerClient):
 
         if stream_enabled:
             with self._lock:
-                stream_alive = self._stream_connected
+                stream_alive = bool(self._stream_session_id)
                 throttle_sec = float(self._stream_rest_fallback_min_interval_sec)
                 last_stream_rest_ts = float(self._last_stream_rest_fallback_ts_by_symbol.get(upper, 0.0))
             if stream_alive and throttle_sec > 0:
@@ -4622,15 +7679,20 @@ class IgApiClient(BaseBrokerClient):
                 throttle_remaining = throttle_sec - since_last_rest
                 if throttle_remaining > 0:
                     with self._lock:
-                        cached = self._get_cached_tick_locked(upper, max_age_sec=stale_tick_max_age_sec)
+                        cached = self._get_cached_tick_locked(upper, max_age_sec=fresh_tick_max_age_sec)
+                        stream_quote_stagnant = (
+                            cached is not None and self._is_stream_quote_stagnant_locked(upper, time.time())
+                        )
                     if cached is not None:
-                        return cached
+                        if not stream_quote_stagnant:
+                            return cached
 
         interval = _as_float(self.rest_market_min_interval_sec, 0.0)
         if not math.isfinite(interval) or interval <= 0:
             interval = 0.0
         if interval > 0:
             while True:
+                cached_stream_quote_stagnant = False
                 with self._lock:
                     now_mono = time.monotonic()
                     now_wall = time.time()
@@ -4647,16 +7709,19 @@ class IgApiClient(BaseBrokerClient):
                         if stream_enabled:
                             self._last_stream_rest_fallback_ts_by_symbol[upper] = now_wall
                         break
-                with self._lock:
                     if stream_enabled:
-                        cached = self._get_cached_tick_locked(upper, max_age_sec=stale_tick_max_age_sec)
+                        cached = self._get_cached_tick_locked(upper, max_age_sec=fresh_tick_max_age_sec)
+                        cached_stream_quote_stagnant = (
+                            cached is not None and self._is_stream_quote_stagnant_locked(upper, now_wall)
+                        )
                     else:
                         cached = self._get_cached_tick_locked(
                             upper,
                             max_age_sec=max(1.0, self.stream_tick_max_age_sec),
                         )
                 if cached is not None:
-                    return cached
+                    if not cached_stream_quote_stagnant:
+                        return cached
                 time.sleep(min(wait_sec, 0.2))
         elif stream_enabled:
             with self._lock:
@@ -4678,12 +7743,12 @@ class IgApiClient(BaseBrokerClient):
             self._rest_fallback_hits_total += 1
         return tick
 
-    def get_symbol_spec(self, symbol: str) -> SymbolSpec:
+    def get_symbol_spec(self, symbol: str, *, force_refresh: bool = False) -> SymbolSpec:
         upper = symbol.upper()
         cached: SymbolSpec | None = None
         with self._lock:
             cached = self._symbol_spec_cache.get(upper)
-        if cached is not None:
+        if cached is not None and not force_refresh:
             metadata = cached.metadata if isinstance(cached.metadata, dict) else {}
             origin = str(metadata.get("spec_origin") or "").strip().lower()
             is_allowance_fallback = origin.startswith("critical_fallback")
@@ -4707,8 +7772,7 @@ class IgApiClient(BaseBrokerClient):
             fallback_metadata["spec_origin"] = "critical_fallback_allowance"
             fallback_metadata["allowance_cooldown_remaining_sec"] = round(cooldown_remaining, 2)
             fallback_spec.metadata = fallback_metadata
-            with self._lock:
-                self._symbol_spec_cache[upper] = fallback_spec
+            self._cache_symbol_spec_entry(upper, fallback_spec, promote_symbol_cache=True)
             logger.warning(
                 "IG symbol spec fallback activated for %s during allowance cooldown (%.1fs remaining)",
                 upper,
@@ -4727,6 +7791,132 @@ class IgApiClient(BaseBrokerClient):
             self._maybe_start_allowance_cooldown(text, "symbol spec")
             raise
         return self._build_symbol_spec_from_market_details(symbol, epic, body, cache_symbol=True)
+
+    def get_symbol_spec_for_epic(
+        self,
+        symbol: str,
+        epic: str,
+        *,
+        force_refresh: bool = False,
+    ) -> SymbolSpec:
+        upper = str(symbol).upper().strip()
+        normalized_epic = str(epic).strip().upper()
+        if not upper or not normalized_epic:
+            return self.get_symbol_spec(symbol, force_refresh=force_refresh)
+
+        cached = self._get_cached_symbol_spec_for_epic(upper, normalized_epic)
+        if cached is not None and not force_refresh:
+            metadata = cached.metadata if isinstance(cached.metadata, dict) else {}
+            origin = str(metadata.get("spec_origin") or "").strip().lower()
+            is_allowance_fallback = origin.startswith("critical_fallback")
+            if not is_allowance_fallback:
+                return cached
+            if self._allowance_cooldown_remaining_for_market_data() > 0:
+                return cached
+
+        cooldown_remaining = self._allowance_cooldown_remaining_for_market_data()
+        if cooldown_remaining > 0:
+            if cached is not None:
+                cached_metadata = dict(cached.metadata) if isinstance(cached.metadata, dict) else {}
+                cached_metadata["allowance_cooldown_remaining_sec"] = round(cooldown_remaining, 2)
+                cached.metadata = cached_metadata
+                self._cache_symbol_spec_entry(upper, cached, promote_symbol_cache=True)
+                return cached
+            fallback_spec = self._build_fallback_symbol_spec_for_epic(upper, normalized_epic)
+            fallback_metadata = (
+                dict(fallback_spec.metadata)
+                if isinstance(fallback_spec.metadata, dict)
+                else {}
+            )
+            fallback_metadata["spec_origin"] = "critical_fallback_allowance_epic_override"
+            fallback_metadata["allowance_cooldown_remaining_sec"] = round(cooldown_remaining, 2)
+            fallback_spec.metadata = fallback_metadata
+            self._cache_symbol_spec_entry(upper, fallback_spec, promote_symbol_cache=True)
+            return fallback_spec
+
+        if _as_float(self.rest_market_min_interval_sec, 0.0) > 0:
+            self._wait_for_market_rest_slot()
+
+        try:
+            spec = self._get_symbol_spec_for_epic(upper, normalized_epic)
+            self._activate_epic(upper, normalized_epic)
+            self._cache_symbol_spec_entry(upper, spec, promote_symbol_cache=True)
+            self._reset_allowance_cooldown()
+            return spec
+        except BrokerError as exc:
+            text = str(exc)
+            self._maybe_start_allowance_cooldown(text, "symbol spec epic override")
+            raise
+
+    def get_symbol_spec_candidates_for_entry(
+        self,
+        symbol: str,
+        *,
+        force_refresh: bool = False,
+    ) -> list[SymbolSpec]:
+        upper = str(symbol).upper().strip()
+        if not upper:
+            return []
+
+        cooldown_remaining = self._allowance_cooldown_remaining_for_market_data()
+        if cooldown_remaining > 0:
+            specs: list[SymbolSpec] = []
+            for epic in self._epic_attempt_order(upper):
+                cached = self._get_cached_symbol_spec_for_epic(upper, epic)
+                if cached is not None:
+                    specs.append(cached)
+            if specs:
+                return specs
+            cached = self._get_cached_symbol_spec(upper)
+            if cached is not None:
+                return [cached]
+            try:
+                return [self.get_symbol_spec(symbol)]
+            except BrokerError:
+                return []
+
+        specs: list[SymbolSpec] = []
+        seen_epics: set[str] = set()
+
+        for epic in self._epic_attempt_order(upper):
+            normalized_epic = str(epic).strip().upper()
+            if not normalized_epic or normalized_epic in seen_epics:
+                continue
+            try:
+                cached = self._get_cached_symbol_spec_for_epic(upper, normalized_epic)
+                cached_metadata = (
+                    cached.metadata
+                    if isinstance(cached, SymbolSpec) and isinstance(cached.metadata, dict)
+                    else {}
+                )
+                cached_origin = str(cached_metadata.get("spec_origin") or "").strip().lower()
+                cached_is_allowance_fallback = cached_origin.startswith("critical_fallback")
+                if not force_refresh and cached is not None and not cached_is_allowance_fallback:
+                    spec = cached
+                else:
+                    if _as_float(self.rest_market_min_interval_sec, 0.0) > 0:
+                        self._wait_for_market_rest_slot()
+                    spec = self._get_symbol_spec_for_epic(upper, normalized_epic)
+                seen_epics.add(normalized_epic)
+                specs.append(spec)
+            except BrokerError as exc:
+                text = str(exc)
+                if self._is_epic_unavailable_error_text(text):
+                    continue
+                if self._is_instrument_invalid_error_text(text):
+                    self._mark_epic_temporarily_invalid(upper, normalized_epic, reason=text)
+                    continue
+                self._maybe_start_allowance_cooldown(text, "symbol spec candidates")
+                if specs:
+                    break
+                raise
+
+        if specs:
+            return specs
+        try:
+            return [self.get_symbol_spec(symbol)]
+        except BrokerError:
+            return []
 
     def get_account_snapshot(self) -> AccountSnapshot:
         now = time.time()
@@ -4814,33 +8004,144 @@ class IgApiClient(BaseBrokerClient):
         pong_timeout_sec: float,
     ) -> ConnectivityStatus:
         _ = pong_timeout_sec
-        if not self._connected:
-            return ConnectivityStatus(
+        now = time.time()
+        with self._lock:
+            connected = bool(self._connected)
+            cached = self._connectivity_status_cache
+            cached_ts = float(self._connectivity_status_cache_ts)
+
+        if not connected:
+            status = ConnectivityStatus(
                 healthy=False,
                 reason="broker_not_connected",
                 latency_ms=None,
                 pong_ok=False,
             )
+            with self._lock:
+                self._connectivity_status_cache = status
+                self._connectivity_status_cache_ts = now
+            return status
 
-        started = time.time()
-        try:
-            self._request("GET", "/session", version="1", auth=True)
-        except Exception as exc:
-            return ConnectivityStatus(
+        allowance_remaining = self._allowance_cooldown_remaining()
+        if allowance_remaining > 0.0:
+            status = ConnectivityStatus(
                 healthy=False,
-                reason=f"connectivity_check_failed:{exc}",
+                reason=(
+                    "connectivity_check_failed:"
+                    f"IG public API allowance cooldown is active ({allowance_remaining:.1f}s remaining)"
+                ),
                 latency_ms=None,
                 pong_ok=False,
             )
+            with self._lock:
+                self._connectivity_status_cache = status
+                self._connectivity_status_cache_ts = now
+            return status
+
+        if cached is not None:
+            ttl_sec = self._connectivity_status_cache_ttl_for_status(cached)
+            if ttl_sec > 0 and (now - cached_ts) <= ttl_sec:
+                return ConnectivityStatus(
+                    healthy=bool(cached.healthy),
+                    reason=str(cached.reason),
+                    latency_ms=cached.latency_ms,
+                    pong_ok=cached.pong_ok,
+                )
+
+        with self._connectivity_probe_lock:
+            now = time.time()
+            allowance_remaining = self._allowance_cooldown_remaining()
+            if allowance_remaining > 0.0:
+                status = ConnectivityStatus(
+                    healthy=False,
+                    reason=(
+                        "connectivity_check_failed:"
+                        f"IG public API allowance cooldown is active ({allowance_remaining:.1f}s remaining)"
+                    ),
+                    latency_ms=None,
+                    pong_ok=False,
+                )
+                with self._lock:
+                    self._connectivity_status_cache = status
+                    self._connectivity_status_cache_ts = now
+                return status
+
+            with self._lock:
+                cached = self._connectivity_status_cache
+                cached_ts = float(self._connectivity_status_cache_ts)
+            if cached is not None:
+                ttl_sec = self._connectivity_status_cache_ttl_for_status(cached)
+                if ttl_sec > 0 and (now - cached_ts) <= ttl_sec:
+                    return ConnectivityStatus(
+                        healthy=bool(cached.healthy),
+                        reason=str(cached.reason),
+                        latency_ms=cached.latency_ms,
+                        pong_ok=cached.pong_ok,
+                    )
+
+            started = now
+            try:
+                self._request("GET", "/session", version="1", auth=True)
+            except Exception as exc:
+                text = str(exc)
+                lowered = text.lower()
+                if self._is_allowance_error_text(text):
+                    cooldown_sec = self._start_allowance_cooldown(text, minimum_sec=30.0)
+                    with self._lock:
+                        self._allowance_last_scope = "connectivity"
+                    status = ConnectivityStatus(
+                        healthy=False,
+                        reason=(
+                            "connectivity_check_failed:"
+                            f"IG public API allowance cooldown is active ({cooldown_sec:.1f}s remaining)"
+                        ),
+                        latency_ms=None,
+                        pong_ok=False,
+                    )
+                elif "critical_trade_operation_active" in lowered:
+                    status = ConnectivityStatus(
+                        healthy=True,
+                        reason="critical_trade_operation_active",
+                        latency_ms=0.0,
+                        pong_ok=True,
+                    )
+                else:
+                    status = ConnectivityStatus(
+                        healthy=False,
+                        reason=f"connectivity_check_failed:{exc}",
+                        latency_ms=None,
+                        pong_ok=False,
+                    )
+                with self._lock:
+                    self._connectivity_status_cache = status
+                    self._connectivity_status_cache_ts = time.time()
+                return status
 
         latency_ms = (time.time() - started) * 1000.0
         healthy = latency_ms <= max_latency_ms
-        return ConnectivityStatus(
+        status = ConnectivityStatus(
             healthy=healthy,
             reason="ok" if healthy else "latency_too_high",
             latency_ms=latency_ms,
             pong_ok=True,
         )
+        with self._lock:
+            self._connectivity_status_cache = status
+            self._connectivity_status_cache_ts = time.time()
+        return status
+
+    def _connectivity_status_cache_ttl_for_status(self, status: ConnectivityStatus | None) -> float:
+        if status is None:
+            return 0.0
+        if bool(status.healthy):
+            return float(self._connectivity_status_cache_ttl_sec)
+        ttl_sec = float(self._connectivity_status_unhealthy_cache_ttl_sec)
+        reason = str(status.reason or "").lower()
+        if "request dispatch timeout" in reason:
+            # Dispatch queue saturation is shared across all workers. Keep the
+            # degraded result longer so many symbol workers do not stampede /session.
+            ttl_sec = max(ttl_sec, 15.0)
+        return ttl_sec
 
     def get_stream_health_status(
         self,
@@ -4859,23 +8160,42 @@ class IgApiClient(BaseBrokerClient):
         upper = symbol.upper() if symbol else None
 
         with self._lock:
+            stream_thread = self._stream_thread
             stream_enabled = self._stream_enabled
-            stream_connected = self._stream_connected
+            legacy_stream_connected = (
+                self._stream_session_id is not None
+                and stream_thread is not None
+                and stream_thread.is_alive()
+            )
+            sdk_stream_connected = bool(self._stream_use_sdk and self._stream_sdk_client and self._stream_sdk_connected)
+            stream_connected = legacy_stream_connected or sdk_stream_connected
 
             last_tick_age_sec: float | None = None
+            quote_stagnation_age_sec: float | None = None
             if upper:
                 tick = self._tick_cache.get(upper)
                 if tick is not None:
                     last_tick_age_sec = max(0.0, now - tick.timestamp)
+                changed_at = self._stream_last_quote_change_ts_by_symbol.get(upper)
+                if changed_at is not None:
+                    quote_stagnation_age_sec = max(0.0, now - changed_at)
+                symbol_subscription_active = upper in self._stream_symbol_to_table
             elif self._tick_cache:
-                freshest_ts = max(item.timestamp for item in self._tick_cache.values())
+                freshest_ts = max(
+                    float(getattr(item, "received_at", item.timestamp) or item.timestamp)
+                    for item in self._tick_cache.values()
+                )
                 last_tick_age_sec = max(0.0, now - freshest_ts)
+                symbol_subscription_active = False
+            else:
+                symbol_subscription_active = False
 
             next_retry_in_sec = None
+            if self._stream_next_retry_at is not None:
+                next_retry_in_sec = max(0.0, self._stream_next_retry_at - now)
 
-            desired_subscriptions_snapshot = frozenset(self._stream_desired_subscriptions)
-            desired_subscriptions = len(desired_subscriptions_snapshot)
-            active_subscriptions = len(self._stream_subscriptions)
+            desired_subscriptions = len(self._stream_desired_subscriptions)
+            active_subscriptions = len(self._stream_symbol_to_table)
             last_error = self._stream_last_error
             reconnect_attempts = self._stream_reconnect_attempts
             total_reconnects = self._stream_total_reconnects
@@ -4893,17 +8213,33 @@ class IgApiClient(BaseBrokerClient):
         if not stream_enabled:
             reason = "stream_disabled_rest_only"
         elif stream_connected:
-            if upper and upper in desired_subscriptions_snapshot:
-                if last_tick_age_sec is None:
+            if upper and upper in self._stream_desired_subscriptions:
+                if not symbol_subscription_active:
+                    if last_error and "subscription_failed:" in str(last_error):
+                        reason = f"stream_subscription_failed_rest_fallback:{last_error}"
+                    else:
+                        reason = "stream_subscription_pending_rest_fallback"
+                elif last_tick_age_sec is None:
                     reason = "stream_warmup_rest_fallback"
                 elif last_tick_age_sec > max(0.1, max_tick_age_sec):
                     reason = f"stream_tick_stale_rest_fallback:{last_tick_age_sec:.2f}s>{max_tick_age_sec:.2f}s"
+                elif (
+                    self._stream_stagnant_quote_max_age_sec > 0
+                    and quote_stagnation_age_sec is not None
+                    and quote_stagnation_age_sec > self._stream_stagnant_quote_max_age_sec
+                ):
+                    reason = (
+                        "stream_quote_stagnant_rest_fallback:"
+                        f"{quote_stagnation_age_sec:.2f}s>{self._stream_stagnant_quote_max_age_sec:.2f}s"
+                    )
                 else:
                     reason = "ok"
             else:
                 reason = "ok"
         else:
-            if not stream_endpoint_configured:
+            if self._stream_sdk_enabled and not self._stream_sdk_available:
+                reason = "lightstreamer_sdk_missing_rest_fallback"
+            elif not stream_endpoint_configured:
                 reason = "stream_endpoint_missing_rest_fallback"
             elif last_error:
                 reason = f"stream_disconnected_rest_fallback:{last_error}"
@@ -4973,22 +8309,9 @@ class IgApiClient(BaseBrokerClient):
         last_epic_unavailable: BrokerError | None = None
         last_rejected_error: BrokerError | None = None
         reference_spec = self._get_cached_symbol_spec(symbol)
-        trusted_reference_lot_min = self._trusted_cached_lot_min(reference_spec)
-        should_verify_cached_min = (
-            reference_spec is not None
-            and trusted_reference_lot_min is None
-            and (float(volume) + 1e-12) < float(reference_spec.lot_min)
-        )
-        allow_market_metadata_requests = (
-            cooldown_remaining <= 0.0
-            and (reference_spec is None or should_verify_cached_min)
-        )
+        allow_market_metadata_requests = cooldown_remaining <= 0.0
         if not allow_market_metadata_requests:
-            reason = (
-                f"allowance cooldown ({cooldown_remaining:.1f}s remaining)"
-                if cooldown_remaining > 0.0
-                else "cached symbol spec is available"
-            )
+            reason = f"allowance cooldown ({cooldown_remaining:.1f}s remaining)"
             logger.info(
                 "IG open_position using cached/fallback metadata for %s (%s)",
                 str(symbol).upper(),
@@ -4996,7 +8319,7 @@ class IgApiClient(BaseBrokerClient):
             )
 
         attempts = self._epic_attempt_order(symbol)
-        _deal_attempt_counter = 0
+        open_attempt_index = 0
         for epic in attempts:
             try:
                 candidate_spec, candidate_body = self._resolve_open_candidate_spec(
@@ -5018,7 +8341,15 @@ class IgApiClient(BaseBrokerClient):
                     candidate_spec,
                     origin="open_reference_seed",
                 )
-                trusted_reference_lot_min = self._trusted_cached_lot_min(reference_spec)
+            candidate_reference_spec = self._get_cached_symbol_spec_for_epic(symbol, epic)
+            if candidate_reference_spec is None and reference_spec is not None:
+                reference_metadata = (
+                    reference_spec.metadata
+                    if isinstance(reference_spec.metadata, dict)
+                    else {}
+                )
+                if str(reference_metadata.get("epic") or "").strip().upper() == str(epic).strip().upper():
+                    candidate_reference_spec = reference_spec
 
             currency_attempts = self._order_currency_attempts(
                 symbol,
@@ -5026,9 +8357,10 @@ class IgApiClient(BaseBrokerClient):
                 allow_account_refresh=False,
             )
             effective_lot_min = float(candidate_spec.lot_min)
+            trusted_reference_lot_min = self._trusted_cached_lot_min(candidate_reference_spec)
             if trusted_reference_lot_min is not None:
                 effective_lot_min = max(effective_lot_min, trusted_reference_lot_min)
-            if float(volume) + 1e-12 < effective_lot_min:
+            if float(volume) + FLOAT_ROUNDING_TOLERANCE < effective_lot_min:
                 self._promote_symbol_lot_min_from_market_spec(
                     symbol=symbol,
                     epic=epic,
@@ -5052,9 +8384,26 @@ class IgApiClient(BaseBrokerClient):
                     effective_lot_min,
                 )
                 continue
+            candidate_volume = _normalize_volume_floor_for_spec(candidate_spec, float(volume))
+            if candidate_volume <= 0:
+                last_rejected_error = BrokerError(
+                    f"Requested size below broker minimum after step normalization for {str(symbol).upper()} "
+                    f"(requested={float(volume):g}, normalized={candidate_volume:g}, "
+                    f"min={effective_lot_min:g}, step={float(candidate_spec.lot_step):g}, epic={epic})"
+                )
+                logger.warning(
+                    "IG open_position skipping epic=%s for %s because normalized size %.6f is below broker minimum %.6f "
+                    "(requested=%.6f step=%.6f)",
+                    epic,
+                    str(symbol).upper(),
+                    candidate_volume,
+                    effective_lot_min,
+                    float(volume),
+                    float(candidate_spec.lot_step),
+                )
+                continue
             advance_epic = False
             for currency_code in currency_attempts:
-                _deal_attempt_counter += 1
                 candidate_entry, candidate_stop_loss, candidate_take_profit = self._remap_open_levels_for_candidate(
                     symbol=symbol,
                     side=side,
@@ -5077,61 +8426,59 @@ class IgApiClient(BaseBrokerClient):
                     spec=candidate_spec,
                     min_distance=min_stop_distance,
                 )
+                attempt_reference = _format_open_deal_reference_for_attempt(comment, open_attempt_index)
+                open_attempt_index += 1
                 payload = {
                     "epic": epic,
                     "expiry": "-",
                     "direction": direction,
-                    "size": float(volume),
-                    "orderType": "MARKET",
+                    "size": float(candidate_volume),
                     "timeInForce": "EXECUTE_AND_ELIMINATE",
                     "forceOpen": bool(self._open_force_open),
                     "guaranteedStop": bool(use_guaranteed_stop),
                     "currencyCode": currency_code,
                     "stopLevel": float(candidate_stop_loss),
                     "limitLevel": float(candidate_take_profit),
-                    "dealReference": _format_open_deal_reference(comment, attempt=_deal_attempt_counter),
+                    "dealReference": attempt_reference,
                 }
-                open_level = self._open_level_with_tolerance(
-                    side=side,
-                    entry=candidate_entry,
-                    spec=candidate_spec,
-                )
-                if open_level is not None:
-                    payload["level"] = float(open_level)
+                order_type = "MARKET"
                 if self._open_use_quote_id:
                     quote_id = self._extract_quote_id_from_market_body(candidate_body)
-                    if quote_id:
+                    open_level = self._open_level_with_tolerance(
+                        side=side,
+                        entry=candidate_entry,
+                        spec=candidate_spec,
+                    )
+                    if quote_id and open_level is not None:
+                        order_type = "QUOTE"
                         payload["quoteId"] = quote_id
+                        payload["level"] = float(open_level)
+                payload["orderType"] = order_type
                 try:
                     body, _ = self._request("POST", "/positions/otc", payload=payload, version="2", auth=True)
                 except BrokerError as exc:
                     error_text = str(exc)
                     if self._is_instrument_invalid_error_text(error_text):
                         self._mark_epic_temporarily_invalid(symbol, epic, reason=error_text)
-                    if "minimum_order_size_error" in error_text.lower():
+                    if self._is_minimum_order_size_error_text(error_text):
                         self._promote_symbol_lot_min_after_reject(
                             symbol=symbol,
                             epic=epic,
                             candidate_spec=candidate_spec,
-                            attempted_volume=float(volume),
-                            reason="MINIMUM_ORDER_SIZE_ERROR",
-                        )
-                    if "set increments" in error_text.lower() or "size increment" in error_text.lower():
-                        self._adapt_lot_step_after_increment_reject(
-                            symbol=symbol,
-                            epic=epic,
-                            candidate_spec=candidate_spec,
-                            attempted_volume=float(volume),
-                        )
-                        raise BrokerError(
-                            f"{error_text} | epic={epic} direction={direction} "
-                            f"size={float(volume):g} currency={currency_code} "
-                            f"(lot_step adapted, will retry next cycle)"
+                            attempted_volume=float(candidate_volume),
+                            reason="ORDER_SIZE_INCREMENT_ERROR"
+                            if (
+                                "set increments" in error_text.lower()
+                                or "invalid_size" in error_text.lower()
+                                or "invalid.size" in error_text.lower()
+                                or "invalid size" in error_text.lower()
+                            )
+                            else "MINIMUM_ORDER_SIZE_ERROR",
                         )
                     self._maybe_start_allowance_cooldown(error_text, "trade open")
                     contextual_error = BrokerError(
                         f"{error_text} | epic={epic} direction={direction} "
-                        f"size={float(volume):g} currency={currency_code} "
+                        f"size={float(candidate_volume):g} currency={currency_code} "
                         f"stop={float(candidate_stop_loss):g} limit={float(candidate_take_profit):g}"
                     )
                     if self._is_guaranteed_stop_required_text(error_text) and not use_guaranteed_stop:
@@ -5207,9 +8554,7 @@ class IgApiClient(BaseBrokerClient):
                             take_profit=float(candidate_take_profit),
                             epic=epic,
                         )
-                        sync_payload["_cache_ts"] = time.time()
-                        with self._lock:
-                            self._position_open_sync[position_id] = sync_payload
+                        self._cache_open_sync_payload(position_id, sync_payload)
                         return position_id
                     if status == "REJECTED":
                         self._maybe_start_allowance_cooldown(reason, "trade open confirm")
@@ -5219,7 +8564,7 @@ class IgApiClient(BaseBrokerClient):
                         reject_error = BrokerError(
                             "IG deal rejected: "
                             f"{reason or 'UNKNOWN'} | epic={epic} direction={direction} "
-                            f"size={float(volume):g} currency={currency_code} "
+                            f"size={float(candidate_volume):g} currency={currency_code} "
                             f"stop={float(candidate_stop_loss):g} limit={float(candidate_take_profit):g} "
                             f"confirm={confirm_summary}"
                         )
@@ -5227,16 +8572,9 @@ class IgApiClient(BaseBrokerClient):
                             symbol=symbol,
                             epic=epic,
                             candidate_spec=candidate_spec,
-                            attempted_volume=float(volume),
+                            attempted_volume=float(candidate_volume),
                             reason=reason,
                         )
-                        if reason == "DEAL_SIZE_INCREMENT_ERROR":
-                            self._adapt_lot_step_after_increment_reject(
-                                symbol=symbol,
-                                epic=epic,
-                                candidate_spec=candidate_spec,
-                                attempted_volume=float(volume),
-                            )
                         if self._is_guaranteed_stop_required_text(reason) and not use_guaranteed_stop:
                             self._mark_symbol_guaranteed_stop_required(symbol, source="open_confirm_reject")
                             last_rejected_error = reject_error
@@ -5274,7 +8612,7 @@ class IgApiClient(BaseBrokerClient):
                             recovered_open = self._recover_open_position_after_rejected_confirm(
                                 symbol=symbol,
                                 side=side,
-                                volume=float(volume),
+                                volume=float(candidate_volume),
                                 epic=epic,
                                 deal_reference=deal_reference,
                                 fallback_open_price=float(candidate_entry or entry_price or 0.0),
@@ -5298,9 +8636,7 @@ class IgApiClient(BaseBrokerClient):
                                     recovered_sync["source"] = str(
                                         recovered_open.get("source") or "ig_positions_after_rejected_confirm"
                                     )
-                                    recovered_sync["_cache_ts"] = time.time()
-                                    with self._lock:
-                                        self._position_open_sync[recovered_position_id] = recovered_sync
+                                    self._cache_open_sync_payload(recovered_position_id, recovered_sync)
                                     logger.warning(
                                         "IG open_position recovered accepted deal after rejected confirm for %s | "
                                         "epic=%s deal_reference=%s recovered_position_id=%s",
@@ -5313,22 +8649,18 @@ class IgApiClient(BaseBrokerClient):
                         raise reject_error
                     time.sleep(0.3)
                 else:
-                    if deal_reference:
-                        # Confirm endpoint can lag; preserve the candidate epic used for this accepted POST.
-                        self._activate_epic(symbol, epic)
-                        sync_payload = self._build_open_sync_payload(
-                            deal_reference,
-                            None,
-                            deal_reference=deal_reference,
-                            open_price=float(candidate_entry or entry_price or 0.0),
-                            stop_loss=float(candidate_stop_loss),
-                            take_profit=float(candidate_take_profit),
-                            epic=epic,
-                        )
-                        sync_payload["_cache_ts"] = time.time()
-                        with self._lock:
-                            self._position_open_sync[deal_reference] = sync_payload
-                    return deal_reference
+                    return self._recover_open_position_after_confirm_timeout(
+                        symbol=symbol,
+                        side=side,
+                        volume=float(candidate_volume),
+                        epic=epic,
+                        deal_reference=deal_reference,
+                        fallback_open_price=float(candidate_entry or entry_price or 0.0),
+                        fallback_stop_loss=float(candidate_stop_loss),
+                        fallback_take_profit=float(candidate_take_profit),
+                        direction=direction,
+                        currency_code=currency_code,
+                    )
                 if advance_epic:
                     break
 
@@ -5384,7 +8716,7 @@ class IgApiClient(BaseBrokerClient):
             effective_lot_min = float(candidate_spec.lot_min)
             if trusted_reference_lot_min is not None:
                 effective_lot_min = max(effective_lot_min, trusted_reference_lot_min)
-            if float(volume) + 1e-12 < effective_lot_min:
+            if float(volume) + FLOAT_ROUNDING_TOLERANCE < effective_lot_min:
                 self._promote_symbol_lot_min_from_market_spec(
                     symbol=symbol,
                     epic=epic,
@@ -5408,9 +8740,26 @@ class IgApiClient(BaseBrokerClient):
                     effective_lot_min,
                 )
                 continue
+            candidate_volume = _normalize_volume_floor_for_spec(candidate_spec, float(volume))
+            if candidate_volume <= 0:
+                last_rejected_error = BrokerError(
+                    f"Requested size below broker minimum after step normalization for {str(symbol).upper()} "
+                    f"(requested={float(volume):g}, normalized={candidate_volume:g}, "
+                    f"min={effective_lot_min:g}, step={float(candidate_spec.lot_step):g}, epic={epic})"
+                )
+                logger.warning(
+                    "IG open_position skipping auto-discovered epic=%s for %s because normalized size %.6f "
+                    "is below broker minimum %.6f (requested=%.6f step=%.6f)",
+                    epic,
+                    str(symbol).upper(),
+                    candidate_volume,
+                    effective_lot_min,
+                    float(volume),
+                    float(candidate_spec.lot_step),
+                )
+                continue
             advance_epic = False
             for currency_code in currency_attempts:
-                _deal_attempt_counter += 1
                 candidate_entry, candidate_stop_loss, candidate_take_profit = self._remap_open_levels_for_candidate(
                     symbol=symbol,
                     side=side,
@@ -5433,61 +8782,59 @@ class IgApiClient(BaseBrokerClient):
                     spec=candidate_spec,
                     min_distance=min_stop_distance,
                 )
+                attempt_reference = _format_open_deal_reference_for_attempt(comment, open_attempt_index)
+                open_attempt_index += 1
                 payload = {
                     "epic": epic,
                     "expiry": "-",
                     "direction": direction,
-                    "size": float(volume),
-                    "orderType": "MARKET",
+                    "size": float(candidate_volume),
                     "timeInForce": "EXECUTE_AND_ELIMINATE",
                     "forceOpen": bool(self._open_force_open),
                     "guaranteedStop": bool(use_guaranteed_stop),
                     "currencyCode": currency_code,
                     "stopLevel": float(candidate_stop_loss),
                     "limitLevel": float(candidate_take_profit),
-                    "dealReference": _format_open_deal_reference(comment, attempt=_deal_attempt_counter),
+                    "dealReference": attempt_reference,
                 }
-                open_level = self._open_level_with_tolerance(
-                    side=side,
-                    entry=candidate_entry,
-                    spec=candidate_spec,
-                )
-                if open_level is not None:
-                    payload["level"] = float(open_level)
+                order_type = "MARKET"
                 if self._open_use_quote_id:
                     quote_id = self._extract_quote_id_from_market_body(candidate_body)
-                    if quote_id:
+                    open_level = self._open_level_with_tolerance(
+                        side=side,
+                        entry=candidate_entry,
+                        spec=candidate_spec,
+                    )
+                    if quote_id and open_level is not None:
+                        order_type = "QUOTE"
                         payload["quoteId"] = quote_id
+                        payload["level"] = float(open_level)
+                payload["orderType"] = order_type
                 try:
                     body, _ = self._request("POST", "/positions/otc", payload=payload, version="2", auth=True)
                 except BrokerError as exc:
                     error_text = str(exc)
                     if self._is_instrument_invalid_error_text(error_text):
                         self._mark_epic_temporarily_invalid(symbol, epic, reason=error_text)
-                    if "minimum_order_size_error" in error_text.lower():
+                    if self._is_minimum_order_size_error_text(error_text):
                         self._promote_symbol_lot_min_after_reject(
                             symbol=symbol,
                             epic=epic,
                             candidate_spec=candidate_spec,
-                            attempted_volume=float(volume),
-                            reason="MINIMUM_ORDER_SIZE_ERROR",
-                        )
-                    if "set increments" in error_text.lower() or "size increment" in error_text.lower():
-                        self._adapt_lot_step_after_increment_reject(
-                            symbol=symbol,
-                            epic=epic,
-                            candidate_spec=candidate_spec,
-                            attempted_volume=float(volume),
-                        )
-                        raise BrokerError(
-                            f"{error_text} | epic={epic} direction={direction} "
-                            f"size={float(volume):g} currency={currency_code} "
-                            f"(lot_step adapted, will retry next cycle)"
+                            attempted_volume=float(candidate_volume),
+                            reason="ORDER_SIZE_INCREMENT_ERROR"
+                            if (
+                                "set increments" in error_text.lower()
+                                or "invalid_size" in error_text.lower()
+                                or "invalid.size" in error_text.lower()
+                                or "invalid size" in error_text.lower()
+                            )
+                            else "MINIMUM_ORDER_SIZE_ERROR",
                         )
                     self._maybe_start_allowance_cooldown(error_text, "trade open")
                     contextual_error = BrokerError(
                         f"{error_text} | epic={epic} direction={direction} "
-                        f"size={float(volume):g} currency={currency_code} "
+                        f"size={float(candidate_volume):g} currency={currency_code} "
                         f"stop={float(candidate_stop_loss):g} limit={float(candidate_take_profit):g}"
                     )
                     if self._is_guaranteed_stop_required_text(error_text) and not use_guaranteed_stop:
@@ -5569,9 +8916,7 @@ class IgApiClient(BaseBrokerClient):
                             take_profit=float(candidate_take_profit),
                             epic=epic,
                         )
-                        sync_payload["_cache_ts"] = time.time()
-                        with self._lock:
-                            self._position_open_sync[position_id] = sync_payload
+                        self._cache_open_sync_payload(position_id, sync_payload)
                         return position_id
                     if status == "REJECTED":
                         self._maybe_start_allowance_cooldown(reason, "trade open confirm")
@@ -5581,7 +8926,7 @@ class IgApiClient(BaseBrokerClient):
                         reject_error = BrokerError(
                             "IG deal rejected: "
                             f"{reason or 'UNKNOWN'} | epic={epic} direction={direction} "
-                            f"size={float(volume):g} currency={currency_code} "
+                            f"size={float(candidate_volume):g} currency={currency_code} "
                             f"stop={float(candidate_stop_loss):g} limit={float(candidate_take_profit):g} "
                             f"confirm={confirm_summary}"
                         )
@@ -5589,16 +8934,9 @@ class IgApiClient(BaseBrokerClient):
                             symbol=symbol,
                             epic=epic,
                             candidate_spec=candidate_spec,
-                            attempted_volume=float(volume),
+                            attempted_volume=float(candidate_volume),
                             reason=reason,
                         )
-                        if reason == "DEAL_SIZE_INCREMENT_ERROR":
-                            self._adapt_lot_step_after_increment_reject(
-                                symbol=symbol,
-                                epic=epic,
-                                candidate_spec=candidate_spec,
-                                attempted_volume=float(volume),
-                            )
                         if self._is_guaranteed_stop_required_text(reason) and not use_guaranteed_stop:
                             self._mark_symbol_guaranteed_stop_required(symbol, source="open_confirm_reject")
                             last_rejected_error = reject_error
@@ -5636,7 +8974,7 @@ class IgApiClient(BaseBrokerClient):
                             recovered_open = self._recover_open_position_after_rejected_confirm(
                                 symbol=symbol,
                                 side=side,
-                                volume=float(volume),
+                                volume=float(candidate_volume),
                                 epic=epic,
                                 deal_reference=deal_reference,
                                 fallback_open_price=float(candidate_entry or entry_price or 0.0),
@@ -5668,34 +9006,24 @@ class IgApiClient(BaseBrokerClient):
                                     recovered_sync["source"] = str(
                                         recovered_open.get("source") or "ig_positions_after_rejected_confirm"
                                     )
-                                    recovered_sync["_cache_ts"] = time.time()
-                                    with self._lock:
-                                        self._position_open_sync[recovered_position_id] = recovered_sync
+                                    self._cache_open_sync_payload(recovered_position_id, recovered_sync)
                                     return recovered_position_id
                         raise reject_error
                     time.sleep(0.3)
                 else:
-                    if deal_reference:
-                        # Confirm endpoint can lag; preserve the candidate epic used for this accepted POST.
-                        self._activate_epic(symbol, epic)
-                        logger.warning(
-                            "IG open_position epic auto-discovered for %s: using %s",
-                            str(symbol).upper(),
-                            epic,
-                        )
-                        sync_payload = self._build_open_sync_payload(
-                            deal_reference,
-                            None,
-                            deal_reference=deal_reference,
-                            open_price=float(candidate_entry or entry_price or 0.0),
-                            stop_loss=float(candidate_stop_loss),
-                            take_profit=float(candidate_take_profit),
-                            epic=epic,
-                        )
-                        sync_payload["_cache_ts"] = time.time()
-                        with self._lock:
-                            self._position_open_sync[deal_reference] = sync_payload
-                    return deal_reference
+                    return self._recover_open_position_after_confirm_timeout(
+                        symbol=symbol,
+                        side=side,
+                        volume=float(candidate_volume),
+                        epic=epic,
+                        deal_reference=deal_reference,
+                        fallback_open_price=float(candidate_entry or entry_price or 0.0),
+                        fallback_stop_loss=float(candidate_stop_loss),
+                        fallback_take_profit=float(candidate_take_profit),
+                        direction=direction,
+                        currency_code=currency_code,
+                        auto_discovered=True,
+                    )
                 if advance_epic:
                     break
 
@@ -5709,17 +9037,15 @@ class IgApiClient(BaseBrokerClient):
         symbol = str(position.symbol).upper().strip()
         with self._critical_trade_operation(f"close_position:{symbol}"):
             direction = "SELL" if position.side == Side.BUY else "BUY"
+            deal_id = str(position.position_id or "").strip()
+            if not deal_id:
+                raise BrokerError("close position requires non-empty dealId")
             close_volume = float(position.volume if volume is None else volume)
             if not math.isfinite(close_volume) or close_volume <= 0:
                 raise BrokerError("close volume must be positive")
-            if close_volume - float(position.volume) > 1e-9:
+            if close_volume - float(position.volume) > FLOAT_COMPARISON_TOLERANCE:
                 raise BrokerError(
                     f"close volume exceeds open position volume (requested={close_volume:g}, open={float(position.volume):g})"
-                )
-            deal_id = str(position.position_id or "").strip()
-            if not deal_id:
-                raise BrokerError(
-                    f"cannot close position: dealId is empty (symbol={symbol}, side={position.side})"
                 )
             payload = {
                 "dealId": deal_id,
@@ -5728,18 +9054,59 @@ class IgApiClient(BaseBrokerClient):
                 "orderType": "MARKET",
                 "timeInForce": "EXECUTE_AND_ELIMINATE",
             }
-            logger.info(
-                "IG close_position request | symbol=%s payload=%s",
-                symbol,
-                json.dumps(payload),
-            )
-            body, _ = self._request(
-                "DELETE",
-                "/positions/otc",
-                payload=payload,
-                version="1",
-                auth=True,
-            )
+            payload_without_tif = {
+                "dealId": deal_id,
+                "direction": direction,
+                "size": close_volume,
+                "orderType": "MARKET",
+            }
+            retry_payload = {
+                "dealId": deal_id,
+                "direction": direction,
+                "size": close_volume,
+            }
+            override_headers = {
+                "_method": "DELETE",
+                "X-HTTP-Method-Override": "DELETE",
+            }
+
+            # IG FAQ explicitly recommends POST + _method: DELETE when DELETE payloads are not
+            # reliably forwarded by the client stack or intermediate proxies.
+            attempts: list[tuple[str, dict[str, Any], dict[str, str] | None, dict[str, Any] | None]] = [
+                ("POST", payload, override_headers, {"_method": "DELETE"}),
+                ("POST", payload_without_tif, override_headers, {"_method": "DELETE"}),
+                ("POST", retry_payload, override_headers, {"_method": "DELETE"}),
+                ("DELETE", payload, None, None),
+                ("DELETE", payload_without_tif, None, None),
+                ("DELETE", retry_payload, None, None),
+            ]
+
+            body: dict[str, Any] | None = None
+            last_close_error: BrokerError | None = None
+            for method_name, attempt_payload, attempt_headers, attempt_query in attempts:
+                try:
+                    body, _ = self._request(
+                        method_name,
+                        "/positions/otc",
+                        payload=attempt_payload,
+                        version="1",
+                        auth=True,
+                        extra_headers=attempt_headers,
+                        query=attempt_query,
+                    )
+                    break
+                except BrokerError as exc:
+                    last_close_error = exc
+                    if not self._is_retryable_close_request_error_text(str(exc)):
+                        raise
+                    continue
+            if body is None:
+                if last_close_error is not None:
+                    raise last_close_error
+                raise BrokerError(
+                    "IG close position failed: no close request attempts were executed "
+                    f"(position_id={position.position_id})"
+                )
             deal_reference = str(body.get("dealReference") or "").strip()
             if not deal_reference:
                 raise BrokerError(
@@ -5766,7 +9133,7 @@ class IgApiClient(BaseBrokerClient):
 
             sync_payload = self._extract_close_sync_from_confirm(position.position_id, confirm)
             sync_payload["closed_volume"] = close_volume
-            sync_payload["close_complete"] = close_volume >= (float(position.volume) - 1e-9)
+            sync_payload["close_complete"] = close_volume >= (float(position.volume) - FLOAT_COMPARISON_TOLERANCE)
             sync_payload["_cache_ts"] = time.time()
             with self._lock:
                 self._position_close_sync[str(position.position_id)] = sync_payload

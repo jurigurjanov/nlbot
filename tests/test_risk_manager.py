@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 
 import pytest
@@ -84,6 +85,37 @@ def test_trade_blocked_when_volume_below_instrument_min(store):
     assert decision.allowed is False
     assert decision.suggested_volume == 0.0
     assert "below instrument minimum" in decision.reason
+    assert "min_lot_risk_pct=" in decision.reason
+
+
+def test_drawdown_limit_multiplier_handles_near_zero_span_without_division_error(store):
+    cfg = RiskConfig(drawdown_risk_throttle_min_multiplier=0.25)
+    manager = RiskManager(cfg, store)
+
+    multiplier, trigger = manager._drawdown_limit_multiplier(
+        drawdown_pct=1e-12,
+        max_drawdown_pct=1e-12,
+        start_ratio=0.999999,
+    )
+
+    assert trigger >= 0.0
+    assert multiplier == pytest.approx(0.25)
+
+
+def test_floor_volume_to_step_accepts_float_lot_precision(store):
+    manager = RiskManager(RiskConfig(), store)
+    spec = SymbolSpec(
+        symbol="EURUSD",
+        tick_size=0.0001,
+        tick_value=10.0,
+        contract_size=100_000.0,
+        lot_min=0.01,
+        lot_max=100.0,
+        lot_step=0.01,
+        lot_precision=2.0,  # type: ignore[arg-type]
+    )
+
+    assert manager._floor_volume_to_step(0.257, spec) == pytest.approx(0.25)
 
 
 def test_volume_uses_balance_as_risk_base(store):
@@ -120,6 +152,67 @@ def test_volume_uses_balance_as_risk_base(store):
 
     assert decision.allowed is True
     assert decision.suggested_volume == pytest.approx(0.20)
+
+
+def test_volume_sizing_uses_pip_distance_for_five_digit_fx_quotes(store):
+    cfg = RiskConfig(max_risk_per_trade_pct=1.0, min_stop_loss_pips=10)
+    manager = RiskManager(cfg, store)
+
+    snapshot = AccountSnapshot(balance=10_000, equity=10_000, margin_free=10_000, timestamp=1.0)
+    spec = SymbolSpec(
+        symbol="EURUSD",
+        tick_size=0.00001,
+        tick_value=1.0,
+        contract_size=100_000.0,
+        lot_min=0.01,
+        lot_max=100.0,
+        lot_step=0.01,
+        price_precision=5,
+        lot_precision=2,
+    )
+
+    decision = manager.can_open_trade(
+        snapshot=snapshot,
+        symbol="EURUSD",
+        open_positions_count=0,
+        entry=1.10000,
+        stop_loss=1.09999,
+        symbol_spec=spec,
+    )
+
+    assert decision.allowed is True
+    assert decision.suggested_volume == pytest.approx(1.0)
+
+
+def test_estimate_volume_uses_pip_distance_for_fx_spread(store):
+    cfg = RiskConfig(max_risk_per_trade_pct=1.0, min_stop_loss_pips=1, spread_risk_weight=1.0)
+    manager = RiskManager(cfg, store)
+    spec = SymbolSpec(
+        symbol="EURUSD",
+        tick_size=0.00001,
+        tick_value=1.0,
+        contract_size=100_000.0,
+        lot_min=0.01,
+        lot_max=100.0,
+        lot_step=0.01,
+        price_precision=5,
+        lot_precision=2,
+    )
+
+    volume, diagnostics = manager._estimate_volume(
+        capital_base=100.0,
+        entry=1.10000,
+        stop_loss=1.09999,
+        symbol_spec=spec,
+        current_spread_pips=2.0,
+        risk_pct=1.0,
+    )
+
+    assert diagnostics["pip_size"] == pytest.approx(0.0001)
+    assert diagnostics["min_distance"] == pytest.approx(0.0001)
+    assert diagnostics["spread_distance"] == pytest.approx(0.0002)
+    assert diagnostics["effective_distance"] == pytest.approx(0.00021)
+    assert volume == pytest.approx(0.04)
 
 
 def test_volume_sizing_accounts_for_current_spread(store):
@@ -164,7 +257,136 @@ def test_volume_sizing_accounts_for_current_spread(store):
     assert with_spread.suggested_volume == pytest.approx(20.0)
 
 
-def test_margin_precheck_blocks_when_free_margin_is_insufficient(store):
+def test_volume_sizing_uses_configurable_spread_risk_weight(store):
+    cfg = RiskConfig(max_risk_per_trade_pct=1.0, min_stop_loss_pips=1, spread_risk_weight=0.5)
+    manager = RiskManager(cfg, store)
+    snapshot = AccountSnapshot(balance=10_000, equity=10_000, margin_free=10_000, timestamp=1.0)
+    spec = SymbolSpec(
+        symbol="US500",
+        tick_size=1.0,
+        tick_value=1.0,
+        contract_size=1.0,
+        lot_min=0.01,
+        lot_max=100.0,
+        lot_step=0.01,
+        price_precision=1,
+        lot_precision=2,
+    )
+
+    decision = manager.can_open_trade(
+        snapshot=snapshot,
+        symbol="US500",
+        open_positions_count=0,
+        entry=100.0,
+        stop_loss=99.0,
+        symbol_spec=spec,
+        current_spread_pips=4.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.suggested_volume == pytest.approx(33.33)
+
+
+def test_symbol_spec_round_volume_floors_instead_of_rounding_up():
+    spec = SymbolSpec(
+        symbol="US100",
+        tick_size=1.0,
+        tick_value=1.0,
+        contract_size=1.0,
+        lot_min=0.1,
+        lot_max=100.0,
+        lot_step=0.1,
+        price_precision=1,
+        lot_precision=1,
+    )
+
+    assert spec.round_volume(0.26) == pytest.approx(0.2)
+    assert spec.round_volume(0.31) == pytest.approx(0.3)
+    assert spec.round_volume(0.09) == pytest.approx(0.0)
+
+
+def test_symbol_spec_round_volume_ignores_uninitialized_lot_max():
+    spec = SymbolSpec(
+        symbol="US100",
+        tick_size=1.0,
+        tick_value=1.0,
+        contract_size=1.0,
+        lot_min=0.1,
+        lot_max=0.0,
+        lot_step=0.1,
+        price_precision=1,
+        lot_precision=1,
+    )
+
+    assert math.isinf(spec.effective_lot_max())
+    assert spec.round_volume(0.26) == pytest.approx(0.2)
+
+
+def test_estimate_volume_never_rounds_up_past_raw_risk_limit(store):
+    cfg = RiskConfig(max_risk_per_trade_pct=1.0, min_stop_loss_pips=1)
+    manager = RiskManager(cfg, store)
+    spec = SymbolSpec(
+        symbol="US100",
+        tick_size=1.0,
+        tick_value=1.0,
+        contract_size=1.0,
+        lot_min=0.1,
+        lot_max=100.0,
+        lot_step=0.1,
+        price_precision=1,
+        lot_precision=1,
+    )
+
+    volume, diagnostics = manager._estimate_volume(
+        capital_base=100.0,
+        entry=100.0,
+        stop_loss=96.1538461538,
+        symbol_spec=spec,
+        risk_pct=1.0,
+    )
+
+    assert diagnostics["raw_volume"] == pytest.approx(0.26, abs=1e-6)
+    assert volume == pytest.approx(0.2)
+    assert float(diagnostics["rounded_volume"]) <= float(diagnostics["raw_volume"])
+
+
+def test_margin_downsize_ignores_uninitialized_lot_max(store):
+    cfg = RiskConfig(
+        max_risk_per_trade_pct=1.0,
+        min_stop_loss_pips=1,
+        margin_check_enabled=True,
+        margin_safety_buffer=1.0,
+        margin_fallback_leverage=20.0,
+    )
+    manager = RiskManager(cfg, store)
+    snapshot = AccountSnapshot(balance=10_000, equity=10_000, margin_free=26.0, timestamp=1.0)
+    spec = SymbolSpec(
+        symbol="US100",
+        tick_size=1.0,
+        tick_value=1.0,
+        contract_size=1.0,
+        lot_min=0.1,
+        lot_max=0.0,
+        lot_step=0.1,
+        price_precision=1,
+        lot_precision=1,
+        metadata={"leverage": 20.0},
+    )
+
+    decision = manager.can_open_trade(
+        snapshot=snapshot,
+        symbol="US100",
+        open_positions_count=0,
+        entry=100.0,
+        stop_loss=99.0,
+        symbol_spec=spec,
+    )
+
+    assert decision.allowed is True
+    assert decision.suggested_volume == pytest.approx(5.2)
+
+
+def test_margin_precheck_downsizes_when_free_margin_is_insufficient(store):
     cfg = RiskConfig(
         max_risk_per_trade_pct=1.0,
         min_stop_loss_pips=1,
@@ -195,12 +417,374 @@ def test_margin_precheck_blocks_when_free_margin_is_insufficient(store):
         symbol_spec=spec,
     )
 
+    assert decision.allowed is True
+    assert decision.suggested_volume == pytest.approx(17.39)
+
+
+def test_margin_estimate_uses_margin_price_scale_divisor_for_scaled_non_fx_quote(store):
+    cfg = RiskConfig(
+        max_risk_per_trade_pct=1.0,
+        min_stop_loss_pips=1,
+        margin_check_enabled=True,
+        margin_safety_buffer=1.0,
+    )
+    manager = RiskManager(cfg, store)
+    spec = SymbolSpec(
+        symbol="WTI",
+        tick_size=0.1,
+        tick_value=1.0,
+        contract_size=100.0,
+        lot_min=0.1,
+        lot_max=100.0,
+        lot_step=0.1,
+        price_precision=1,
+        lot_precision=1,
+        metadata={
+            "margin_factor": 10.0,
+            "margin_factor_unit": "PERCENTAGE",
+            "margin_price_scale_divisor": 10.0,
+        },
+    )
+
+    required_margin, source, diagnostics = manager._estimate_required_margin(
+        entry=969.6,
+        volume=1.0,
+        symbol_spec=spec,
+    )
+
+    assert required_margin == pytest.approx(969.6)
+    assert diagnostics["margin_entry"] == pytest.approx(96.96)
+    assert diagnostics["notional"] == pytest.approx(9696.0)
+    assert "margin_factor:10.0:PERCENTAGE" in source
+    assert "entry_scale:metadata:10" in source
+
+
+def test_margin_estimate_uses_broker_raw_contract_value_for_index_cfd(store):
+    cfg = RiskConfig(
+        max_risk_per_trade_pct=1.0,
+        min_stop_loss_pips=1,
+        margin_check_enabled=True,
+        margin_safety_buffer=1.0,
+    )
+    manager = RiskManager(cfg, store)
+    spec = SymbolSpec(
+        symbol="US500",
+        tick_size=1.0,
+        tick_value=250.0,
+        contract_size=250.0,
+        lot_min=1.0,
+        lot_max=100.0,
+        lot_step=1.0,
+        price_precision=1,
+        lot_precision=0,
+        metadata={
+            "margin_factor": 5.0,
+            "margin_factor_unit": "PERCENTAGE",
+            "margin_price_scale_divisor": 1.0,
+        },
+    )
+
+    required_margin, source, diagnostics = manager._estimate_required_margin(
+        entry=5_600.0,
+        volume=1.0,
+        symbol_spec=spec,
+    )
+
+    assert required_margin == pytest.approx(70_000.0)
+    assert diagnostics["margin_entry"] == pytest.approx(5_600.0)
+    assert diagnostics["notional"] == pytest.approx(1_400_000.0)
+    assert "margin_factor:5.0:PERCENTAGE" in source
+    assert "entry_scale" not in source
+
+
+def test_margin_estimate_infers_percent_for_unknown_unit_from_leverage(store):
+    cfg = RiskConfig(
+        max_risk_per_trade_pct=1.0,
+        min_stop_loss_pips=1,
+        margin_check_enabled=True,
+        margin_safety_buffer=1.0,
+        margin_fallback_leverage=20.0,
+    )
+    manager = RiskManager(cfg, store)
+    spec = SymbolSpec(
+        symbol="US100",
+        tick_size=1.0,
+        tick_value=1.0,
+        contract_size=1.0,
+        lot_min=0.01,
+        lot_max=100.0,
+        lot_step=0.01,
+        price_precision=1,
+        lot_precision=2,
+        metadata={
+            "margin_factor": 1.0,
+            "leverage": 100.0,
+        },
+    )
+
+    required_margin, source, diagnostics = manager._estimate_required_margin(
+        entry=100.0,
+        volume=1.0,
+        symbol_spec=spec,
+    )
+
+    assert required_margin == pytest.approx(1.0)
+    assert diagnostics["margin_ratio"] == pytest.approx(0.01)
+    assert diagnostics["effective_leverage"] == pytest.approx(100.0)
+    assert "margin_factor:1.0:UNKNOWN_INFERRED_PERCENTAGE_FROM_LEVERAGE:100" in source
+
+
+def test_margin_estimate_preserves_ratio_for_unknown_unit_when_leverage_matches(store):
+    cfg = RiskConfig(
+        max_risk_per_trade_pct=1.0,
+        min_stop_loss_pips=1,
+        margin_check_enabled=True,
+        margin_safety_buffer=1.0,
+        margin_fallback_leverage=20.0,
+    )
+    manager = RiskManager(cfg, store)
+    spec = SymbolSpec(
+        symbol="US100",
+        tick_size=1.0,
+        tick_value=1.0,
+        contract_size=1.0,
+        lot_min=0.01,
+        lot_max=100.0,
+        lot_step=0.01,
+        price_precision=1,
+        lot_precision=2,
+        metadata={
+            "margin_factor": 0.5,
+            "leverage": 2.0,
+        },
+    )
+
+    required_margin, source, diagnostics = manager._estimate_required_margin(
+        entry=100.0,
+        volume=1.0,
+        symbol_spec=spec,
+    )
+
+    assert required_margin == pytest.approx(50.0)
+    assert diagnostics["margin_ratio"] == pytest.approx(0.5)
+    assert diagnostics["effective_leverage"] == pytest.approx(2.0)
+    assert "margin_factor:0.5:UNKNOWN_INFERRED_RATIO_FROM_LEVERAGE:2" in source
+
+
+def test_margin_estimate_assumes_ig_unknown_unit_is_percentage(store):
+    cfg = RiskConfig(
+        max_risk_per_trade_pct=1.0,
+        min_stop_loss_pips=1,
+        margin_check_enabled=True,
+        margin_safety_buffer=1.0,
+        margin_fallback_leverage=20.0,
+    )
+    manager = RiskManager(cfg, store)
+    spec = SymbolSpec(
+        symbol="US100",
+        tick_size=1.0,
+        tick_value=1.0,
+        contract_size=1.0,
+        lot_min=0.01,
+        lot_max=100.0,
+        lot_step=0.01,
+        price_precision=1,
+        lot_precision=2,
+        metadata={
+            "broker": "ig",
+            "margin_factor": 1.0,
+            "leverage": 0.0,
+        },
+    )
+
+    required_margin, source, diagnostics = manager._estimate_required_margin(
+        entry=100.0,
+        volume=1.0,
+        symbol_spec=spec,
+    )
+
+    assert required_margin == pytest.approx(1.0)
+    assert diagnostics["margin_ratio"] == pytest.approx(0.01)
+    assert diagnostics["effective_leverage"] == pytest.approx(100.0)
+    assert "margin_factor:1.0:UNKNOWN_ASSUMED_PERCENTAGE_IG" in source
+
+
+def test_volume_sizing_uses_point_value_without_contract_division_for_non_fx(store):
+    cfg = RiskConfig(max_risk_per_trade_pct=1.0, min_stop_loss_pips=1, margin_check_enabled=False)
+    manager = RiskManager(cfg, store)
+
+    snapshot = AccountSnapshot(balance=10_000, equity=10_000, margin_free=10_000, timestamp=1.0)
+    spec = SymbolSpec(
+        symbol="WTI",
+        tick_size=0.1,
+        tick_value=1.0,
+        contract_size=100.0,
+        lot_min=0.1,
+        lot_max=100.0,
+        lot_step=0.1,
+        price_precision=1,
+        lot_precision=1,
+        metadata={"tick_value_kind": "point"},
+    )
+
+    decision = manager.can_open_trade(
+        snapshot=snapshot,
+        symbol="WTI",
+        open_positions_count=0,
+        entry=969.6,
+        stop_loss=968.6,
+        symbol_spec=spec,
+    )
+
+    assert decision.allowed is True
+    assert decision.suggested_volume == pytest.approx(10.0)
+
+
+def test_margin_level_blocks_trade_when_current_level_is_too_low(store):
+    cfg = RiskConfig(
+        max_risk_per_trade_pct=1.0,
+        min_stop_loss_pips=1,
+        margin_min_level_pct=200.0,
+    )
+    manager = RiskManager(cfg, store)
+    snapshot = AccountSnapshot(balance=10_000, equity=10_000, margin_free=900.0, timestamp=1.0)
+    spec = SymbolSpec(
+        symbol="US100",
+        tick_size=1.0,
+        tick_value=1.0,
+        contract_size=1.0,
+        lot_min=0.01,
+        lot_max=100.0,
+        lot_step=0.01,
+        price_precision=1,
+        lot_precision=2,
+        metadata={"leverage": 20.0},
+    )
+
+    decision = manager.can_open_trade(
+        snapshot=snapshot,
+        symbol="US100",
+        open_positions_count=1,
+        entry=100.0,
+        stop_loss=99.0,
+        symbol_spec=spec,
+    )
+
     assert decision.allowed is False
-    assert decision.suggested_volume == 0.0
-    assert "Insufficient free margin" in decision.reason
+    assert "Margin level below minimum" in decision.reason
 
 
-def test_margin_precheck_applies_configured_overhead_pct(store):
+def test_margin_level_blocks_trade_when_projected_level_would_be_too_low(store):
+    cfg = RiskConfig(
+        max_risk_per_trade_pct=1.0,
+        min_stop_loss_pips=1,
+        margin_check_enabled=True,
+        margin_safety_buffer=1.0,
+        margin_fallback_leverage=20.0,
+        margin_min_level_pct=200.0,
+    )
+    manager = RiskManager(cfg, store)
+    snapshot = AccountSnapshot(balance=10_000, equity=10_000, margin_free=5_200.0, timestamp=1.0)
+    spec = SymbolSpec(
+        symbol="US100",
+        tick_size=1.0,
+        tick_value=100.0,
+        contract_size=100.0,
+        lot_min=1.0,
+        lot_max=100.0,
+        lot_step=1.0,
+        price_precision=1,
+        lot_precision=0,
+        metadata={"leverage": 20.0},
+    )
+
+    decision = manager.can_open_trade(
+        snapshot=snapshot,
+        symbol="US100",
+        open_positions_count=1,
+        entry=50.0,
+        stop_loss=49.0,
+        symbol_spec=spec,
+    )
+
+    assert decision.allowed is False
+    assert "Margin-constrained maximum volume is below instrument minimum" in decision.reason
+
+
+def test_margin_precheck_downsizes_volume_to_fit_free_margin(store):
+    cfg = RiskConfig(
+        max_risk_per_trade_pct=1.0,
+        min_stop_loss_pips=1,
+        margin_check_enabled=True,
+        margin_safety_buffer=1.0,
+        margin_fallback_leverage=20.0,
+    )
+    manager = RiskManager(cfg, store)
+    snapshot = AccountSnapshot(balance=10_000, equity=10_000, margin_free=120.0, timestamp=1.0)
+    spec = SymbolSpec(
+        symbol="US100",
+        tick_size=1.0,
+        tick_value=1.0,
+        contract_size=1.0,
+        lot_min=0.1,
+        lot_max=100.0,
+        lot_step=0.1,
+        price_precision=1,
+        lot_precision=1,
+        metadata={"leverage": 20.0},
+    )
+
+    decision = manager.can_open_trade(
+        snapshot=snapshot,
+        symbol="US100",
+        open_positions_count=0,
+        entry=1_000.0,
+        stop_loss=999.0,
+        symbol_spec=spec,
+    )
+
+    assert decision.allowed is True
+    assert decision.suggested_volume == pytest.approx(2.4)
+
+
+def test_margin_precheck_downsizes_volume_to_fit_projected_margin_level(store):
+    cfg = RiskConfig(
+        max_risk_per_trade_pct=1.0,
+        min_stop_loss_pips=1,
+        margin_check_enabled=True,
+        margin_safety_buffer=1.0,
+        margin_fallback_leverage=20.0,
+        margin_min_level_pct=200.0,
+    )
+    manager = RiskManager(cfg, store)
+    snapshot = AccountSnapshot(balance=10_000, equity=10_000, margin_free=10_000.0, timestamp=1.0)
+    spec = SymbolSpec(
+        symbol="US100",
+        tick_size=1.0,
+        tick_value=1.0,
+        contract_size=1.0,
+        lot_min=0.1,
+        lot_max=100.0,
+        lot_step=0.1,
+        price_precision=1,
+        lot_precision=1,
+        metadata={"leverage": 20.0},
+    )
+
+    decision = manager.can_open_trade(
+        snapshot=snapshot,
+        symbol="US100",
+        open_positions_count=0,
+        entry=2_000.0,
+        stop_loss=1_999.0,
+        symbol_spec=spec,
+    )
+
+    assert decision.allowed is True
+    assert decision.suggested_volume == pytest.approx(50.0)
+
+
+def test_margin_precheck_downsizes_with_configured_overhead_pct(store):
     cfg = RiskConfig(
         max_risk_per_trade_pct=1.0,
         min_stop_loss_pips=1,
@@ -235,12 +819,11 @@ def test_margin_precheck_applies_configured_overhead_pct(store):
         symbol_spec=spec,
     )
 
-    assert decision.allowed is False
-    assert "Insufficient free margin" in decision.reason
-    assert "overhead_pct:10.00" in decision.reason
+    assert decision.allowed is True
+    assert decision.suggested_volume == pytest.approx(94.54)
 
 
-def test_margin_precheck_applies_holiday_multiplier(store, monkeypatch):
+def test_margin_precheck_downsizes_with_holiday_multiplier(store, monkeypatch):
     cfg = RiskConfig(
         max_risk_per_trade_pct=1.0,
         min_stop_loss_pips=1,
@@ -275,12 +858,11 @@ def test_margin_precheck_applies_holiday_multiplier(store, monkeypatch):
         symbol_spec=spec,
     )
 
-    assert decision.allowed is False
-    assert "Insufficient free margin" in decision.reason
-    assert "holiday_multiplier:1.20" in decision.reason
+    assert decision.allowed is True
+    assert decision.suggested_volume == pytest.approx(91.66)
 
 
-def test_margin_precheck_blocks_when_post_open_reserve_is_breached(store):
+def test_margin_precheck_downsizes_when_post_open_reserve_would_be_breached(store):
     cfg = RiskConfig(
         max_risk_per_trade_pct=1.0,
         min_stop_loss_pips=1,
@@ -304,7 +886,7 @@ def test_margin_precheck_blocks_when_post_open_reserve_is_breached(store):
         metadata={"leverage": 20.0},
     )
 
-    # Required margin: 50 -> free_after_open: 20, reserve: 25 -> must block.
+    # Required margin: 50 -> free_after_open: 20, reserve: 25 -> should downsize.
     decision = manager.can_open_trade(
         snapshot=snapshot,
         symbol="US100",
@@ -314,8 +896,8 @@ def test_margin_precheck_blocks_when_post_open_reserve_is_breached(store):
         symbol_spec=spec,
     )
 
-    assert decision.allowed is False
-    assert "Free margin reserve would be breached" in decision.reason
+    assert decision.allowed is True
+    assert decision.suggested_volume == pytest.approx(90.0)
 
 
 def test_margin_precheck_can_be_disabled(store):
@@ -427,7 +1009,7 @@ def test_margin_precheck_normalizes_scaled_ig_fx_quote_for_margin(store):
     assert decision.suggested_volume == pytest.approx(1.0)
 
 
-def test_margin_precheck_applies_account_currency_conversion_rate(store):
+def test_margin_precheck_downsizes_with_account_currency_conversion_rate(store):
     cfg = RiskConfig(
         max_risk_per_trade_pct=1.0,
         min_stop_loss_pips=1,
@@ -462,9 +1044,8 @@ def test_margin_precheck_applies_account_currency_conversion_rate(store):
         symbol_spec=spec,
     )
 
-    assert decision.allowed is False
-    assert "Insufficient free margin" in decision.reason
-    assert "conversion:account_currency_conversion_rate:1.2" in decision.reason
+    assert decision.allowed is True
+    assert decision.suggested_volume == pytest.approx(91.66)
 
 
 def test_margin_precheck_normalizes_scaled_fx_quote_without_broker_metadata(store):
@@ -617,6 +1198,55 @@ def test_daily_drawdown_lock_blocks_until_next_day(store, monkeypatch):
 
     release_events = [event for event in store.load_events() if event["message"] == "Daily drawdown lock released"]
     assert release_events
+
+
+def test_drawdown_risk_throttle_reduces_suggested_volume_before_hard_lock(store, monkeypatch):
+    cfg = RiskConfig(
+        start_balance=10_000,
+        max_risk_per_trade_pct=1.0,
+        max_daily_drawdown_pct=10.0,
+        max_total_drawdown_pct=20.0,
+        drawdown_risk_throttle_enabled=True,
+        drawdown_risk_throttle_daily_start_ratio=0.5,
+        drawdown_risk_throttle_total_start_ratio=0.5,
+        drawdown_risk_throttle_min_multiplier=0.5,
+        min_stop_loss_pips=10,
+    )
+    manager = RiskManager(cfg, store)
+    spec = SymbolSpec(
+        symbol="EURUSD",
+        tick_size=0.0001,
+        tick_value=10.0,
+        contract_size=100_000.0,
+        lot_min=0.01,
+        lot_max=100.0,
+        lot_step=0.01,
+        price_precision=5,
+        lot_precision=2,
+    )
+
+    monkeypatch.setattr(manager, "_current_day", lambda: "2026-02-26")
+    init_decision = manager.can_open_trade(
+        snapshot=AccountSnapshot(balance=10_000, equity=10_000, margin_free=10_000, timestamp=1.0),
+        symbol="EURUSD",
+        open_positions_count=0,
+        entry=1.1000,
+        stop_loss=1.0950,
+        symbol_spec=spec,
+    )
+    assert init_decision.allowed is True
+    assert init_decision.suggested_volume == pytest.approx(0.20)
+
+    throttled_decision = manager.can_open_trade(
+        snapshot=AccountSnapshot(balance=10_000, equity=9_250, margin_free=9_250, timestamp=2.0),
+        symbol="EURUSD",
+        open_positions_count=0,
+        entry=1.1000,
+        stop_loss=1.0950,
+        symbol_spec=spec,
+    )
+    assert throttled_decision.allowed is True
+    assert throttled_decision.suggested_volume == pytest.approx(0.13)
 
 
 def test_max_open_positions_emits_alert_once_while_limit_active(store):

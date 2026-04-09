@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
-from xtb_bot.config import ConfigError, load_config
+from xtb_bot.config import ConfigError, _parse_schedule_weekdays, load_config
 
 
 def _set_required_env(monkeypatch):
+    for key in list(os.environ):
+        if key == "BROKER" or key.startswith(("XTB_", "IG_", "BOT_")):
+            monkeypatch.delenv(key, raising=False)
+
     monkeypatch.setenv("BROKER", "xtb")
     monkeypatch.delenv("IG_BROKER", raising=False)
     monkeypatch.delenv("IG_IDENTIFIER", raising=False)
@@ -53,12 +59,20 @@ def test_config_accepts_positive_open_slot_lease_sec(monkeypatch):
     assert config.risk.open_slot_lease_sec == 45.0
 
 
-def test_config_rejects_tp_sl_ratio_below_two(monkeypatch):
+def test_config_rejects_tp_sl_ratio_below_one(monkeypatch):
     _set_required_env(monkeypatch)
-    monkeypatch.setenv("XTB_MIN_TP_SL_RATIO", "1.9")
+    monkeypatch.setenv("XTB_MIN_TP_SL_RATIO", "0.9")
 
     with pytest.raises(ConfigError, match="min_tp_sl_ratio"):
         load_config()
+
+
+def test_config_accepts_tp_sl_ratio_below_two_for_strategy_compatibility(monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("XTB_MIN_TP_SL_RATIO", "1.8")
+
+    config = load_config()
+    assert config.risk.min_tp_sl_ratio == pytest.approx(1.8)
 
 
 def test_config_accepts_tp_sl_ratio_three(monkeypatch):
@@ -67,6 +81,42 @@ def test_config_accepts_tp_sl_ratio_three(monkeypatch):
 
     config = load_config()
     assert config.risk.min_tp_sl_ratio == 3.0
+
+
+def test_config_wraps_invalid_float_value_in_config_error(monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("XTB_MIN_TP_SL_RATIO", "abc")
+
+    with pytest.raises(ConfigError, match="invalid float value"):
+        load_config()
+
+
+def test_config_wraps_invalid_integer_value_in_config_error(monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("XTB_MAX_OPEN_POSITIONS", "abc")
+
+    with pytest.raises(ConfigError, match="invalid integer value"):
+        load_config()
+
+
+def test_config_rounds_integer_like_float_values(monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("XTB_MAX_OPEN_POSITIONS", "1.9")
+
+    config = load_config()
+    assert config.risk.max_open_positions == 2
+
+
+def test_config_rejects_non_finite_integer_value(monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("XTB_MAX_OPEN_POSITIONS", "nan")
+
+    with pytest.raises(ConfigError, match="invalid integer value"):
+        load_config()
+
+
+def test_parse_schedule_weekdays_wraps_ranges_without_loop():
+    assert _parse_schedule_weekdays("fri-mon") == (4, 5, 6, 0)
 
 
 def test_config_rejects_invalid_trailing_activation_ratio(monkeypatch):
@@ -234,6 +284,11 @@ def test_config_rejects_invalid_margin_holiday_dates(monkeypatch):
 
 def test_config_parses_extended_margin_fields(monkeypatch):
     _set_required_env(monkeypatch)
+    monkeypatch.setenv("XTB_DRAWDOWN_RISK_THROTTLE_DAILY_START_RATIO", "0.4")
+    monkeypatch.setenv("XTB_DRAWDOWN_RISK_THROTTLE_TOTAL_START_RATIO", "0.5")
+    monkeypatch.setenv("XTB_DRAWDOWN_RISK_THROTTLE_MIN_MULTIPLIER", "0.6")
+    monkeypatch.setenv("XTB_SPREAD_RISK_WEIGHT", "0.75")
+    monkeypatch.setenv("XTB_MARGIN_MIN_LEVEL_PCT", "200")
     monkeypatch.setenv("XTB_MARGIN_OVERHEAD_PCT", "2.5")
     monkeypatch.setenv("XTB_MARGIN_WEEKEND_MULTIPLIER", "1.25")
     monkeypatch.setenv("XTB_MARGIN_WEEKEND_START_HOUR_UTC", "19")
@@ -248,6 +303,11 @@ def test_config_parses_extended_margin_fields(monkeypatch):
 
     config = load_config()
 
+    assert config.risk.drawdown_risk_throttle_daily_start_ratio == pytest.approx(0.4)
+    assert config.risk.drawdown_risk_throttle_total_start_ratio == pytest.approx(0.5)
+    assert config.risk.drawdown_risk_throttle_min_multiplier == pytest.approx(0.6)
+    assert config.risk.spread_risk_weight == pytest.approx(0.75)
+    assert config.risk.margin_min_level_pct == pytest.approx(200.0)
     assert config.risk.margin_overhead_pct == pytest.approx(2.5)
     assert config.risk.margin_weekend_multiplier == pytest.approx(1.25)
     assert config.risk.margin_weekend_start_hour_utc == 19
@@ -259,6 +319,30 @@ def test_config_parses_extended_margin_fields(monkeypatch):
     assert config.risk.external_cashflow_rebase_enabled is True
     assert config.risk.external_cashflow_rebase_min_abs == pytest.approx(250.0)
     assert config.risk.external_cashflow_rebase_min_pct == pytest.approx(5.0)
+
+
+def test_config_rejects_invalid_drawdown_risk_throttle_start_ratio(monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("XTB_DRAWDOWN_RISK_THROTTLE_DAILY_START_RATIO", "1.0")
+
+    with pytest.raises(ConfigError, match="drawdown_risk_throttle_daily_start_ratio"):
+        load_config()
+
+
+def test_config_rejects_invalid_spread_risk_weight(monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("XTB_SPREAD_RISK_WEIGHT", "1.1")
+
+    with pytest.raises(ConfigError, match="spread_risk_weight"):
+        load_config()
+
+
+def test_config_rejects_negative_margin_min_level_pct(monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("XTB_MARGIN_MIN_LEVEL_PCT", "-1")
+
+    with pytest.raises(ConfigError, match="margin_min_level_pct"):
+        load_config()
 
 
 def test_config_rejects_non_positive_connectivity_pong_timeout(monkeypatch):

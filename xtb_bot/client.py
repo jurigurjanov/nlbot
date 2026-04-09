@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from xtb_bot.tolerances import FLOAT_COMPARISON_TOLERANCE, FLOAT_ROUNDING_TOLERANCE
+
 from collections import deque
 import json
 import logging
@@ -11,7 +13,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 try:
     import websocket  # type: ignore
@@ -52,13 +54,30 @@ class BaseBrokerClient(ABC):
     def get_price(self, symbol: str) -> PriceTick:
         raise NotImplementedError
 
+    def get_price_stream_only(self, symbol: str, wait_timeout_sec: float = 0.0) -> PriceTick | None:
+        _ = (symbol, wait_timeout_sec)
+        return None
+
+    def set_stream_tick_handler(self, handler: Callable[[PriceTick], None] | None) -> None:
+        _ = handler
+
     @abstractmethod
     def get_symbol_spec(self, symbol: str) -> SymbolSpec:
         raise NotImplementedError
 
+    def get_symbol_spec_for_epic(self, symbol: str, epic: str) -> SymbolSpec:
+        _ = epic
+        return self.get_symbol_spec(symbol)
+
+    def get_symbol_spec_candidates_for_entry(self, symbol: str) -> list[SymbolSpec]:
+        return [self.get_symbol_spec(symbol)]
+
     @abstractmethod
     def get_account_snapshot(self) -> AccountSnapshot:
         raise NotImplementedError
+
+    def get_account_currency_code(self) -> str | None:
+        return None
 
     @abstractmethod
     def get_session_close_utc(self, symbol: str, now_ts: float) -> float | None:
@@ -109,22 +128,17 @@ class BaseBrokerClient(ABC):
         _ = position_id
         return None
 
-    def get_position_close_sync(
-        self,
-        position_id: str,
-        *,
-        deal_reference: str | None = None,
-        opened_at: float | None = None,
-        symbol: str | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any] | None:
-        _ = (position_id, deal_reference, opened_at, symbol, kwargs)
-        return None
+    def mark_symbol_guaranteed_stop_required(self, symbol: str, source: str | None = None) -> None:
+        _ = (symbol, source)
 
     def get_public_api_backoff_remaining_sec(self) -> float:
         return 0.0
 
     def get_market_data_wait_remaining_sec(self) -> float:
+        return 0.0
+
+    def get_stream_rest_fallback_block_remaining_sec(self, symbol: str) -> float:
+        _ = symbol
         return 0.0
 
     def get_managed_open_positions(
@@ -167,6 +181,7 @@ class MockBrokerClient(BaseBrokerClient):
             "FRA40": "21:00",
             "UK100": "21:00",
             "JP225": "20:00",
+            "JPN225": "20:00",
         }
         self._specs: dict[str, SymbolSpec] = {
             "EURUSD": SymbolSpec(
@@ -446,6 +461,7 @@ class XtbApiClient(BaseBrokerClient):
         self._stream_last_disconnect_ts: float | None = None
         self._stream_last_reconnect_ts: float | None = None
         self._stream_next_retry_at: float | None = None
+        self._stream_ws_session_id: str | None = None
         self._stream_backoff_base_sec = 0.5
         self._stream_backoff_max_sec = 30.0
         self._account_snapshot_cache: AccountSnapshot | None = None
@@ -474,6 +490,10 @@ class XtbApiClient(BaseBrokerClient):
         if endpoint.endswith("/real"):
             return f"{endpoint}Stream"
         return f"{endpoint.rstrip('/')}/stream"
+
+    @staticmethod
+    def _log_close_exception(action: str, exc: Exception) -> None:
+        logger.debug("XTB close cleanup failed during %s: %s", action, exc)
 
     def connect(self) -> None:
         if websocket is None:
@@ -509,9 +529,12 @@ class XtbApiClient(BaseBrokerClient):
             if self._ws is not None:
                 try:
                     self._send_command("logout")
-                except Exception:
-                    pass
-                self._ws.close()
+                except Exception as exc:
+                    self._log_close_exception("logout", exc)
+                try:
+                    self._ws.close()
+                except Exception as exc:
+                    self._log_close_exception("control socket close", exc)
                 self._ws = None
             self._stream_session_id = None
             self._pending_raw_messages.clear()
@@ -521,6 +544,7 @@ class XtbApiClient(BaseBrokerClient):
             self._stream_last_error = None
             self._stream_next_retry_at = None
             self._stream_reconnect_attempts = 0
+            self._stream_ws_session_id = None
             self._account_snapshot_cache = None
             self._account_snapshot_cached_at = 0.0
         if reader_to_join is not None and reader_to_join.is_alive():
@@ -588,7 +612,7 @@ class XtbApiClient(BaseBrokerClient):
         while not self._control_keepalive_stop_event.wait(interval):
             with self._lock:
                 if self._ws is None:
-                    return
+                    continue
                 try:
                     self._send_command("ping")
                     # Raw websocket ping helps detect half-open TCP state.
@@ -604,6 +628,8 @@ class XtbApiClient(BaseBrokerClient):
     def _mark_stream_disconnected_locked(self, error: str | None) -> None:
         stream_ws = self._stream_ws
         self._stream_ws = None
+        self._stream_ws_session_id = None
+        self._stream_stop_event.set()
         self._tick_subscriptions.clear()
         self._stream_last_disconnect_ts = time.time()
         if error:
@@ -613,14 +639,16 @@ class XtbApiClient(BaseBrokerClient):
         if stream_ws is not None:
             try:
                 stream_ws.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log_close_exception("stream disconnect close", exc)
 
     def _ensure_stream_connected_locked(self) -> bool:
         if websocket is None:
             return False
         if self._stream_ws is not None:
-            return True
+            if self._stream_ws_session_id == self._stream_session_id:
+                return True
+            self._mark_stream_disconnected_locked("stream_session_rotated")
         if not self._stream_session_id:
             return False
         now = time.time()
@@ -645,22 +673,22 @@ class XtbApiClient(BaseBrokerClient):
 
         was_reconnect = self._stream_last_disconnect_ts is not None
         self._stream_ws = stream_ws
-        # Stop old reader thread if still running
-        self._stream_stop_event.set()
-        old_thread = self._stream_reader_thread
-        if old_thread is not None and old_thread.is_alive():
-            old_thread.join(timeout=2.0)
-        self._stream_stop_event.clear()
+        reader_stop_event = threading.Event()
+        self._stream_stop_event = reader_stop_event
         self._stream_reader_thread = threading.Thread(
             target=self._stream_reader_loop,
+            args=(stream_ws, reader_stop_event),
             name="xtb-stream-reader",
             daemon=True,
         )
         self._stream_reader_thread.start()
+        self._stream_ws_session_id = str(self._stream_session_id)
         self._stream_last_error = None
         self._stream_next_retry_at = None
         self._stream_reconnect_attempts = 0
         self._stream_last_reconnect_ts = time.time()
+        if not self._restore_stream_subscriptions_locked():
+            return False
         if was_reconnect:
             self._stream_total_reconnects += 1
             logger.warning(
@@ -678,34 +706,57 @@ class XtbApiClient(BaseBrokerClient):
         if stream_ws is not None:
             try:
                 stream_ws.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log_close_exception("stream socket close", exc)
         reader = self._stream_reader_thread
         self._stream_reader_thread = None
         self._stream_next_retry_at = None
         self._stream_reconnect_attempts = 0
+        self._stream_ws_session_id = None
         if reader is threading.current_thread():
             return None
         return reader
+
+    def _restore_stream_subscriptions_locked(self) -> bool:
+        if self._stream_ws is None or not self._stream_session_id:
+            return False
+        for symbol in sorted(self._stream_desired_subscriptions):
+            if symbol in self._tick_subscriptions:
+                continue
+            try:
+                self._send_stream_subscribe_locked(symbol)
+            except Exception as exc:
+                self._mark_stream_disconnected_locked(f"stream_resubscribe_failed:{exc}")
+                logger.warning("Failed to restore tick stream for %s: %s", symbol, exc)
+                return False
+            self._tick_subscriptions.add(symbol)
+        return True
 
     def _stream_monitor_loop(self) -> None:
         while not self._stream_monitor_stop_event.is_set():
             wait_for = 0.5
             with self._lock:
                 if self._ws is None or not self._stream_session_id:
-                    return
+                    if self._stream_ws is not None:
+                        self._mark_stream_disconnected_locked("command_socket_not_connected")
+                    wait_for = 0.2
+                else:
+                    reader = self._stream_reader_thread
+                    if (
+                        self._stream_ws is not None
+                        and self._stream_ws_session_id != self._stream_session_id
+                    ):
+                        self._mark_stream_disconnected_locked("stream_session_rotated")
+                    elif self._stream_ws is not None and reader is not None and not reader.is_alive():
+                        self._mark_stream_disconnected_locked("stream_reader_stopped")
 
-                reader = self._stream_reader_thread
-                if self._stream_ws is not None and reader is not None and not reader.is_alive():
-                    self._mark_stream_disconnected_locked("stream_reader_stopped")
-
-                if self._stream_ws is None:
-                    now = time.time()
-                    if self._stream_next_retry_at is None or now >= self._stream_next_retry_at:
-                        self._ensure_stream_connected_locked()
-                    retry_at = self._stream_next_retry_at
-                    if retry_at is not None:
-                        wait_for = max(0.2, min(2.0, retry_at - time.time()))
+                    if self._stream_ws is None:
+                        now = time.time()
+                        if self._stream_next_retry_at is None or now >= self._stream_next_retry_at:
+                            self._ensure_stream_connected_locked()
+                        retry_at = self._stream_next_retry_at
+                        if retry_at is not None:
+                            wait_for = max(0.2, min(2.0, retry_at - time.time()))
 
             self._stream_monitor_stop_event.wait(wait_for)
 
@@ -742,6 +793,7 @@ class XtbApiClient(BaseBrokerClient):
             volume = None
         if volume is not None and volume <= 0:
             volume = None
+        received_at = time.time()
 
         return PriceTick(
             symbol=str(payload["symbol"]).upper(),
@@ -749,13 +801,11 @@ class XtbApiClient(BaseBrokerClient):
             ask=float(payload["ask"]),
             timestamp=ts,
             volume=volume,
+            received_at=received_at,
         )
 
-    def _stream_reader_loop(self) -> None:
-        while not self._stream_stop_event.is_set():
-            stream_ws = self._stream_ws
-            if stream_ws is None:
-                return
+    def _stream_reader_loop(self, stream_ws: websocket.WebSocket, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
             try:
                 raw = stream_ws.recv()
                 if raw is None:
@@ -769,7 +819,7 @@ class XtbApiClient(BaseBrokerClient):
                     # Ignore stale reader errors after a reconnect replaced socket instance.
                     if self._stream_ws is stream_ws:
                         self._mark_stream_disconnected_locked(str(exc))
-                if not self._stream_stop_event.is_set():
+                if not stop_event.is_set():
                     logger.warning("Stream reader stopped: %s", exc)
                 return
 
@@ -877,7 +927,7 @@ class XtbApiClient(BaseBrokerClient):
             descr = response.get("errorDescr", "No description")
             raise BrokerError(f"XTB command {command} failed: {code} {descr}")
 
-        return response.get("returnData") or {}
+        return response.get("returnData", {})
 
     def _perform_control_ping(self, timeout_sec: float) -> bool:
         ws = self._ensure_connected()
@@ -979,9 +1029,13 @@ class XtbApiClient(BaseBrokerClient):
             if normalized_symbol:
                 tick = self._tick_cache.get(normalized_symbol)
                 if tick is not None:
-                    last_tick_age_sec = max(0.0, now - tick.timestamp)
+                    freshness_ts = float(tick.received_at) if tick.received_at is not None else float(tick.timestamp)
+                    last_tick_age_sec = max(0.0, now - freshness_ts)
             elif self._tick_cache:
-                freshest_ts = max(item.timestamp for item in self._tick_cache.values())
+                freshest_ts = max(
+                    float(item.received_at) if item.received_at is not None else float(item.timestamp)
+                    for item in self._tick_cache.values()
+                )
                 last_tick_age_sec = max(0.0, now - freshest_ts)
 
             next_retry_in_sec = None
@@ -1100,8 +1154,8 @@ class XtbApiClient(BaseBrokerClient):
         return SymbolSpec(
             symbol=symbol,
             tick_size=tick_size,
-            tick_value=max(tick_value, 1e-9),
-            contract_size=max(contract_size, 1e-9),
+            tick_value=max(tick_value, FLOAT_COMPARISON_TOLERANCE),
+            contract_size=max(contract_size, FLOAT_COMPARISON_TOLERANCE),
             lot_min=max(lot_min, lot_step),
             lot_max=max(lot_max, lot_min),
             lot_step=lot_step,
@@ -1119,7 +1173,8 @@ class XtbApiClient(BaseBrokerClient):
         tick = self._tick_cache.get(symbol.upper())
         if tick is None:
             return None
-        if (time.time() - tick.timestamp) > max_age_sec:
+        freshness_ts = float(tick.received_at) if tick.received_at is not None else float(tick.timestamp)
+        if (time.time() - freshness_ts) > max_age_sec:
             return None
         return PriceTick(
             symbol=tick.symbol,
@@ -1127,6 +1182,7 @@ class XtbApiClient(BaseBrokerClient):
             ask=float(tick.ask),
             timestamp=float(tick.timestamp),
             volume=(float(tick.volume) if tick.volume is not None else None),
+            received_at=(float(tick.received_at) if tick.received_at is not None else None),
         )
 
     def get_price(self, symbol: str) -> PriceTick:
@@ -1158,6 +1214,7 @@ class XtbApiClient(BaseBrokerClient):
                 ask=float(data["ask"]),
                 timestamp=float(ts_ms) / 1000.0,
                 volume=volume,
+                received_at=time.time(),
             )
 
     def get_symbol_spec(self, symbol: str) -> SymbolSpec:
@@ -1374,7 +1431,7 @@ class XtbApiClient(BaseBrokerClient):
         close_volume = float(position.volume if volume is None else volume)
         if close_volume <= 0:
             raise BrokerError("close volume must be positive")
-        if close_volume - float(position.volume) > 1e-9:
+        if close_volume - float(position.volume) > FLOAT_COMPARISON_TOLERANCE:
             raise BrokerError(
                 f"close volume exceeds open position volume (requested={close_volume:g}, open={float(position.volume):g})"
             )

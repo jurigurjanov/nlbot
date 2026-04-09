@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import logging
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -181,6 +184,33 @@ def test_get_upcoming_high_impact_events_filters_window(monkeypatch):
     assert events[0].name == "NFP"
 
 
+def test_close_logs_socket_cleanup_errors(monkeypatch, caplog):
+    client = XtbApiClient(
+        user_id="1",
+        password="1",
+        app_name="xtb-bot",
+        account_type=AccountType.DEMO,
+    )
+
+    class _BrokenSocket:
+        def close(self) -> None:
+            raise RuntimeError("close boom")
+
+    client._ws = _BrokenSocket()  # type: ignore[assignment]
+    client._stream_ws = _BrokenSocket()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        client,
+        "_send_command",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("logout boom")),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        client.close()
+
+    assert "logout boom" in caplog.text
+    assert "close boom" in caplog.text
+
+
 def test_connectivity_status_unhealthy_when_latency_exceeds_limit(monkeypatch):
     client = XtbApiClient(
         user_id="1",
@@ -218,6 +248,146 @@ def test_connectivity_status_unhealthy_when_pong_missing(monkeypatch):
     status = client.get_connectivity_status(max_latency_ms=500.0, pong_timeout_sec=2.0)
     assert status.healthy is False
     assert status.reason == "pong_timeout_or_missing"
+
+
+def test_control_keepalive_thread_survives_transient_disconnect(monkeypatch):
+    client = XtbApiClient(
+        user_id="1",
+        password="1",
+        app_name="xtb-bot",
+        account_type=AccountType.DEMO,
+    )
+    client._control_keepalive_interval_sec = 0.01
+    ping_calls = {"count": 0}
+
+    def fake_send_command(command: str, arguments: dict | None = None):
+        _ = arguments
+        assert command == "ping"
+        ping_calls["count"] += 1
+        return {}
+
+    monkeypatch.setattr(client, "_send_command", fake_send_command)
+    monkeypatch.setattr(client, "_perform_control_ping", lambda timeout_sec: True)
+
+    with client._lock:
+        client._ws = None
+        client._start_control_keepalive_locked()
+        keepalive_thread = client._control_keepalive_thread
+
+    time.sleep(0.03)
+    assert keepalive_thread is not None
+    assert keepalive_thread.is_alive()
+    assert ping_calls["count"] == 0
+
+    with client._lock:
+        client._ws = object()  # type: ignore[assignment]
+
+    deadline = time.time() + 0.2
+    while ping_calls["count"] == 0 and time.time() < deadline:
+        time.sleep(0.01)
+
+    with client._lock:
+        thread_to_join = client._stop_control_keepalive_locked()
+    if thread_to_join is not None and thread_to_join.is_alive():
+        thread_to_join.join(timeout=1.0)
+
+    assert ping_calls["count"] >= 1
+
+
+def test_stream_monitor_survives_command_disconnect_and_reconnects(monkeypatch):
+    client = XtbApiClient(
+        user_id="1",
+        password="1",
+        app_name="xtb-bot",
+        account_type=AccountType.DEMO,
+    )
+    reconnect_calls = {"count": 0}
+
+    class _AliveThread:
+        def is_alive(self) -> bool:
+            return True
+
+    def fake_ensure_stream_connected_locked() -> bool:
+        reconnect_calls["count"] += 1
+        client._stream_ws = object()  # type: ignore[assignment]
+        client._stream_ws_session_id = str(client._stream_session_id or "")
+        client._stream_reader_thread = _AliveThread()  # type: ignore[assignment]
+        client._stream_next_retry_at = None
+        return True
+
+    monkeypatch.setattr(client, "_ensure_stream_connected_locked", fake_ensure_stream_connected_locked)
+
+    with client._lock:
+        client._ws = None
+        client._stream_session_id = None
+        client._stream_ws = object()  # type: ignore[assignment]
+        client._stream_ws_session_id = "session-1"
+        client._stream_reader_thread = _AliveThread()  # type: ignore[assignment]
+        client._start_stream_monitor_locked()
+        monitor_thread = client._stream_monitor_thread
+
+    time.sleep(0.03)
+    assert monitor_thread is not None
+    assert monitor_thread.is_alive()
+
+    with client._lock:
+        assert client._stream_ws is None
+        client._ws = object()  # type: ignore[assignment]
+        client._stream_session_id = "session-2"
+        client._stream_next_retry_at = time.time() - 1.0
+
+    deadline = time.time() + 0.2
+    while reconnect_calls["count"] == 0 and time.time() < deadline:
+        time.sleep(0.01)
+
+    with client._lock:
+        thread_to_join = client._stop_stream_monitor_locked()
+    if thread_to_join is not None and thread_to_join.is_alive():
+        thread_to_join.join(timeout=1.0)
+
+    assert reconnect_calls["count"] >= 1
+
+
+def test_stream_reconnect_restores_desired_subscriptions(monkeypatch):
+    client = XtbApiClient(
+        user_id="1",
+        password="1",
+        app_name="xtb-bot",
+        account_type=AccountType.DEMO,
+    )
+    sent_payloads: list[dict[str, object]] = []
+
+    class _FakeStreamWs:
+        def send(self, payload: str) -> None:
+            sent_payloads.append(json.loads(payload))
+
+        def close(self) -> None:
+            return None
+
+    fake_stream_ws = _FakeStreamWs()
+    fake_websocket = SimpleNamespace(create_connection=lambda endpoint, timeout: fake_stream_ws)
+    monkeypatch.setattr("xtb_bot.client.websocket", fake_websocket)
+    monkeypatch.setattr(client, "_stream_reader_loop", lambda stream_ws, stop_event: None)
+
+    with client._lock:
+        client._stream_session_id = "session-restore-1"
+        client._stream_desired_subscriptions.update({"EURUSD", "USDJPY"})
+        connected = client._ensure_stream_connected_locked()
+        restored_subscriptions = set(client._tick_subscriptions)
+        bound_session_id = client._stream_ws_session_id
+        reader_to_join = client._close_stream_locked()
+
+    if reader_to_join is not None and reader_to_join.is_alive():
+        reader_to_join.join(timeout=1.0)
+
+    assert connected is True
+    assert restored_subscriptions == {"EURUSD", "USDJPY"}
+    assert bound_session_id == "session-restore-1"
+    assert client._tick_subscriptions == set()
+    symbols = {str(payload.get("symbol") or "") for payload in sent_payloads}
+    assert symbols == {"EURUSD", "USDJPY"}
+    assert all(payload.get("command") == "getTickPrices" for payload in sent_payloads)
+    assert all(payload.get("streamSessionId") == "session-restore-1" for payload in sent_payloads)
 
 
 def test_derive_stream_endpoint_for_xtb_demo_and_live():
@@ -343,6 +513,34 @@ def test_stream_health_status_detects_stale_tick_for_symbol():
 
     status = client.get_stream_health_status(symbol="EURUSD", max_tick_age_sec=5.0)
     assert status.healthy is False
+    assert "stream_tick_stale" in status.reason
+
+
+def test_stream_health_status_uses_received_at_over_broker_timestamp():
+    client = XtbApiClient(
+        user_id="1",
+        password="1",
+        app_name="xtb-bot",
+        account_type=AccountType.DEMO,
+    )
+    now = time.time()
+    client._ws = object()  # type: ignore[assignment]
+    client._stream_session_id = "session-1"
+    client._stream_ws = object()  # type: ignore[assignment]
+    client._stream_reader_thread = None
+    client._stream_desired_subscriptions.add("EURUSD")
+    client._tick_cache["EURUSD"] = PriceTick(
+        symbol="EURUSD",
+        bid=1.1000,
+        ask=1.1002,
+        timestamp=now + 300.0,
+        received_at=now - 30.0,
+    )
+
+    status = client.get_stream_health_status(symbol="EURUSD", max_tick_age_sec=5.0)
+
+    assert status.healthy is False
+    assert status.last_tick_age_sec == pytest.approx(30.0, rel=0.1)
     assert "stream_tick_stale" in status.reason
 
 
