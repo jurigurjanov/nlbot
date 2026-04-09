@@ -129,6 +129,8 @@ class MultiStrategyRuntimeState:
     scale_out_offset_by_name: dict[str, float] = field(default_factory=dict)
     # Per-asset-class soft overlap threshold (overrides _MULTI_STRATEGY_SOFT_OVERLAP_HOLD_RATIO).
     soft_overlap_hold_ratio: float = _MULTI_STRATEGY_SOFT_OVERLAP_HOLD_RATIO
+    family_netting_enabled: bool = False
+    family_map_config: dict[str, str] = field(default_factory=dict)
 
 
 class WorkerMultiStrategyRuntime:
@@ -416,6 +418,22 @@ class WorkerMultiStrategyRuntime:
             limit=normalizer_window,
         )
         state.enabled = True
+        state.family_netting_enabled = worker._strategy_bool_param(
+            strategy_params, "multi_strategy_family_netting_enabled", True
+        )
+        family_map_raw = strategy_params.get("multi_strategy_family_map")
+        if isinstance(family_map_raw, dict):
+            state.family_map_config = {
+                str(k).strip().lower(): str(v).strip().lower()
+                for k, v in family_map_raw.items()
+                if str(k).strip() and str(v).strip()
+            }
+        if state.family_netting_enabled:
+            logger.info(
+                "Multi-strategy family netting enabled | symbol=%s families=%s",
+                worker.symbol,
+                ",".join(sorted(set(state.family_map_config.values()) or {"trend"})),
+            )
         if asset_class == "fx":
             logger.info(
                 "Multi-strategy FX tuning applied | symbol=%s conflict_zone=[%.3f,%.3f] soft_overlap=%.3f components=%s",
@@ -826,6 +844,9 @@ class WorkerMultiStrategyRuntime:
             return inferred
 
         normalized = worker._normalize_strategy_label(strategy_name)
+        configured = self._state.family_map_config.get(normalized)
+        if configured:
+            return configured
         if normalized in _MULTI_STRATEGY_MEAN_REVERSION_COMPONENTS:
             return "mean_reversion"
         if normalized in _MULTI_STRATEGY_TREND_COMPONENTS:
@@ -1396,6 +1417,12 @@ class WorkerMultiStrategyRuntime:
         family_by_strategy = (
             dict(family_by_strategy_raw) if isinstance(family_by_strategy_raw, dict) else {}
         )
+        family_map: dict[str, str] | None = None
+        if state.family_netting_enabled:
+            family_map = {}
+            for strategy_name, _strategy in state.components:
+                sig = signal_by_name.get(strategy_name)
+                family_map[strategy_name] = self.component_family(strategy_name, sig)
         decision = state.aggregator.compute_net_intent(
             symbol=worker.symbol,
             real_position_lots=float(real_position_lots),
@@ -1407,6 +1434,7 @@ class WorkerMultiStrategyRuntime:
             heartbeat_ok=heartbeat_ok,
             risk_blocked=False,
             reconcile_error=False,
+            family_map=family_map,
         )
         state.last_decision = decision
         state.last_signal_by_name = signal_by_name
@@ -1466,8 +1494,10 @@ class WorkerMultiStrategyRuntime:
         soft_overlap_ratio: float | None = None
         soft_overlap_detected = False
         effective_soft_overlap_threshold = state.soft_overlap_hold_ratio
+        family_netting_active = bool(state.family_netting_enabled and decision.family_decisions)
         if (
-            net_side in {Side.BUY, Side.SELL}
+            not family_netting_active
+            and net_side in {Side.BUY, Side.SELL}
             and abs(float(real_position_lots)) <= FLOAT_COMPARISON_TOLERANCE
             and not decision.conflict_detected
         ):
@@ -1518,8 +1548,22 @@ class WorkerMultiStrategyRuntime:
             "multi_soft_overlap_detected": soft_overlap_detected,
             "multi_soft_overlap_ratio": soft_overlap_ratio,
             "multi_soft_overlap_threshold": effective_soft_overlap_threshold,
+            "multi_family_netting_enabled": family_netting_active,
             **debug_decision_payload(decision),
         }
+        if family_netting_active and decision.family_decisions:
+            family_summary = {}
+            for fd in decision.family_decisions:
+                family_summary[fd.family] = {
+                    "target": fd.target_net_qty_lots,
+                    "buy_power": round(fd.buy_power, 6),
+                    "sell_power": round(fd.sell_power, 6),
+                    "conflict": fd.conflict_detected,
+                    "intent_count": len(fd.intents),
+                    "weighted_stop_loss_pips": fd.weighted_stop_loss_pips,
+                    "weighted_take_profit_pips": fd.weighted_take_profit_pips,
+                }
+            metadata["multi_family_decisions"] = family_summary
         summary = self.directional_summary(decision)
         hold_reason_summary = self.component_hold_reason_summary(signal_by_name)
         metadata["multi_buy_component_count"] = int(summary["buy_component_count"])
