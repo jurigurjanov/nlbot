@@ -1256,6 +1256,19 @@ class WorkerOrderManager:
                 use_local_close_price = broker_close_price is not None and broker_close_price > 0
                 if not worker._broker_sync_has_factual_close_details(broker_sync):
                     use_local_close_price = False
+                    # Persist the original close reason now so reconciliation
+                    # paths (worker manual-close sync, bot runtime sync) can
+                    # preserve it instead of overwriting with a generic
+                    # "broker_reconcile" / "broker_manual_close" label.
+                    worker.store.update_trade_performance(
+                        position_id=position.position_id,
+                        symbol=position.symbol,
+                        close_reason=reason,
+                        max_favorable_pips=0.0,
+                        max_adverse_pips=0.0,
+                        max_favorable_pnl=0.0,
+                        max_adverse_pnl=0.0,
+                    )
                     worker._arm_pending_close_verification(
                         position=position,
                         reason=reason,

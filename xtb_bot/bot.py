@@ -4482,6 +4482,12 @@ class TradingBot:
         pnl_estimate_source = close_details.get("pnl_estimate_source")
         has_close_details = (close_price is not None) or (closed_at is not None) or (pnl_value is not None)
 
+        # If the worker already persisted a close_reason (from the original
+        # _close_position call), prefer it over the generic "broker_reconcile"
+        # label so the real exit trigger is preserved in trade history.
+        existing_perf = self.store.load_trade_performance(position.position_id)
+        existing_reason = str((existing_perf or {}).get("close_reason") or "").strip() or None
+
         if has_close_details:
             self.store.update_trade_status(
                 position.position_id,
@@ -4492,11 +4498,16 @@ class TradingBot:
                 pnl_is_estimated=pnl_is_estimated,
                 pnl_estimate_source=pnl_estimate_source,
             )
+            reconcile_reason = (
+                f"close_verified:{existing_reason}:{context}"
+                if existing_reason
+                else f"broker_reconcile:{context}:closed"
+            )
             self.store.finalize_trade_performance(
                 position_id=position.position_id,
                 symbol=position.symbol,
                 closed_at=closed_at,
-                close_reason=f"broker_reconcile:{context}:closed",
+                close_reason=reconcile_reason,
             )
         else:
             # Position absence on broker confirms closure, but we keep existing close fields untouched
@@ -4510,11 +4521,16 @@ class TradingBot:
                 position.position_id,
                 status="closed",
             )
+            reconcile_reason = (
+                f"close_verified:{existing_reason}:{context}"
+                if existing_reason
+                else f"broker_reconcile:{context}:closed_pending_details"
+            )
             self.store.finalize_trade_performance(
                 position_id=position.position_id,
                 symbol=position.symbol,
                 closed_at=preserved_closed_at,
-                close_reason=f"broker_reconcile:{context}:closed_pending_details",
+                close_reason=reconcile_reason,
             )
         source = str((broker_sync or {}).get("source") or "").strip().lower() or "broker_sync"
         self.store.record_event(
@@ -5479,11 +5495,18 @@ class TradingBot:
                     status="missing_on_broker",
                     closed_at=now_ts,
                 )
+                missing_existing_perf = self.store.load_trade_performance(normalized_position_id)
+                missing_existing_reason = str((missing_existing_perf or {}).get("close_reason") or "").strip() or None
+                missing_close_reason = (
+                    f"close_verified:{missing_existing_reason}:runtime_sync"
+                    if missing_existing_reason
+                    else "runtime_sync:missing_on_broker"
+                )
                 self.store.finalize_trade_performance(
                     position_id=normalized_position_id,
                     symbol=local_position.symbol,
                     closed_at=now_ts,
-                    close_reason="runtime_sync:missing_on_broker",
+                    close_reason=missing_close_reason,
                 )
                 self.position_book.remove_by_id(normalized_position_id)
                 local_by_id.pop(position_id, None)

@@ -507,8 +507,17 @@ class RiskManager:
         diagnostics["min_lot_risk_pct"] = min_lot_risk_pct
 
         if raw_volume < symbol_spec.lot_min:
-            diagnostics["reason"] = "below_instrument_min_lot"
-            return 0.0, diagnostics
+            if (
+                self.cfg.allow_min_lot_override
+                and min_lot_risk_pct <= self.cfg.min_lot_risk_cap_pct
+                and symbol_spec.lot_min > 0
+            ):
+                raw_volume = symbol_spec.lot_min
+                diagnostics["min_lot_override"] = 1.0
+                diagnostics["min_lot_override_risk_pct"] = min_lot_risk_pct
+            else:
+                diagnostics["reason"] = "below_instrument_min_lot"
+                return 0.0, diagnostics
 
         rounded = symbol_spec.round_volume(raw_volume)
         diagnostics["rounded_volume"] = rounded
@@ -802,6 +811,15 @@ class RiskManager:
             risk_pct=effective_risk_pct,
         )
         diagnostics.update(risk_budget_diagnostics)
+        if diagnostics.get("min_lot_override"):
+            logger.info(
+                "min_lot_override applied: volume bumped to lot_min=%.4f "
+                "(raw=%.6f, override_risk_pct=%.4f%%, cap=%.2f%%)",
+                float(diagnostics.get("lot_min", 0.0)),
+                float(diagnostics.get("raw_volume", 0.0)),
+                float(diagnostics.get("min_lot_override_risk_pct", 0.0)),
+                self.cfg.min_lot_risk_cap_pct,
+            )
         if volume <= 0:
             reason = (
                 "Calculated volume is zero or below instrument minimum "
