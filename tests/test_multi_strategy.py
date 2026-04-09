@@ -7,6 +7,7 @@ import pytest
 from xtb_bot.multi_strategy import (
     AggregatorConfig,
     AggregatorLifecycleState,
+    FamilyIntentDecision,
     IntentRejectReason,
     RebalanceMode,
     RollingPercentileNormalizer,
@@ -474,3 +475,272 @@ def test_allocate_cost_pro_rata_preserves_total():
     assert allocations["b"] == pytest.approx(-30.0)
     assert allocations["c"] == pytest.approx(0.0)
     assert sum(allocations.values()) == pytest.approx(-40.0)
+
+
+# ---------------------------------------------------------------------------
+# Family netting tests
+# ---------------------------------------------------------------------------
+
+def _family_aggregator(
+    *,
+    lot_step: float = 0.1,
+    min_open: float = 0.1,
+    conflict_low: float = 0.85,
+    conflict_high: float = 1.12,
+) -> VirtualPositionAggregator:
+    config = AggregatorConfig(
+        lot_step_lots=lot_step,
+        min_open_lot=min_open,
+        deadband_lots=0.0,
+        min_conflict_power=0.05,
+        conflict_ratio_low=conflict_low,
+        conflict_ratio_high=conflict_high,
+    )
+    normalizer = RollingPercentileNormalizer(window=16, min_samples=1, default_value=1.0)
+    return VirtualPositionAggregator(config=config, normalizer=normalizer)
+
+
+def test_family_netting_cross_family_no_conflict():
+    """Trend BUY + MR SELL should NOT trigger conflict — they are in different families."""
+    aggregator = _family_aggregator()
+    aggregator.upsert_intent(
+        _intent(strategy_id="momentum", target=1.0, confidence=0.8), now_ts=1_000.0,
+    )
+    aggregator.upsert_intent(
+        _intent(strategy_id="mean_reversion_bb", target=-1.0, confidence=0.8, seq=1),
+        now_ts=1_000.0,
+    )
+    family_map = {"momentum": "trend", "mean_reversion_bb": "mean_reversion"}
+
+    decision = aggregator.compute_net_intent(
+        symbol="US100",
+        real_position_lots=0.0,
+        family_map=family_map,
+        now_ts=1_001.0,
+    )
+
+    # Global conflict should be False (cross-family opposition is by design)
+    assert decision.conflict_detected is False
+    assert decision.mode == RebalanceMode.NORMAL
+    # Both families should have produced decisions
+    assert len(decision.family_decisions) == 2
+    # Neither family should be internally conflicted
+    for fd in decision.family_decisions:
+        assert fd.conflict_detected is False
+
+    # Net target: trend +0.8 + MR -0.8 = 0.0 (equal confidence & weight → cancel out)
+    # But each family independently contributes its own target
+    trend_fd = next(fd for fd in decision.family_decisions if fd.family == "trend")
+    mr_fd = next(fd for fd in decision.family_decisions if fd.family == "mean_reversion")
+    assert trend_fd.target_net_qty_lots > 0
+    assert mr_fd.target_net_qty_lots < 0
+
+
+def test_family_netting_cross_family_produces_net_position():
+    """Trend (strong BUY) + MR (weak SELL) → net BUY position."""
+    aggregator = _family_aggregator()
+    # 3 trend strategies agreeing on BUY
+    aggregator.upsert_intent(
+        _intent(strategy_id="momentum", symbol="EURUSD", target=1.0, confidence=0.9, weight=1.3), now_ts=1_000.0,
+    )
+    aggregator.upsert_intent(
+        _intent(strategy_id="trend_following", symbol="EURUSD", target=1.0, confidence=0.8, weight=1.2, seq=1),
+        now_ts=1_000.0,
+    )
+    aggregator.upsert_intent(
+        _intent(strategy_id="g1", symbol="EURUSD", target=1.0, confidence=0.7, weight=0.6, seq=1),
+        now_ts=1_000.0,
+    )
+    # 1 MR strategy opposing
+    aggregator.upsert_intent(
+        _intent(strategy_id="mean_reversion_bb", symbol="EURUSD", target=-1.0, confidence=0.8, weight=0.2, seq=1),
+        now_ts=1_000.0,
+    )
+    family_map = {
+        "momentum": "trend",
+        "trend_following": "trend",
+        "g1": "trend",
+        "mean_reversion_bb": "mean_reversion",
+    }
+
+    decision = aggregator.compute_net_intent(
+        symbol="EURUSD",
+        real_position_lots=0.0,
+        family_map=family_map,
+        now_ts=1_001.0,
+    )
+
+    assert decision.conflict_detected is False
+    assert decision.target_net_qty_lots > 0  # Net BUY
+    # Trend family should have positive target, MR family negative
+    trend_fd = next(fd for fd in decision.family_decisions if fd.family == "trend")
+    mr_fd = next(fd for fd in decision.family_decisions if fd.family == "mean_reversion")
+    assert trend_fd.target_net_qty_lots > 0
+    assert mr_fd.target_net_qty_lots < 0
+    assert abs(trend_fd.target_net_qty_lots) > abs(mr_fd.target_net_qty_lots)
+
+
+def test_family_netting_intra_family_conflict_only_blocks_that_family():
+    """Two trend strategies conflicting should block trend family, not MR family."""
+    aggregator = _family_aggregator()
+    # Trend strategy A: BUY
+    aggregator.upsert_intent(
+        _intent(strategy_id="momentum", symbol="EURUSD", target=1.0, confidence=0.8, weight=1.0), now_ts=1_000.0,
+    )
+    # Trend strategy B: SELL (conflict within trend family)
+    aggregator.upsert_intent(
+        _intent(strategy_id="trend_following", symbol="EURUSD", target=-1.0, confidence=0.8, weight=1.0, seq=1),
+        now_ts=1_000.0,
+    )
+    # MR strategy: SELL (no conflict in its own family)
+    aggregator.upsert_intent(
+        _intent(strategy_id="mean_reversion_bb", symbol="EURUSD", target=-1.0, confidence=0.8, weight=1.0, seq=1),
+        now_ts=1_000.0,
+    )
+    family_map = {
+        "momentum": "trend",
+        "trend_following": "trend",
+        "mean_reversion_bb": "mean_reversion",
+    }
+
+    decision = aggregator.compute_net_intent(
+        symbol="EURUSD",
+        real_position_lots=0.0,
+        family_map=family_map,
+        now_ts=1_001.0,
+    )
+
+    trend_fd = next(fd for fd in decision.family_decisions if fd.family == "trend")
+    mr_fd = next(fd for fd in decision.family_decisions if fd.family == "mean_reversion")
+
+    # Trend family should be in conflict (equal BUY vs SELL)
+    assert trend_fd.conflict_detected is True
+    assert trend_fd.target_net_qty_lots == pytest.approx(0.0)
+
+    # MR family should NOT be in conflict (single strategy, no opposition)
+    assert mr_fd.conflict_detected is False
+    assert mr_fd.target_net_qty_lots < 0  # SELL target
+
+    # Global: only MR contributes, so net should be SELL
+    assert decision.target_net_qty_lots < 0
+
+
+def test_family_netting_none_family_map_uses_global_netting():
+    """When family_map=None, behavior is identical to pre-family-netting."""
+    aggregator = _family_aggregator()
+    aggregator.upsert_intent(
+        _intent(strategy_id="momentum", target=1.0, confidence=0.8), now_ts=1_000.0,
+    )
+    aggregator.upsert_intent(
+        _intent(strategy_id="mean_reversion_bb", target=-1.0, confidence=0.8, seq=1),
+        now_ts=1_000.0,
+    )
+
+    # Without family_map: global netting → conflict
+    decision_global = aggregator.compute_net_intent(
+        symbol="US100",
+        real_position_lots=0.0,
+        family_map=None,
+        now_ts=1_001.0,
+    )
+    assert decision_global.conflict_detected is True
+    assert len(decision_global.family_decisions) == 0
+
+    # With family_map: no global conflict
+    family_map = {"momentum": "trend", "mean_reversion_bb": "mean_reversion"}
+    decision_family = aggregator.compute_net_intent(
+        symbol="US100",
+        real_position_lots=0.0,
+        family_map=family_map,
+        now_ts=1_002.0,
+    )
+    assert decision_family.conflict_detected is False
+    assert len(decision_family.family_decisions) == 2
+
+
+def test_family_netting_sl_tp_from_dominant_family():
+    """SL/TP should come from the family with the larger absolute target."""
+    aggregator = _family_aggregator()
+    # Trend: BUY with SL=15, TP=30
+    aggregator.upsert_intent(
+        _intent(
+            strategy_id="momentum", symbol="EURUSD", target=1.0, confidence=0.9, weight=1.5,
+            stop_loss_pips=15.0, take_profit_pips=30.0,
+        ),
+        now_ts=1_000.0,
+    )
+    # MR: SELL with SL=5, TP=10
+    aggregator.upsert_intent(
+        _intent(
+            strategy_id="mean_reversion_bb", symbol="EURUSD", target=-1.0, confidence=0.5, weight=0.3,
+            stop_loss_pips=5.0, take_profit_pips=10.0, seq=1,
+        ),
+        now_ts=1_000.0,
+    )
+    family_map = {"momentum": "trend", "mean_reversion_bb": "mean_reversion"}
+
+    decision = aggregator.compute_net_intent(
+        symbol="EURUSD",
+        real_position_lots=0.0,
+        family_map=family_map,
+        now_ts=1_001.0,
+    )
+
+    # Trend family is dominant (higher weight * confidence)
+    assert decision.target_net_qty_lots > 0
+    # SL/TP should come from trend family
+    assert decision.weighted_stop_loss_pips == pytest.approx(15.0)
+    assert decision.weighted_take_profit_pips == pytest.approx(30.0)
+
+
+def test_family_netting_global_reduce_only_overrides_all_families():
+    """Emergency/degraded mode should override all family targets to reduce-only."""
+    aggregator = _family_aggregator()
+    aggregator.upsert_intent(
+        _intent(strategy_id="momentum", target=1.0, confidence=0.9), now_ts=1_000.0,
+    )
+    aggregator.upsert_intent(
+        _intent(strategy_id="mean_reversion_bb", target=-1.0, confidence=0.8, seq=1),
+        now_ts=1_000.0,
+    )
+    family_map = {"momentum": "trend", "mean_reversion_bb": "mean_reversion"}
+
+    decision = aggregator.compute_net_intent(
+        symbol="US100",
+        real_position_lots=0.0,
+        family_map=family_map,
+        heartbeat_ok=False,  # Emergency!
+        now_ts=1_001.0,
+    )
+
+    assert decision.mode == RebalanceMode.EMERGENCY
+    assert decision.reduce_only is True
+    assert decision.target_net_qty_lots == pytest.approx(0.0)
+
+
+def test_family_netting_single_family_matches_global():
+    """When all strategies are in one family, result should match global netting."""
+    aggregator = _family_aggregator()
+    aggregator.upsert_intent(
+        _intent(strategy_id="momentum", target=1.0, confidence=0.9, weight=1.0), now_ts=1_000.0,
+    )
+    aggregator.upsert_intent(
+        _intent(strategy_id="trend_following", target=1.0, confidence=0.8, weight=1.0, seq=1),
+        now_ts=1_000.0,
+    )
+
+    # Global netting
+    decision_global = aggregator.compute_net_intent(
+        symbol="US100", real_position_lots=0.0, family_map=None, now_ts=1_001.0,
+    )
+
+    # Family netting with all in same family
+    family_map = {"momentum": "trend", "trend_following": "trend"}
+    decision_family = aggregator.compute_net_intent(
+        symbol="US100", real_position_lots=0.0, family_map=family_map, now_ts=1_002.0,
+    )
+
+    assert decision_global.target_net_qty_lots == pytest.approx(decision_family.target_net_qty_lots)
+    assert decision_global.conflict_detected == decision_family.conflict_detected
+    assert len(decision_family.family_decisions) == 1
+    assert decision_family.family_decisions[0].family == "trend"

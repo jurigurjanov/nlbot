@@ -1066,6 +1066,20 @@ _MULTI_STRATEGY_DEFAULTS: dict[str, Any] = {
     "multi_strategy_normalizer_default": 0.65,
     "multi_strategy_reconciliation_epsilon_lots": 1e-6,
     "multi_strategy_emergency_event_cooldown_sec": 30.0,
+    "multi_strategy_family_netting_enabled": True,
+    "multi_strategy_family_map": {
+        "momentum": "trend",
+        "momentum_fx": "trend",
+        "momentum_index": "trend",
+        "g1": "trend",
+        "trend_following": "trend",
+        "crypto_trend_following": "trend",
+        "mean_breakout_v2": "trend",
+        "donchian_breakout": "trend",
+        "g2": "trend",
+        "index_hybrid": "trend",
+        "mean_reversion_bb": "mean_reversion",
+    },
 }
 
 DEFAULT_STRATEGY_PARAMS: dict[str, Any] = {

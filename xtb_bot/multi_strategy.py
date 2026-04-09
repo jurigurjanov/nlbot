@@ -173,6 +173,23 @@ class NetIntentDecision:
     weighted_take_profit_coverage: float
     conflict_detected: bool
     intents: tuple[NormalizedIntent, ...]
+    family_decisions: tuple["FamilyIntentDecision", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyIntentDecision:
+    """Per-family aggregation result used in family netting mode."""
+
+    family: str
+    target_net_qty_lots: float
+    buy_power: float
+    sell_power: float
+    conflict_detected: bool
+    weighted_stop_loss_pips: float | None
+    weighted_take_profit_pips: float | None
+    weighted_stop_coverage: float
+    weighted_take_profit_coverage: float
+    intents: tuple[NormalizedIntent, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +416,95 @@ class VirtualPositionAggregator:
             return 0.0
         return clipped
 
+    def _aggregate_family(
+        self,
+        *,
+        family: str,
+        intents: list[NormalizedIntent],
+    ) -> FamilyIntentDecision:
+        """Aggregate intents within a single family."""
+        buy_power = 0.0
+        sell_power = 0.0
+        buy_weighted_stop_sum = 0.0
+        sell_weighted_stop_sum = 0.0
+        buy_weighted_take_sum = 0.0
+        sell_weighted_take_sum = 0.0
+        buy_stop_covered_weight = 0.0
+        sell_stop_covered_weight = 0.0
+        buy_take_covered_weight = 0.0
+        sell_take_covered_weight = 0.0
+
+        for item in intents:
+            wq = item.weighted_qty
+            if wq > 0:
+                buy_power += wq
+                stop_pips = _coerce_positive_finite(item.intent.stop_loss_pips)
+                if stop_pips is not None:
+                    buy_weighted_stop_sum += wq * stop_pips
+                    buy_stop_covered_weight += wq
+                take_pips = _coerce_positive_finite(item.intent.take_profit_pips)
+                if take_pips is not None:
+                    buy_weighted_take_sum += wq * take_pips
+                    buy_take_covered_weight += wq
+            elif wq < 0:
+                abs_wq = abs(wq)
+                sell_power += abs_wq
+                stop_pips = _coerce_positive_finite(item.intent.stop_loss_pips)
+                if stop_pips is not None:
+                    sell_weighted_stop_sum += abs_wq * stop_pips
+                    sell_stop_covered_weight += abs_wq
+                take_pips = _coerce_positive_finite(item.intent.take_profit_pips)
+                if take_pips is not None:
+                    sell_weighted_take_sum += abs_wq * take_pips
+                    sell_take_covered_weight += abs_wq
+
+        conflict = self._in_conflict(buy_power, sell_power)
+        lots_epsilon = self._lots_epsilon()
+
+        raw_target = sum(item.weighted_qty for item in intents)
+        target = quantize_to_step(raw_target, self.config.lot_step_lots)
+        if abs(target) < max(self.config.min_open_lot, lots_epsilon):
+            target = 0.0
+        if conflict:
+            target = 0.0
+
+        # Weighted SL/TP within family
+        weighted_stop: float | None = None
+        weighted_take: float | None = None
+        stop_coverage = 0.0
+        take_coverage = 0.0
+        buy_abs_weight = buy_power
+        sell_abs_weight = sell_power
+        if target > lots_epsilon:
+            if buy_abs_weight > lots_epsilon:
+                stop_coverage = buy_stop_covered_weight / buy_abs_weight
+                take_coverage = buy_take_covered_weight / buy_abs_weight
+            if buy_stop_covered_weight > lots_epsilon:
+                weighted_stop = buy_weighted_stop_sum / buy_stop_covered_weight
+            if buy_take_covered_weight > lots_epsilon:
+                weighted_take = buy_weighted_take_sum / buy_take_covered_weight
+        elif target < -lots_epsilon:
+            if sell_abs_weight > lots_epsilon:
+                stop_coverage = sell_stop_covered_weight / sell_abs_weight
+                take_coverage = sell_take_covered_weight / sell_abs_weight
+            if sell_stop_covered_weight > lots_epsilon:
+                weighted_stop = sell_weighted_stop_sum / sell_stop_covered_weight
+            if sell_take_covered_weight > lots_epsilon:
+                weighted_take = sell_weighted_take_sum / sell_take_covered_weight
+
+        return FamilyIntentDecision(
+            family=family,
+            target_net_qty_lots=target,
+            buy_power=buy_power,
+            sell_power=sell_power,
+            conflict_detected=conflict,
+            weighted_stop_loss_pips=weighted_stop,
+            weighted_take_profit_pips=weighted_take,
+            weighted_stop_coverage=clip01(stop_coverage),
+            weighted_take_profit_coverage=clip01(take_coverage),
+            intents=tuple(intents),
+        )
+
     def compute_net_intent(
         self,
         *,
@@ -412,6 +518,7 @@ class VirtualPositionAggregator:
         heartbeat_ok: bool = True,
         risk_blocked: bool = False,
         reconcile_error: bool = False,
+        family_map: dict[str, str] | None = None,
     ) -> NetIntentDecision:
         now = time.time() if now_ts is None else float(now_ts)
         symbol_key = self._symbol_key(symbol)
@@ -473,15 +580,70 @@ class VirtualPositionAggregator:
                 )
             )
 
-        conflict = self._in_conflict(buy_power, sell_power)
+        lots_epsilon = self._lots_epsilon()
+        family_decisions_tuple: tuple[FamilyIntentDecision, ...] = ()
+
+        if family_map is not None:
+            # --- Family netting branch ---
+            family_groups: dict[str, list[NormalizedIntent]] = {}
+            for item in normalized:
+                fam = family_map.get(item.intent.strategy_id, "trend")
+                family_groups.setdefault(fam, []).append(item)
+
+            family_decisions: list[FamilyIntentDecision] = []
+            for fam_name in sorted(family_groups):
+                fd = self._aggregate_family(family=fam_name, intents=family_groups[fam_name])
+                family_decisions.append(fd)
+            family_decisions_tuple = tuple(family_decisions)
+
+            requested_target_net = sum(fd.target_net_qty_lots for fd in family_decisions)
+            requested_target_net = quantize_to_step(requested_target_net, self.config.lot_step_lots)
+            if abs(requested_target_net) < max(self.config.min_open_lot, lots_epsilon):
+                requested_target_net = 0.0
+            target_net = requested_target_net
+
+            # Global conflict = False (cross-family opposition is by design)
+            conflict = False
+
+            # SL/TP from dominant family (largest abs target)
+            dominant_fd = max(family_decisions, key=lambda fd: abs(fd.target_net_qty_lots)) if family_decisions else None
+            weighted_stop_loss_pips: float | None = dominant_fd.weighted_stop_loss_pips if dominant_fd else None
+            weighted_take_profit_pips: float | None = dominant_fd.weighted_take_profit_pips if dominant_fd else None
+            weighted_stop_coverage: float = dominant_fd.weighted_stop_coverage if dominant_fd else 0.0
+            weighted_take_profit_coverage: float = dominant_fd.weighted_take_profit_coverage if dominant_fd else 0.0
+        else:
+            # --- Original global netting branch ---
+            conflict = self._in_conflict(buy_power, sell_power)
+            requested_target_net = sum(item.weighted_qty for item in normalized)
+            requested_target_net = quantize_to_step(requested_target_net, self.config.lot_step_lots)
+            if abs(requested_target_net) < max(self.config.min_open_lot, lots_epsilon):
+                requested_target_net = 0.0
+            target_net = requested_target_net
+
+            weighted_stop_loss_pips = None
+            weighted_take_profit_pips = None
+            weighted_stop_coverage = 0.0
+            weighted_take_profit_coverage = 0.0
+            if target_net > lots_epsilon:
+                if buy_abs_weight > lots_epsilon:
+                    weighted_stop_coverage = buy_stop_covered_weight / buy_abs_weight
+                    weighted_take_profit_coverage = buy_take_covered_weight / buy_abs_weight
+                if buy_stop_covered_weight > lots_epsilon:
+                    weighted_stop_loss_pips = buy_weighted_stop_sum / buy_stop_covered_weight
+                if buy_take_covered_weight > lots_epsilon:
+                    weighted_take_profit_pips = buy_weighted_take_sum / buy_take_covered_weight
+            elif target_net < -lots_epsilon:
+                if sell_abs_weight > lots_epsilon:
+                    weighted_stop_coverage = sell_stop_covered_weight / sell_abs_weight
+                    weighted_take_profit_coverage = sell_take_covered_weight / sell_abs_weight
+                if sell_stop_covered_weight > lots_epsilon:
+                    weighted_stop_loss_pips = sell_weighted_stop_sum / sell_stop_covered_weight
+                if sell_take_covered_weight > lots_epsilon:
+                    weighted_take_profit_pips = sell_weighted_take_sum / sell_take_covered_weight
+
+        # --- Shared reduce_only / exec_delta / state / return ---
         reduce_only = False
         mode = RebalanceMode.NORMAL
-        lots_epsilon = self._lots_epsilon()
-        requested_target_net = sum(item.weighted_qty for item in normalized)
-        requested_target_net = quantize_to_step(requested_target_net, self.config.lot_step_lots)
-        if abs(requested_target_net) < max(self.config.min_open_lot, lots_epsilon):
-            requested_target_net = 0.0
-        target_net = requested_target_net
 
         if not heartbeat_ok:
             mode = RebalanceMode.EMERGENCY
@@ -518,27 +680,6 @@ class VirtualPositionAggregator:
         if abs(exec_delta) < max(deadband, lots_epsilon):
             exec_delta = 0.0
 
-        weighted_stop_loss_pips: float | None = None
-        weighted_take_profit_pips: float | None = None
-        weighted_stop_coverage = 0.0
-        weighted_take_profit_coverage = 0.0
-        if target_net > lots_epsilon:
-            if buy_abs_weight > lots_epsilon:
-                weighted_stop_coverage = buy_stop_covered_weight / buy_abs_weight
-                weighted_take_profit_coverage = buy_take_covered_weight / buy_abs_weight
-            if buy_stop_covered_weight > lots_epsilon:
-                weighted_stop_loss_pips = buy_weighted_stop_sum / buy_stop_covered_weight
-            if buy_take_covered_weight > lots_epsilon:
-                weighted_take_profit_pips = buy_weighted_take_sum / buy_take_covered_weight
-        elif target_net < -lots_epsilon:
-            if sell_abs_weight > lots_epsilon:
-                weighted_stop_coverage = sell_stop_covered_weight / sell_abs_weight
-                weighted_take_profit_coverage = sell_take_covered_weight / sell_abs_weight
-            if sell_stop_covered_weight > lots_epsilon:
-                weighted_stop_loss_pips = sell_weighted_stop_sum / sell_stop_covered_weight
-            if sell_take_covered_weight > lots_epsilon:
-                weighted_take_profit_pips = sell_weighted_take_sum / sell_take_covered_weight
-
         state = self._resolve_state(
             symbol=symbol_key,
             intents_available=bool(normalized),
@@ -565,6 +706,7 @@ class VirtualPositionAggregator:
             weighted_take_profit_coverage=clip01(weighted_take_profit_coverage),
             conflict_detected=conflict,
             intents=tuple(normalized),
+            family_decisions=family_decisions_tuple,
         )
 
     def _resolve_state(
@@ -825,7 +967,7 @@ def allocate_cost_pro_rata(notional_by_strategy: dict[str, float], total_cost: f
 
 
 def debug_decision_payload(decision: NetIntentDecision) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "symbol": decision.symbol,
         "state": decision.state.value,
         "mode": decision.mode.value,
@@ -842,3 +984,16 @@ def debug_decision_payload(decision: NetIntentDecision) -> dict[str, Any]:
         "conflict_detected": decision.conflict_detected,
         "intent_count": len(decision.intents),
     }
+    if decision.family_decisions:
+        payload["family_decisions"] = [
+            {
+                "family": fd.family,
+                "target_net_qty_lots": fd.target_net_qty_lots,
+                "buy_power": fd.buy_power,
+                "sell_power": fd.sell_power,
+                "conflict_detected": fd.conflict_detected,
+                "intent_count": len(fd.intents),
+            }
+            for fd in decision.family_decisions
+        ]
+    return payload
