@@ -17,6 +17,7 @@ from typing import Any
 
 from xtb_bot.config import DEFAULT_MULTI_STRATEGY_COMPONENT_NAMES, resolve_strategy_param
 from xtb_bot.models import Position, Signal, Side
+from xtb_bot.symbols import is_index_symbol as _is_index_symbol
 from xtb_bot.multi_strategy import (
     AggregatorConfig,
     NetIntentDecision,
@@ -41,6 +42,28 @@ from xtb_bot.strategies.base import (
 
 
 logger = logging.getLogger("xtb_bot.worker")
+
+
+def _classify_symbol_asset_class(symbol: str) -> str:
+    """Classify symbol into asset class without requiring WorkerSymbolRuntime.
+
+    Used during bootstrap when worker._symbol_runtime is not yet available.
+    """
+    upper = str(symbol or "").strip().upper()
+    if _is_index_symbol(upper):
+        return "index"
+    if upper.startswith(("XAU", "XAG")) or upper in {
+        "WTI", "BRENT", "NGAS", "NATGAS", "OIL", "SILVER", "GOLD",
+        "COPPER", "PLATINUM", "PALLADIUM", "COCOA", "COFFEE", "SUGAR",
+        "COTTON", "CORN", "WHEAT", "SOYBEAN",
+    }:
+        return "commodity"
+    if upper in {"BTC", "ETH", "LTC", "BCH", "DOGE", "XRP", "SOL"} or upper.endswith(("BTC", "ETH", "USDT")):
+        return "crypto"
+    if len(upper) == 6 and upper.isalpha():
+        return "fx"
+    return "other"
+
 
 _MULTI_STRATEGY_CARRIER_NAME = "multi_strategy"
 _MULTI_STRATEGY_SOFT_OVERLAP_HOLD_RATIO = 0.58
@@ -363,7 +386,9 @@ class WorkerMultiStrategyRuntime:
         )
 
         # Per-asset-class overrides for conflict zone and soft overlap.
-        asset_class = worker._multi_strategy_symbol_asset_class()
+        # NOTE: worker._symbol_runtime is not yet initialized at bootstrap time,
+        # so we classify the symbol directly via the symbols module.
+        asset_class = _classify_symbol_asset_class(worker.symbol)
         conflict_low_by_asset = strategy_params.get("multi_strategy_conflict_ratio_low_by_asset")
         conflict_high_by_asset = strategy_params.get("multi_strategy_conflict_ratio_high_by_asset")
         soft_overlap_by_asset = strategy_params.get("multi_strategy_soft_overlap_ratio_by_asset")
