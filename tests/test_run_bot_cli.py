@@ -834,7 +834,7 @@ def test_main_keeps_index_hybrid_tunable_overrides_when_profile_is_applied(monke
     assert cfg.strategy_params["index_gap_hysteresis_min"] == 0.00025
 
 
-def test_main_ignores_strategy_profile_for_non_index_hybrid(monkeypatch):
+def test_main_applies_safe_strategy_profile_for_momentum(monkeypatch):
     cfg = types.SimpleNamespace(
         strategy="momentum",
         strategy_params={"momentum_confirm_bars": 2},
@@ -845,7 +845,11 @@ def test_main_ignores_strategy_profile_for_non_index_hybrid(monkeypatch):
         cfg,
     )
     assert captured.get("ran") is True
-    assert cfg.strategy_params == {"momentum_confirm_bars": 2}
+    # "safe" maps to conservative profile which overrides params
+    assert cfg.strategy_params["momentum_confirm_bars"] == 2
+    assert cfg.strategy_params["momentum_atr_multiplier"] == 2.0
+    assert cfg.strategy_params["momentum_risk_reward_ratio"] == 2.5
+    assert cfg.strategy_params["momentum_execution_min_confidence_for_entry"] == 0.74
 
 
 def test_main_applies_conservative_strategy_profile_for_mean_breakout_v2(monkeypatch):

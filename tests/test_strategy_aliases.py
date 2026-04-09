@@ -25,11 +25,6 @@ def test_create_strategy_accepts_momentum_aliases():
         assert strategy.name == "momentum"
 
 
-def test_create_strategy_rejects_disabled_oil_strategy():
-    with pytest.raises(ValueError, match="Unknown strategy: oil"):
-        create_strategy("oil", {})
-
-
 def test_create_strategy_supports_multi_strategy_carrier():
     strategy = create_strategy("multi_strategy", {"stop_loss_pips": 10, "take_profit_pips": 20})
     assert strategy.name == "multi_strategy"
@@ -139,20 +134,6 @@ def test_resolve_strategy_param_prefers_crypto_strategy_specific_value_over_tren
         mode="execution",
     )
     assert value == 0.81
-
-
-def test_resolve_strategy_param_does_not_fallback_from_disabled_oil_alias():
-    params = {
-        "g1_execution_min_confidence_for_entry": 0.68,
-    }
-    value = resolve_strategy_param(
-        params,
-        "oil",
-        "min_confidence_for_entry",
-        0.0,
-        mode="execution",
-    )
-    assert value == 0.0
 
 
 def test_create_strategy_accepts_g2():

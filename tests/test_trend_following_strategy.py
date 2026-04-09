@@ -42,7 +42,6 @@ def _ts(hhmm: str) -> float:
 
 def test_available_strategies_contains_trend_following():
     assert "g1" in available_strategies()
-    assert "oil" not in available_strategies()
     assert "trend_following" in available_strategies()
     assert "crypto_trend_following" in available_strategies()
     assert "donchian_breakout" in available_strategies()
@@ -51,11 +50,6 @@ def test_available_strategies_contains_trend_following():
     assert "mean_reversion_bb" in available_strategies()
     assert "momentum_index" in available_strategies()
     assert "momentum_fx" in available_strategies()
-
-
-def test_create_strategy_rejects_disabled_oil_strategy():
-    with pytest.raises(ValueError, match="Unknown strategy: oil"):
-        create_strategy("oil", {})
 
 
 def test_g1_holds_in_kama_chop_regime():

@@ -1655,7 +1655,7 @@ def _parse_strategy_schedule(
                 f"unsupported={','.join(unsupported_symbols) or '-'}"
             )
         label_raw = item.get("label")
-        label = str(label_raw).strip() if label_raw not in (None, "") else None
+        label = str(label_raw).strip() if not _is_blank(label_raw) else None
         entries.append(
             StrategyScheduleEntry(
                 strategy=strategy,
@@ -1699,6 +1699,34 @@ def _as_int(value: Any, default: int) -> int:
     return int(math.ceil(parsed - 0.5))
 
 
+_BOT_ENV_PREFIXES = ("XTB_", "IG_", "BOT_", "BROKER")
+
+_KNOWN_ENV_KEYS: frozenset[str] = frozenset({
+    "BROKER",
+    "BOT_STORAGE_PATH", "BOT_STRICT_BROKER_CONNECT",
+    "BOT_MAGIC_INSTANCE",
+})
+
+
+def _warn_unrecognized_env_keys(used_keys: set[str]) -> None:
+    for key in sorted(os.environ):
+        if not any(key.startswith(p) for p in _BOT_ENV_PREFIXES):
+            continue
+        if key in used_keys or key in _KNOWN_ENV_KEYS:
+            continue
+        # Strategy-scoped keys (XTB_SYMBOLS_MOMENTUM, XTB_STRATEGY_PARAMS_G1, etc.) are dynamic
+        if any(
+            key.startswith(prefix)
+            for prefix in (
+                "XTB_SYMBOLS_", "IG_SYMBOLS_",
+                "XTB_STRATEGY_PARAMS_", "IG_STRATEGY_PARAMS_",
+                "XTB_STRATEGY_PRESETS_", "IG_STRATEGY_PRESETS_",
+            )
+        ):
+            continue
+        logger.warning("unrecognized environment variable: %s (possible typo?)", key)
+
+
 def _as_bool(value: Any, default: bool) -> bool:
     if value is None:
         return default
@@ -1724,13 +1752,21 @@ def _as_symbols(value: Any) -> list[str]:
 
 
 
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+_used_env_keys: set[str] = set()
+
+
 def _resolve(raw_file: dict[str, Any], env_key: str, file_key: str, default: Any = None) -> Any:
+    _used_env_keys.add(env_key)
     env_val = os.getenv(env_key)
-    if env_val not in (None, ""):
+    if not _is_blank(env_val):
         return env_val
     if isinstance(raw_file, dict):
         file_val = raw_file.get(file_key, default)
-        if file_val not in (None, ""):
+        if not _is_blank(file_val):
             return file_val
     return default
 
@@ -1742,15 +1778,17 @@ def _resolve_dual_env(
     file_key: str,
     default: Any = None,
 ) -> Any:
+    _used_env_keys.add(primary_env_key)
+    _used_env_keys.add(secondary_env_key)
     primary = os.getenv(primary_env_key)
-    if primary not in (None, ""):
+    if not _is_blank(primary):
         return primary
     secondary = os.getenv(secondary_env_key)
-    if secondary not in (None, ""):
+    if not _is_blank(secondary):
         return secondary
     if isinstance(raw_file, dict):
         file_val = raw_file.get(file_key, default)
-        if file_val not in (None, ""):
+        if not _is_blank(file_val):
             return file_val
     return default
 
@@ -1783,7 +1821,7 @@ def _resolve_symbols_for_strategy(raw_file: dict[str, Any], broker: str, strateg
         f"{strategy_name}_symbols",
         None,
     )
-    if scoped not in (None, ""):
+    if not _is_blank(scoped):
         return _as_symbols(scoped)
 
     if strategy_name in {"index_hybrid", "g2"}:
@@ -1797,11 +1835,11 @@ def _resolve_symbols_for_strategy(raw_file: dict[str, Any], broker: str, strateg
                 "index_hybrid_symbols",
                 None,
             )
-            if scoped not in (None, ""):
+            if not _is_blank(scoped):
                 return _as_symbols(scoped)
 
         generic = _resolve_dual_env_for_broker(raw_file, broker, "IG_SYMBOLS", "XTB_SYMBOLS", "symbols", None)
-        if generic not in (None, ""):
+        if not _is_blank(generic):
             from xtb_bot.symbols import is_index_symbol as _is_index_symbol
 
             filtered = [symbol for symbol in _as_symbols(generic) if _is_index_symbol(symbol)]
@@ -1871,7 +1909,7 @@ def load_config(
     ig_stream_enabled_override: bool | None = None,
     strict_broker_connect_override: bool | None = None,
 ) -> BotConfig:
-    if config_path not in (None, ""):
+    if not _is_blank(config_path):
         raise ConfigError(
             "JSON config files are no longer supported. "
             "Use .env / environment variables as the single configuration source."
@@ -1895,7 +1933,7 @@ def load_config(
         app_name = _resolve_dual_env(raw_file, "IG_APP_NAME", "XTB_APP_NAME", "app_name", "ig-bot")
         api_key = _resolve(raw_file, "IG_API_KEY", "api_key", "")
         account_id_raw = _resolve(raw_file, "IG_ACCOUNT_ID", "account_id", None)
-        account_id = str(account_id_raw).strip() if account_id_raw not in (None, "") else None
+        account_id = str(account_id_raw).strip() if not _is_blank(account_id_raw) else None
         endpoint = _resolve_dual_env(raw_file, "IG_ENDPOINT", "XTB_ENDPOINT", "endpoint", None)
         symbol_epics = _as_mapping(
             _resolve(raw_file, "IG_SYMBOL_EPICS", "symbol_epics", raw_file.get("ig_symbol_epics"))
@@ -2602,6 +2640,12 @@ def load_config(
 
     if not (0.0 < risk.max_risk_per_trade_pct <= 2.0):
         raise ConfigError("max_risk_per_trade_pct must be in range (0, 2]")
+    if not (0.0 < risk.max_daily_drawdown_pct <= 20.0):
+        raise ConfigError("max_daily_drawdown_pct must be in range (0, 20]")
+    if not (0.0 < risk.max_total_drawdown_pct <= 50.0):
+        raise ConfigError("max_total_drawdown_pct must be in range (0, 50]")
+    if risk.start_balance <= 0:
+        raise ConfigError("start_balance must be > 0")
     if not (0.0 <= risk.drawdown_risk_throttle_daily_start_ratio < 1.0):
         raise ConfigError("drawdown_risk_throttle_daily_start_ratio must be in range [0.0, 1.0)")
     if not (0.0 <= risk.drawdown_risk_throttle_total_start_ratio < 1.0):
@@ -2715,6 +2759,16 @@ def load_config(
         raise ConfigError("account_snapshot_persist_interval_sec must be > 0")
     if risk.symbol_auto_disable_epic_unavailable_threshold < 1:
         raise ConfigError("symbol_auto_disable_epic_unavailable_threshold must be >= 1")
+
+    fast_w = strategy_params.get("fast_window")
+    slow_w = strategy_params.get("slow_window")
+    if fast_w is not None and slow_w is not None:
+        if int(fast_w) <= 0 or int(slow_w) <= 0:
+            raise ConfigError("fast_window and slow_window must be > 0")
+        if int(fast_w) >= int(slow_w):
+            raise ConfigError(
+                f"fast_window ({fast_w}) must be less than slow_window ({slow_w})"
+            )
 
     ig_stream_tick_max_age_sec = _as_float(
         _resolve_dual_env_for_broker(
@@ -2834,7 +2888,7 @@ def load_config(
         None,
     )
     bot_magic_instance = (
-        str(bot_magic_instance_raw).strip() if bot_magic_instance_raw not in (None, "") else None
+        str(bot_magic_instance_raw).strip() if not _is_blank(bot_magic_instance_raw) else None
     )
     if bot_magic_instance is not None:
         if not (4 <= len(bot_magic_instance) <= 20) or not _valid_magic_part(bot_magic_instance):
@@ -2862,6 +2916,8 @@ def load_config(
         else _resolve_symbols_for_strategy(raw_file, broker, str(strategy_value).lower())
     )
 
+    _warn_unrecognized_env_keys(_used_env_keys)
+
     return BotConfig(
         user_id=str(user_id),
         password=str(password),
@@ -2878,7 +2934,7 @@ def load_config(
         storage_path=storage_path,
         endpoint=endpoint,
         broker=broker,
-        api_key=str(api_key) if api_key not in (None, "") else None,
+        api_key=str(api_key) if not _is_blank(api_key) else None,
         account_id=account_id,
         symbol_epics=symbol_epics,
         ig_stream_enabled=ig_stream_enabled,
