@@ -889,6 +889,11 @@ class IgApiClient(BaseBrokerClient):
             "yes",
             "on",
         }
+        self._stream_sdk_forced_transport = (
+            os.getenv("IG_STREAM_SDK_FORCED_TRANSPORT")
+            or os.getenv("XTB_IG_STREAM_SDK_FORCED_TRANSPORT")
+            or None
+        )
         self._stream_sdk_available = _LightstreamerClient is not None and _LightstreamerSubscription is not None
         self._stream_use_sdk = bool(self._stream_enabled and self._stream_sdk_enabled and self._stream_sdk_available)
         self._stream_sdk_client: Any | None = None
@@ -6586,13 +6591,16 @@ class IgApiClient(BaseBrokerClient):
             return
 
         try:
+            forced_transport = self._stream_sdk_forced_transport
             logger.info(
-                "IG Lightstreamer SDK connecting | endpoint=%s account=%s adapter=%s",
-                self._stream_endpoint, self.account_id, LIGHTSTREAMER_ADAPTER_SET,
+                "IG Lightstreamer SDK connecting | endpoint=%s account=%s adapter=%s forced_transport=%s",
+                self._stream_endpoint, self.account_id, LIGHTSTREAMER_ADAPTER_SET, forced_transport,
             )
             client = _LightstreamerClient(self._stream_endpoint, LIGHTSTREAMER_ADAPTER_SET)
             client.connectionDetails.setUser(self.account_id)
             client.connectionDetails.setPassword(f"CST-{self._cst}|XST-{self._security_token}")
+            if forced_transport:
+                client.connectionOptions.setForcedTransport(forced_transport)
             listener = _IgLightstreamerClientListener(self)
             client.addListener(listener)
             self._stream_sdk_client = client
