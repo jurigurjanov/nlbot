@@ -51,6 +51,7 @@ from xtb_bot.bot.close_details import BotCloseDetailsRuntime
 from xtb_bot.bot.trade_metadata import BotTradeMetadataRuntime
 from xtb_bot.bot.position_sync import BotPositionSyncRuntime
 from xtb_bot.bot.worker_lifecycle import BotWorkerLifecycleRuntime
+from xtb_bot.bot.worker_reconcile import BotWorkerReconcileRuntime
 
 
 logger = logging.getLogger(__name__)
@@ -273,6 +274,7 @@ class TradingBot:
         self._price_history = BotPriceHistoryRuntime(self)
         self._position_sync = BotPositionSyncRuntime(self)
         self._worker_lifecycle = BotWorkerLifecycleRuntime(self)
+        self._worker_reconcile = BotWorkerReconcileRuntime(self)
         self._close_details = BotCloseDetailsRuntime(self)
         self._ig_budget = BotIgBudgetRuntime(self)
         self._broker_state = BotBrokerStateRuntime(self)
@@ -680,41 +682,7 @@ class TradingBot:
         self._db_first_loop_retry_after_monotonic_by_name.pop(loop_name, None)
 
     def _static_assignments(self) -> dict[str, WorkerAssignment]:
-        source = (
-            "forced_symbols"
-            if self.config.force_symbols
-            else ("forced" if self.config.force_strategy else "static")
-        )
-        base_strategy_name = str(self.config.strategy).strip().lower()
-        base_strategy_params = self._strategy_params_for(self.config.strategy)
-        if (
-            (self.config.force_symbols or self.config.force_strategy)
-            and base_strategy_name != _MULTI_STRATEGY_CARRIER_NAME
-            and "multi_strategy_enabled" not in base_strategy_params
-        ):
-            assignment_strategy_name = base_strategy_name
-            assignment_strategy_params = dict(base_strategy_params)
-        else:
-            assignment_strategy_name, assignment_strategy_params = self._worker_assignment_payload(
-                self.config.strategy,
-                base_strategy_params,
-            )
-        if (
-            source == "static"
-            and self.config.strategy_schedule
-            and self._schedule_disabled_by_multi_strategy()
-        ):
-            source = "multi_static"
-        return {
-            symbol: WorkerAssignment(
-                symbol=symbol,
-                strategy_name=assignment_strategy_name,
-                strategy_params=dict(assignment_strategy_params),
-                mode_override=self._mode_override_for_symbol(symbol),
-                source=source,
-            )
-            for symbol in self.config.symbols
-        }
+        return self._worker_reconcile._static_assignments()
 
     @staticmethod
     def _worker_lease_key(symbol: str) -> str:
@@ -909,115 +877,20 @@ class TradingBot:
         return self._price_history._history_prefetch_has_time_coverage(symbol, resolution=resolution, target_points=target_points)
 
     def _is_schedule_entry_active(self, now_utc: datetime, entry) -> bool:
-        local_dt = now_utc.astimezone(self._schedule_timezone)
-        minute_of_day = local_dt.hour * 60 + local_dt.minute
-        weekday = local_dt.weekday()
-        if entry.start_minute < entry.end_minute:
-            return weekday in entry.weekdays and entry.start_minute <= minute_of_day < entry.end_minute
-        if weekday in entry.weekdays and minute_of_day >= entry.start_minute:
-            return True
-        previous_weekday = (weekday - 1) % 7
-        if previous_weekday in entry.weekdays and minute_of_day < entry.end_minute:
-            return True
-        return False
+        return self._worker_reconcile._is_schedule_entry_active(now_utc, entry)
 
     def _schedule_assignments(self, now_utc: datetime | None = None) -> dict[str, WorkerAssignment]:
-        current_now = now_utc or self._now_utc()
-        if (
-            self.config.force_symbols
-            or self.config.force_strategy
-            or not self.config.strategy_schedule
-            or self._schedule_disabled_by_multi_strategy()
-        ):
-            return self._static_assignments()
-
-        ranked: dict[str, tuple[int, int, WorkerAssignment]] = {}
-        for index, entry in enumerate(self.config.strategy_schedule):
-            if not self._is_schedule_entry_active(current_now, entry):
-                continue
-            assignment = WorkerAssignment(
-                symbol="",
-                strategy_name=entry.strategy,
-                strategy_params=dict(entry.strategy_params),
-                mode_override=None,
-                source="schedule",
-                label=entry.label or f"{entry.strategy}@{entry.start_time}-{entry.end_time}",
-            )
-            for symbol in entry.symbols:
-                current = ranked.get(symbol)
-                candidate = (
-                    int(entry.priority),
-                    index,
-                    WorkerAssignment(
-                        symbol=symbol,
-                        strategy_name=assignment.strategy_name,
-                        strategy_params=dict(assignment.strategy_params),
-                        mode_override=self._mode_override_for_symbol(symbol),
-                        source=assignment.source,
-                        label=assignment.label,
-                    ),
-                )
-                if current is None or candidate[0] > current[0] or (candidate[0] == current[0] and candidate[1] >= current[1]):
-                    ranked[symbol] = candidate
-        return {symbol: item[2] for symbol, item in ranked.items()}
+        return self._worker_reconcile._schedule_assignments(now_utc)
 
     def _assignment_for_open_position(
         self,
         position: Position,
         fallback: WorkerAssignment | None = None,
     ) -> WorkerAssignment:
-        row = self.store.get_trade_record(position.position_id) or {}
-        strategy_name = str(
-            row.get("strategy")
-            or position.strategy
-            or (fallback.strategy_name if fallback else self.config.strategy)
-        ).strip().lower()
-        if fallback is not None and strategy_name == str(fallback.strategy_name).strip().lower():
-            strategy_params = dict(fallback.strategy_params)
-        elif strategy_name == _MULTI_STRATEGY_CARRIER_NAME:
-            carrier_base_strategy = (
-                self._normalize_strategy_label(row.get("strategy_entry"))
-                or self._normalize_strategy_label(position.strategy_entry)
-                or self._default_strategy_entry_for_assignment(fallback)
-                or self._normalize_strategy_label(self.config.strategy)
-                or self.config.strategy
-            )
-            carrier_name, carrier_params = self._worker_assignment_payload(
-                carrier_base_strategy,
-                self._strategy_params_for(carrier_base_strategy),
-            )
-            strategy_name = carrier_name
-            strategy_params = carrier_params
-        else:
-            strategy_params = self._strategy_params_for(strategy_name)
-        mode_override: RunMode | None = None
-        row_mode = str(row.get("mode") or "").strip().lower()
-        if row_mode in {mode.value for mode in RunMode}:
-            resolved_mode = RunMode(row_mode)
-            if resolved_mode != self.config.mode:
-                mode_override = resolved_mode
-        elif fallback is not None and fallback.mode_override is not None:
-            mode_override = fallback.mode_override
-        else:
-            mode_override = self._mode_override_for_symbol(position.symbol)
-        return WorkerAssignment(
-            symbol=position.symbol,
-            strategy_name=strategy_name,
-            strategy_params=strategy_params,
-            mode_override=mode_override,
-            source="open_position",
-            label=(fallback.label if fallback is not None else None),
-        )
+        return self._worker_reconcile._assignment_for_open_position(position, fallback)
 
     def _target_worker_assignments(self, now_utc: datetime | None = None) -> dict[str, WorkerAssignment]:
-        desired = {
-            self._worker_key(symbol): assignment
-            for symbol, assignment in self._schedule_assignments(now_utc).items()
-        }
-        for position in self.position_book.all_open():
-            symbol_key = self._worker_key(position.symbol)
-            desired[symbol_key] = self._assignment_for_open_position(position, desired.get(symbol_key))
-        return desired
+        return self._worker_reconcile._target_worker_assignments(now_utc)
 
     def _start_worker_for_assignment(self, assignment: WorkerAssignment) -> None:
         self._worker_lifecycle._start_worker_for_assignment(assignment)
@@ -1029,98 +902,10 @@ class TradingBot:
         self._worker_lifecycle._record_deferred_switch(symbol, current, desired)
 
     def _reconcile_workers(self, now_utc: datetime | None = None) -> None:
-        with self._worker_lifecycle_lock:
-            desired = self._target_worker_assignments(now_utc)
-
-            with self._workers_lock:
-                worker_items = list(self.workers.items())
-            for symbol, worker in worker_items:
-                if worker is None:
-                    continue
-                if worker.is_alive():
-                    continue
-                with self._workers_lock:
-                    self.workers.pop(symbol, None)
-                    self._worker_stop_events.pop(symbol, None)
-                    current_assignment = self._worker_assignments.pop(symbol, None)
-                    self._worker_lease_id_by_symbol.pop(self._worker_key(symbol), None)
-                    self._deferred_switch_signature_by_symbol.pop(symbol, None)
-                active_position = self.position_book.get(symbol)
-                restart_assignment = desired.get(symbol)
-                if active_position is not None:
-                    restart_assignment = self._assignment_for_open_position(active_position, restart_assignment)
-                if restart_assignment is not None:
-                    logger.warning(
-                        "Worker for %s stopped unexpectedly, restarting with strategy=%s",
-                        symbol,
-                        restart_assignment.strategy_name,
-                    )
-                    self.store.record_event(
-                        "WARN",
-                        symbol,
-                        "Worker restarted",
-                        {
-                            **self._strategy_event_payload(
-                                restart_assignment.strategy_name,
-                                restart_assignment.strategy_params,
-                            ),
-                            "previous_strategy": self._assignment_strategy_labels(current_assignment)[0],
-                            "previous_strategy_base": self._assignment_strategy_labels(current_assignment)[1],
-                        },
-                    )
-                    self._start_worker_for_assignment(restart_assignment)
-
-            with self._workers_lock:
-                assignment_items = list(self._worker_assignments.items())
-            for symbol, assignment in assignment_items:
-                desired_assignment = desired.get(symbol)
-                active_position = self.position_book.get(symbol)
-                if desired_assignment is None:
-                    if active_position is None:
-                        self._stop_worker_for_symbol(symbol, "schedule_inactive")
-                    continue
-
-                if assignment.runtime_signature() == desired_assignment.runtime_signature():
-                    # Do not restart workers when only metadata/source changed.
-                    if assignment.signature() != desired_assignment.signature():
-                        with self._workers_lock:
-                            self._worker_assignments[symbol] = desired_assignment
-                    with self._workers_lock:
-                        self._deferred_switch_signature_by_symbol.pop(symbol, None)
-                    continue
-
-                if active_position is not None:
-                    self._record_deferred_switch(symbol, assignment, desired_assignment)
-                    continue
-
-                current_mode = (
-                    assignment.mode_override.value if isinstance(assignment.mode_override, RunMode) else self.config.mode.value
-                )
-                desired_mode = (
-                    desired_assignment.mode_override.value
-                    if isinstance(desired_assignment.mode_override, RunMode)
-                    else self.config.mode.value
-                )
-                self._stop_worker_for_symbol(
-                    symbol,
-                    (
-                        "assignment_change:"
-                        f"{assignment.strategy_name}@{current_mode}"
-                        "->"
-                        f"{desired_assignment.strategy_name}@{desired_mode}"
-                    ),
-                )
-                self._start_worker_for_assignment(desired_assignment)
-
-            for symbol, assignment in desired.items():
-                with self._workers_lock:
-                    exists = symbol in self.workers
-                if exists:
-                    continue
-                self._start_worker_for_assignment(assignment)
+        self._worker_reconcile._reconcile_workers(now_utc)
 
     def _start_workers(self) -> None:
-        self._reconcile_workers()
+        self._worker_reconcile._start_workers()
 
     def _runtime_monitor_interval_sec(self) -> float:
         return max(
