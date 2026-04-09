@@ -1021,13 +1021,14 @@ _MULTI_STRATEGY_DEFAULTS: dict[str, Any] = {
         "index_hybrid": 1.45,
     },
     "multi_strategy_fx_weights": {
-        "g1": 0.95,
-        "momentum": 1.10,
-        "trend_following": 0.95,
+        "g1": 0.60,
+        "momentum": 1.30,
+        "trend_following": 1.25,
         "g2": 0.0,
-        "mean_breakout_v2": 1.00,
-        "mean_reversion_bb": 1.10,
-        "index_hybrid": 0.10,
+        "donchian_breakout": 0.70,
+        "mean_breakout_v2": 0.85,
+        "mean_reversion_bb": 0.20,
+        "index_hybrid": 0.0,
     },
     "multi_strategy_commodity_weights": {
         "g1": 0.40,
@@ -1054,6 +1055,12 @@ _MULTI_STRATEGY_DEFAULTS: dict[str, Any] = {
     "multi_strategy_min_conflict_power": 0.05,
     "multi_strategy_conflict_ratio_low": 0.85,
     "multi_strategy_conflict_ratio_high": 1.12,
+    # Per-asset-class overrides for conflict zone and soft overlap.
+    # Keys: "fx", "commodity", "crypto", "index".
+    # If an asset class is not present, the global defaults above are used.
+    "multi_strategy_conflict_ratio_low_by_asset": {"fx": 0.92},
+    "multi_strategy_conflict_ratio_high_by_asset": {"fx": 1.08},
+    "multi_strategy_soft_overlap_ratio_by_asset": {"fx": 0.72},
     "multi_strategy_normalizer_window": 64,
     "multi_strategy_normalizer_min_samples": 12,
     "multi_strategy_normalizer_default": 0.65,

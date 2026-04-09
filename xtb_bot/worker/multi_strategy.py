@@ -127,6 +127,8 @@ class MultiStrategyRuntimeState:
     last_emergency_event_ts: float = 0.0
     last_emergency_signature: str | None = None
     scale_out_offset_by_name: dict[str, float] = field(default_factory=dict)
+    # Per-asset-class soft overlap threshold (overrides _MULTI_STRATEGY_SOFT_OVERLAP_HOLD_RATIO).
+    soft_overlap_hold_ratio: float = _MULTI_STRATEGY_SOFT_OVERLAP_HOLD_RATIO
 
 
 class WorkerMultiStrategyRuntime:
@@ -358,6 +360,27 @@ class WorkerMultiStrategyRuntime:
             1e-6,
         )
 
+        # Per-asset-class overrides for conflict zone and soft overlap.
+        asset_class = worker._multi_strategy_symbol_asset_class()
+        conflict_low_by_asset = strategy_params.get("multi_strategy_conflict_ratio_low_by_asset")
+        conflict_high_by_asset = strategy_params.get("multi_strategy_conflict_ratio_high_by_asset")
+        soft_overlap_by_asset = strategy_params.get("multi_strategy_soft_overlap_ratio_by_asset")
+        if isinstance(conflict_low_by_asset, dict) and asset_class in conflict_low_by_asset:
+            try:
+                conflict_ratio_low = float(conflict_low_by_asset[asset_class])
+            except (TypeError, ValueError):
+                pass
+        if isinstance(conflict_high_by_asset, dict) and asset_class in conflict_high_by_asset:
+            try:
+                conflict_ratio_high = float(conflict_high_by_asset[asset_class])
+            except (TypeError, ValueError):
+                pass
+        if isinstance(soft_overlap_by_asset, dict) and asset_class in soft_overlap_by_asset:
+            try:
+                state.soft_overlap_hold_ratio = max(0.0, min(1.0, float(soft_overlap_by_asset[asset_class])))
+            except (TypeError, ValueError):
+                pass
+
         normalizer_window = max(
             8,
             int(worker._strategy_float_param(strategy_params, "multi_strategy_normalizer_window", 100)),
@@ -393,6 +416,15 @@ class WorkerMultiStrategyRuntime:
             limit=normalizer_window,
         )
         state.enabled = True
+        if asset_class == "fx":
+            logger.info(
+                "Multi-strategy FX tuning applied | symbol=%s conflict_zone=[%.3f,%.3f] soft_overlap=%.3f components=%s",
+                worker.symbol,
+                float(conflict_ratio_low),
+                float(conflict_ratio_high),
+                state.soft_overlap_hold_ratio,
+                ",".join(name for name, _ in components),
+            )
         logger.info(
             (
                 "Multi-strategy netting enabled | symbol=%s base=%s components=%s "
@@ -1433,6 +1465,7 @@ class WorkerMultiStrategyRuntime:
         side = net_side
         soft_overlap_ratio: float | None = None
         soft_overlap_detected = False
+        effective_soft_overlap_threshold = state.soft_overlap_hold_ratio
         if (
             net_side in {Side.BUY, Side.SELL}
             and abs(float(real_position_lots)) <= FLOAT_COMPARISON_TOLERANCE
@@ -1442,7 +1475,7 @@ class WorkerMultiStrategyRuntime:
             opposing_power = min(abs(float(decision.buy_power)), abs(float(decision.sell_power)))
             if dominant_power > max(FLOAT_COMPARISON_TOLERANCE, state.aggregator.config.min_conflict_power):
                 soft_overlap_ratio = opposing_power / dominant_power
-                if soft_overlap_ratio >= _MULTI_STRATEGY_SOFT_OVERLAP_HOLD_RATIO:
+                if soft_overlap_ratio >= effective_soft_overlap_threshold:
                     side = Side.HOLD
                     soft_overlap_detected = True
 
@@ -1483,6 +1516,8 @@ class WorkerMultiStrategyRuntime:
             "multi_regime_mean_reversion_power": regime_payload.get("mean_reversion_power"),
             "multi_net_side": net_side.value,
             "multi_soft_overlap_detected": soft_overlap_detected,
+            "multi_soft_overlap_ratio": soft_overlap_ratio,
+            "multi_soft_overlap_threshold": effective_soft_overlap_threshold,
             **debug_decision_payload(decision),
         }
         summary = self.directional_summary(decision)
