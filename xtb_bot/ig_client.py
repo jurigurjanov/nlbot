@@ -6591,14 +6591,19 @@ class IgApiClient(BaseBrokerClient):
             return
 
         try:
+            # SDK v2 appends /lightstreamer/ to the server address internally,
+            # so strip the suffix that _normalize_lightstreamer_endpoint added.
+            sdk_endpoint = self._stream_endpoint
+            if sdk_endpoint and sdk_endpoint.endswith("/lightstreamer"):
+                sdk_endpoint = sdk_endpoint[: -len("/lightstreamer")]
             # IG Lightstreamer does not support WebSocket (returns 403),
             # so force HTTP-STREAMING unless overridden via env.
             forced_transport = self._stream_sdk_forced_transport or "HTTP-STREAMING"
             logger.info(
                 "IG Lightstreamer SDK connecting | endpoint=%s account=%s adapter=%s transport=%s",
-                self._stream_endpoint, self.account_id, LIGHTSTREAMER_ADAPTER_SET, forced_transport,
+                sdk_endpoint, self.account_id, LIGHTSTREAMER_ADAPTER_SET, forced_transport,
             )
-            client = _LightstreamerClient(self._stream_endpoint, LIGHTSTREAMER_ADAPTER_SET)
+            client = _LightstreamerClient(sdk_endpoint, LIGHTSTREAMER_ADAPTER_SET)
             client.connectionDetails.setUser(self.account_id)
             client.connectionDetails.setPassword(f"CST-{self._cst}|XST-{self._security_token}")
             client.connectionOptions.setForcedTransport(forced_transport)
