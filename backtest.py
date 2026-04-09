@@ -7,16 +7,18 @@ generation and simulates trade execution with SL/TP.
 
 Usage:
     python backtest.py --db state.bck/xtb_bot.db
-    python backtest.py --db state.bck/xtb_bot.db --strategy momentum --symbols US100,DE40
-    python backtest.py --db state.bck/xtb_bot.db --strategy index_hybrid --profile conservative
-    python backtest.py --db state.bck/xtb_bot.db --params '{"momentum_atr_multiplier":2.0}'
-    python backtest.py --db state.bck/xtb_bot.db --compare  # run conservative vs aggressive
+    python backtest.py --db downloads/backtest.db --strategy momentum --symbols US100,DE40
+    python backtest.py --db downloads/backtest.db --strategy index_hybrid --profile conservative
+    python backtest.py --db downloads/backtest.db --compare
+    python backtest.py --db downloads/backtest.db --equity-csv equity.csv
 """
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
+import os
 import sqlite3
 import sys
 import time
@@ -33,6 +35,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from xtb_bot.models import Side, Signal
+from xtb_bot.pip_size import symbol_pip_size_fallback
 from xtb_bot.strategies import create_strategy, available_strategies
 from xtb_bot.strategies.base import Strategy, StrategyContext
 from xtb_bot.strategy_profiles import apply_strategy_profile
@@ -76,6 +79,7 @@ class SymbolResult:
     signals_buy: int = 0
     signals_sell: int = 0
     signals_hold: int = 0
+    equity_curve: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def total_trades(self) -> int:
@@ -124,6 +128,26 @@ class SymbolResult:
             dd = peak - equity
             max_dd = max(max_dd, dd)
         return max_dd
+
+    @property
+    def sharpe_ratio(self) -> float:
+        if len(self.trades) < 2:
+            return 0.0
+        returns = [t.pnl_pips for t in self.trades]
+        mean = sum(returns) / len(returns)
+        variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
+        std = math.sqrt(variance) if variance > 0 else 0.0
+        return mean / std if std > 0 else 0.0
+
+    @property
+    def sortino_ratio(self) -> float:
+        if len(self.trades) < 2:
+            return 0.0
+        returns = [t.pnl_pips for t in self.trades]
+        mean = sum(returns) / len(returns)
+        downside = [min(r, 0.0) ** 2 for r in returns]
+        downside_dev = math.sqrt(sum(downside) / (len(downside) - 1)) if len(downside) > 1 else 0.0
+        return mean / downside_dev if downside_dev > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +243,6 @@ def resample_to_candles(
     for ts, price, vol in ticks:
         candle_start = math.floor(ts / resolution_sec) * resolution_sec
         if candle_start > bucket_start:
-            # Close current candle
             candles.append(Candle(
                 ts=bucket_start,
                 open=bucket_open,
@@ -228,7 +251,6 @@ def resample_to_candles(
                 close=bucket_close,
                 volume=bucket_volume,
             ))
-            # Fill gaps with flat candles
             gap_start = bucket_start + resolution_sec
             while gap_start < candle_start:
                 candles.append(Candle(
@@ -240,7 +262,6 @@ def resample_to_candles(
                     volume=0.0,
                 ))
                 gap_start += resolution_sec
-            # Start new bucket
             bucket_start = candle_start
             bucket_open = price
             bucket_high = price
@@ -253,7 +274,6 @@ def resample_to_candles(
         bucket_close = price
         bucket_volume += vol if vol else 0.0
 
-    # Close last bucket
     candles.append(Candle(
         ts=bucket_start,
         open=bucket_open,
@@ -266,32 +286,23 @@ def resample_to_candles(
 
 
 # ---------------------------------------------------------------------------
-# Pip size helpers
+# Pip size — prefer spec.one_pip_means, then symbol_pip_size_fallback()
 # ---------------------------------------------------------------------------
-def guess_pip_size(symbol: str, spec: SymbolSpec | None) -> float:
-    """Estimate pip size for a symbol."""
-    if spec and spec.one_pip_means:
+def resolve_pip_size(symbol: str, spec: SymbolSpec | None) -> float:
+    if spec and spec.one_pip_means and spec.one_pip_means > 0:
         return spec.one_pip_means
-    if spec:
-        ts = spec.tick_size
-        # For forex pairs tick_size is typically the pip size
-        if ts < 0.01:
-            return ts
-        return ts
-    upper = symbol.upper()
-    # Common defaults
-    if len(upper) == 6 and upper.isalpha():
-        # Forex pair
-        if "JPY" in upper:
-            return 0.01
-        return 0.0001
-    # Indices/commodities: 1 pip = 1 point
-    return 1.0
+    return symbol_pip_size_fallback(symbol, index_pip_size=1.0, energy_pip_size=0.01)
 
 
 # ---------------------------------------------------------------------------
 # Simulation engine
 # ---------------------------------------------------------------------------
+def _compute_pnl(side: Side, entry: float, exit_price: float, pip_size: float) -> float:
+    if side == Side.BUY:
+        return (exit_price - entry) / pip_size
+    return (entry - exit_price) / pip_size
+
+
 def simulate_symbol(
     symbol: str,
     candles: list[Candle],
@@ -302,6 +313,7 @@ def simulate_symbol(
     eval_interval_bars: int = 1,
     cooldown_bars: int = 5,
     spread_pips: float = 1.0,
+    commission_pips: float = 0.0,
 ) -> SymbolResult:
     """
     Run strategy signals over candle history for one symbol.
@@ -314,15 +326,20 @@ def simulate_symbol(
     if len(candles) < warmup_bars + 10:
         return result
 
-    pip_size = guess_pip_size(symbol, spec)
+    pip_size = resolve_pip_size(symbol, spec)
     tick_size = spec.tick_size if spec else pip_size
+
+    # Pre-build arrays once (avoid O(n^2) list comprehensions per bar)
+    all_prices = [c.close for c in candles]
+    all_timestamps = [c.ts for c in candles]
+    all_volumes = [c.volume for c in candles]
 
     open_trade: SimTrade | None = None
     cooldown_until_bar: int = 0
+    equity = 0.0
 
     for bar_idx in range(warmup_bars, len(candles)):
         candle = candles[bar_idx]
-        price = candle.close
 
         # --- Check open trade SL/TP against candle range ---
         if open_trade is not None:
@@ -332,22 +349,26 @@ def simulate_symbol(
             if open_trade.side == Side.BUY:
                 hit_sl = candle.low <= open_trade.stop_loss
                 hit_tp = candle.high >= open_trade.take_profit
-            else:  # SELL
+            else:
                 hit_sl = candle.high >= open_trade.stop_loss
                 hit_tp = candle.low <= open_trade.take_profit
 
             if hit_sl and hit_tp:
-                # Ambiguous: assume SL hit first (conservative)
-                hit_tp = False
+                # Disambiguate: which level is closer to candle open?
+                dist_sl = abs(candle.open - open_trade.stop_loss)
+                dist_tp = abs(candle.open - open_trade.take_profit)
+                if dist_sl <= dist_tp:
+                    hit_tp = False
+                else:
+                    hit_sl = False
 
             if hit_sl:
                 open_trade.exit_price = open_trade.stop_loss
                 open_trade.exit_ts = candle.ts
                 open_trade.exit_reason = "stop_loss"
-                if open_trade.side == Side.BUY:
-                    open_trade.pnl_pips = (open_trade.exit_price - open_trade.entry_price) / pip_size
-                else:
-                    open_trade.pnl_pips = (open_trade.entry_price - open_trade.exit_price) / pip_size
+                open_trade.pnl_pips = _compute_pnl(open_trade.side, open_trade.entry_price, open_trade.exit_price, pip_size) - commission_pips
+                equity += open_trade.pnl_pips
+                result.equity_curve.append((candle.ts, equity))
                 result.trades.append(open_trade)
                 open_trade = None
                 cooldown_until_bar = bar_idx + cooldown_bars
@@ -355,10 +376,9 @@ def simulate_symbol(
                 open_trade.exit_price = open_trade.take_profit
                 open_trade.exit_ts = candle.ts
                 open_trade.exit_reason = "take_profit"
-                if open_trade.side == Side.BUY:
-                    open_trade.pnl_pips = (open_trade.exit_price - open_trade.entry_price) / pip_size
-                else:
-                    open_trade.pnl_pips = (open_trade.entry_price - open_trade.exit_price) / pip_size
+                open_trade.pnl_pips = _compute_pnl(open_trade.side, open_trade.entry_price, open_trade.exit_price, pip_size) - commission_pips
+                equity += open_trade.pnl_pips
+                result.equity_curve.append((candle.ts, equity))
                 result.trades.append(open_trade)
                 open_trade = None
                 cooldown_until_bar = bar_idx + cooldown_bars
@@ -367,17 +387,16 @@ def simulate_symbol(
         if bar_idx % eval_interval_bars != 0:
             continue
 
-        # Build context from history up to current bar (inclusive)
-        window = candles[: bar_idx + 1]
-        prices = [c.close for c in window]
-        timestamps = [c.ts for c in window]
-        volumes = [c.volume for c in window]
-
+        # Pass only the last `warmup_bars` prices — strategies don't need
+        # more history and this keeps generate_signal() at O(warmup) per bar
+        # instead of O(bar_idx).
+        window_start = max(0, bar_idx + 1 - warmup_bars)
+        end = bar_idx + 1
         ctx = StrategyContext(
             symbol=symbol,
-            prices=prices,
-            timestamps=timestamps,
-            volumes=volumes,
+            prices=all_prices[window_start:end],
+            timestamps=all_timestamps[window_start:end],
+            volumes=all_volumes[window_start:end],
             current_volume=candle.volume if candle.volume else None,
             current_spread_pips=spread_pips,
             tick_size=tick_size,
@@ -399,22 +418,21 @@ def simulate_symbol(
 
         # --- Entry logic ---
         if open_trade is not None:
-            continue  # already in a trade
+            continue
         if bar_idx < cooldown_until_bar:
             continue
 
         sl_pips = max(signal.stop_loss_pips, 5.0)
         tp_pips = max(signal.take_profit_pips, sl_pips * 1.5)
 
-        # Apply half-spread slippage
         half_spread = spread_pips * pip_size * 0.5
 
         if signal.side == Side.BUY:
-            entry = price + half_spread
+            entry = candle.close + half_spread
             sl = entry - sl_pips * pip_size
             tp = entry + tp_pips * pip_size
         else:
-            entry = price - half_spread
+            entry = candle.close - half_spread
             sl = entry + sl_pips * pip_size
             tp = entry - tp_pips * pip_size
 
@@ -436,10 +454,9 @@ def simulate_symbol(
         open_trade.exit_price = last.close
         open_trade.exit_ts = last.ts
         open_trade.exit_reason = "end_of_data"
-        if open_trade.side == Side.BUY:
-            open_trade.pnl_pips = (open_trade.exit_price - open_trade.entry_price) / pip_size
-        else:
-            open_trade.pnl_pips = (open_trade.entry_price - open_trade.exit_price) / pip_size
+        open_trade.pnl_pips = _compute_pnl(open_trade.side, open_trade.entry_price, open_trade.exit_price, pip_size) - commission_pips
+        equity += open_trade.pnl_pips
+        result.equity_curve.append((last.ts, equity))
         result.trades.append(open_trade)
 
     return result
@@ -479,8 +496,6 @@ def load_strategy_params_from_env() -> dict[str, Any]:
             if stripped.startswith("XTB_STRATEGY_PARAMS="):
                 json_str = stripped[len("XTB_STRATEGY_PARAMS="):]
                 return json.loads(json_str)
-            if stripped.startswith("XTB_STRATEGY_PARAMS="):
-                return json.loads(stripped.split("=", 1)[1])
     except Exception:
         pass
     return {}
@@ -514,14 +529,14 @@ def format_results_table(
     """Format results as an aligned text table."""
     lines: list[str] = []
     if label:
-        lines.append(f"\n{'=' * 80}")
+        lines.append(f"\n{'=' * 100}")
         lines.append(f"  {label}")
-        lines.append(f"{'=' * 80}")
+        lines.append(f"{'=' * 100}")
 
     header = (
         f"{'Symbol':<10} {'Trades':>6} {'Wins':>5} {'Loss':>5} "
         f"{'WR%':>6} {'PnL':>10} {'AvgWin':>8} {'AvgLoss':>8} "
-        f"{'PF':>6} {'MaxDD':>8} {'Signals':>12}"
+        f"{'PF':>6} {'MaxDD':>8} {'Sharpe':>7} {'Sortino':>8} {'Signals':>12}"
     )
     lines.append(header)
     lines.append("-" * len(header))
@@ -535,7 +550,7 @@ def format_results_table(
     for sym in sorted_symbols:
         r = results[sym]
         if r.total_trades == 0:
-            lines.append(f"{sym:<10} {'—':>6}")
+            lines.append(f"{sym:<10} {'--':>6}")
             continue
         total_trades += r.total_trades
         total_wins += r.wins
@@ -544,11 +559,13 @@ def format_results_table(
         pf = r.profit_factor
         pf_str = f"{pf:.2f}" if pf < 999 else "INF"
         signals = f"B{r.signals_buy}/S{r.signals_sell}/H{r.signals_hold}"
+        sharpe_str = f"{r.sharpe_ratio:.2f}" if r.total_trades >= 2 else "--"
+        sortino_str = f"{r.sortino_ratio:.2f}" if r.total_trades >= 2 else "--"
         lines.append(
             f"{sym:<10} {r.total_trades:>6} {r.wins:>5} {r.losses:>5} "
             f"{r.win_rate * 100:>5.1f}% {r.total_pnl_pips:>+10.1f} "
             f"{r.avg_win_pips:>+8.1f} {r.avg_loss_pips:>+8.1f} "
-            f"{pf_str:>6} {r.max_drawdown_pips:>8.1f} {signals:>12}"
+            f"{pf_str:>6} {r.max_drawdown_pips:>8.1f} {sharpe_str:>7} {sortino_str:>8} {signals:>12}"
         )
 
     lines.append("-" * len(header))
@@ -562,6 +579,8 @@ def format_results_table(
 
 def format_trade_list(results: dict[str, SymbolResult], limit: int = 50) -> str:
     """Format detailed trade list."""
+    from datetime import datetime, timezone
+
     all_trades: list[SimTrade] = []
     for r in results.values():
         all_trades.extend(r.trades)
@@ -573,8 +592,7 @@ def format_trade_list(results: dict[str, SymbolResult], limit: int = 50) -> str:
     ]
     lines.append("-" * 90)
     for t in all_trades[:limit]:
-        from datetime import datetime
-        ts_str = datetime.utcfromtimestamp(t.entry_ts).strftime("%H:%M:%S")
+        ts_str = datetime.fromtimestamp(t.entry_ts, tz=timezone.utc).strftime("%m/%d %H:%M")
         lines.append(
             f"{t.symbol:<8} {t.side.value:<5} {t.entry_price:>10.2f} "
             f"{t.stop_loss:>10.2f} {t.take_profit:>10.2f} "
@@ -584,6 +602,43 @@ def format_trade_list(results: dict[str, SymbolResult], limit: int = 50) -> str:
     if len(all_trades) > limit:
         lines.append(f"  ... and {len(all_trades) - limit} more trades")
     return "\n".join(lines)
+
+
+def write_equity_csv(results: dict[str, SymbolResult], path: Path) -> None:
+    """Write combined equity curve to CSV."""
+    from datetime import datetime, timezone
+
+    all_points: list[tuple[float, str, float]] = []
+    for r in results.values():
+        for ts, eq in r.equity_curve:
+            all_points.append((ts, r.symbol, eq))
+    all_points.sort(key=lambda x: x[0])
+
+    with open(path, "w") as f:
+        f.write("timestamp,datetime,symbol,equity_pips\n")
+        for ts, sym, eq in all_points:
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"{ts:.0f},{dt},{sym},{eq:.2f}\n")
+
+
+# ---------------------------------------------------------------------------
+# Parallel simulation helper
+# ---------------------------------------------------------------------------
+def _simulate_one(args: tuple) -> tuple[str, SymbolResult]:
+    (symbol, ticks, strategy_name, strategy_params, spec,
+     warmup_bars, candle_sec, spread_pips, commission_pips) = args
+    candles = resample_to_candles(ticks, resolution_sec=candle_sec)
+    strategy = create_strategy(strategy_name, strategy_params)
+    result = simulate_symbol(
+        symbol=symbol,
+        candles=candles,
+        strategy=strategy,
+        spec=spec,
+        warmup_bars=warmup_bars,
+        spread_pips=spread_pips,
+        commission_pips=commission_pips,
+    )
+    return symbol, result
 
 
 # ---------------------------------------------------------------------------
@@ -597,33 +652,27 @@ def run_backtest(
     profile: str | None = None,
     warmup_bars: int = 250,
     candle_sec: int = 60,
+    commission_pips: float = 0.0,
+    parallel: bool = False,
     verbose: bool = False,
 ) -> dict[str, SymbolResult]:
     """Run backtest for a strategy across symbols."""
 
-    # Load base params from .env
     base_params = load_strategy_params_from_env()
     strategy_specific = load_strategy_specific_params(strategy_name)
     params = {**base_params, **strategy_specific}
 
-    # Apply profile if specified
     if profile:
         params, applied = apply_strategy_profile(strategy_name, params, profile)
         if verbose:
             print(f"Profile '{profile}' applied: {applied}")
 
-    # Apply user overrides
     if params_override:
         params.update(params_override)
 
-    # Ensure minimum required params
     params.setdefault("stop_loss_pips", 25)
     params.setdefault("take_profit_pips", 50)
 
-    # Create strategy
-    strategy = create_strategy(strategy_name, params)
-
-    # Load data
     print(f"Loading price history from {db_path} ...")
     history = load_price_history(db_path, symbols)
     specs = load_symbol_specs(db_path)
@@ -634,8 +683,25 @@ def run_backtest(
 
     print(f"Loaded {sum(len(v) for v in history.values())} ticks across {len(history)} symbols")
 
-    # Run simulation per symbol
-    results: dict[str, SymbolResult] = {}
+    if parallel and len(history) > 1:
+        workers = min(len(history), os.cpu_count() or 4)
+        print(f"Running {len(history)} symbols in parallel ({workers} workers) ...")
+        task_args = [
+            (sym, ticks, strategy_name, params, specs.get(sym),
+             warmup_bars, candle_sec, get_spread(sym), commission_pips)
+            for sym, ticks in sorted(history.items())
+        ]
+        results: dict[str, SymbolResult] = {}
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            for sym, result in pool.map(_simulate_one, task_args):
+                results[sym] = result
+                if verbose:
+                    print(f"  {sym}: {result.total_trades} trades")
+        return results
+
+    # Sequential
+    strategy = create_strategy(strategy_name, params)
+    results = {}
     for sym, ticks in sorted(history.items()):
         candles = resample_to_candles(ticks, resolution_sec=candle_sec)
         if verbose:
@@ -651,6 +717,7 @@ def run_backtest(
             spec=spec,
             warmup_bars=warmup_bars,
             spread_pips=spread,
+            commission_pips=commission_pips,
         )
         results[sym] = result
 
@@ -663,12 +730,11 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python backtest.py --db state.bck/xtb_bot.db
-  python backtest.py --db state.bck/xtb_bot.db --strategy g2 --symbols US100,DE40
-  python backtest.py --db state.bck/xtb_bot.db --profile aggressive
-  python backtest.py --db state.bck/xtb_bot.db --params '{"momentum_atr_multiplier":2.0}'
-  python backtest.py --db state.bck/xtb_bot.db --compare
-  python backtest.py --db state.bck/xtb_bot.db --trades
+  python backtest.py --db downloads/backtest.db
+  python backtest.py --db downloads/backtest.db --strategy g2 --symbols US100,DE40
+  python backtest.py --db downloads/backtest.db --profile aggressive
+  python backtest.py --db downloads/backtest.db --compare
+  python backtest.py --db downloads/backtest.db --parallel --equity-csv equity.csv
         """,
     )
     parser.add_argument("--db", default=None, help="Path to SQLite state database")
@@ -682,8 +748,11 @@ Examples:
     parser.add_argument("--profile", default=None, help="Strategy profile: safe|conservative|aggressive")
     parser.add_argument("--warmup", type=int, default=250, help="Warmup bars before trading (default: 250)")
     parser.add_argument("--candle-sec", type=int, default=60, help="Candle resolution in seconds (default: 60)")
+    parser.add_argument("--commission-pips", type=float, default=0.0, help="Commission per trade in pips (default: 0)")
     parser.add_argument("--trades", action="store_true", help="Show detailed trade list")
     parser.add_argument("--compare", action="store_true", help="Compare conservative vs aggressive profiles")
+    parser.add_argument("--parallel", action="store_true", help="Run symbols in parallel (multi-process)")
+    parser.add_argument("--equity-csv", default=None, help="Write equity curve to CSV file")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
     args = parser.parse_args()
@@ -703,7 +772,6 @@ Examples:
     params_override = json.loads(args.params) if args.params else None
 
     if args.compare:
-        # Run both profiles and compare
         t0 = time.monotonic()
         print(f"Strategy: {args.strategy}")
         print(f"Comparing conservative vs aggressive profiles ...\n")
@@ -714,6 +782,8 @@ Examples:
             profile="conservative",
             warmup_bars=args.warmup,
             candle_sec=args.candle_sec,
+            commission_pips=args.commission_pips,
+            parallel=args.parallel,
             verbose=args.verbose,
         )
         print(format_results_table(results_cons, label=f"{args.strategy} / CONSERVATIVE"))
@@ -724,11 +794,12 @@ Examples:
             profile="aggressive",
             warmup_bars=args.warmup,
             candle_sec=args.candle_sec,
+            commission_pips=args.commission_pips,
+            parallel=args.parallel,
             verbose=args.verbose,
         )
         print(format_results_table(results_aggr, label=f"{args.strategy} / AGGRESSIVE"))
 
-        # Summary comparison
         def _totals(results: dict[str, SymbolResult]) -> tuple[int, int, float]:
             trades = sum(r.total_trades for r in results.values())
             wins = sum(r.wins for r in results.values())
@@ -757,12 +828,19 @@ Examples:
         profile=args.profile,
         warmup_bars=args.warmup,
         candle_sec=args.candle_sec,
+        commission_pips=args.commission_pips,
+        parallel=args.parallel,
         verbose=args.verbose,
     )
     print(format_results_table(results, label=" / ".join(label_parts)))
 
     if args.trades:
         print(format_trade_list(results))
+
+    if args.equity_csv:
+        eq_path = Path(args.equity_csv)
+        write_equity_csv(results, eq_path)
+        print(f"\nEquity curve written to {eq_path}")
 
     elapsed = time.monotonic() - t0
     print(f"\nElapsed: {elapsed:.1f}s")
