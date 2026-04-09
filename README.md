@@ -1710,6 +1710,67 @@ xtb-bot --cleanup-incompatible-open-trades --cleanup-dry-run
 xtb-bot --cleanup-incompatible-open-trades
 ```
 
+## Бэктестер
+
+Бэктестер позволяет прогнать стратегии на исторических данных из production базы перед деплоем изменений.
+
+### Быстрый старт
+
+```bash
+# Скопировать production БД (rsync с сервера)
+rsync -avz server:/path/to/state/xtb_bot.db state.bck/
+
+# Запуск с дефолтной стратегией (momentum) по всем символам
+python backtest.py --db state.bck/xtb_bot.db
+
+# Конкретная стратегия и символы
+python backtest.py --db state.bck/xtb_bot.db --strategy index_hybrid --symbols US100,DE40,JPN225
+
+# С детализацией по каждой сделке
+python backtest.py --db state.bck/xtb_bot.db --strategy trend_following --trades
+
+# С конкретным профилем (safe / conservative / aggressive)
+python backtest.py --db state.bck/xtb_bot.db --strategy momentum --profile aggressive
+
+# Сравнение conservative vs aggressive
+python backtest.py --db state.bck/xtb_bot.db --strategy momentum --compare
+
+# Переопределение параметров стратегии
+python backtest.py --db state.bck/xtb_bot.db --params '{"momentum_atr_multiplier":2.0}'
+```
+
+### Параметры
+
+| Флаг | Описание |
+|------|----------|
+| `--db` | Путь к SQLite БД с таблицей `price_history` (обязательный) |
+| `--strategy` | Имя стратегии (default: `momentum`). Все доступные: `momentum`, `index_hybrid`, `g1`, `g2`, `trend_following`, `donchian_breakout`, `mean_reversion_bb`, `mean_breakout_v2`, `crypto_trend_following` |
+| `--symbols` | Фильтр символов через запятую (default: все символы из БД) |
+| `--profile` | Профиль стратегии: `safe`, `conservative`, `aggressive` |
+| `--params` | JSON с переопределением параметров стратегии |
+| `--warmup` | Количество свечей для прогрева индикаторов (default: 250) |
+| `--candle-sec` | Размер свечи в секундах (default: 60 = M1) |
+| `--trades` | Вывод детализации по каждой сделке |
+| `--compare` | Прогнать conservative vs aggressive и показать сравнение |
+| `-v` | Verbose: логирование каждого сигнала |
+
+### Как работает
+
+1. Загружает тики из `price_history` в SQLite БД
+2. Пересэмплирует тики в OHLCV свечи (по умолчанию M1)
+3. Walk-forward симуляция: на каждой свече строит `StrategyContext`, вызывает `generate_signal()`
+4. При получении сигнала открывает виртуальную сделку с SL/TP
+5. На каждом тике проверяет срабатывание SL/TP
+6. Выводит статистику: trades, WR%, PnL, profit factor, max drawdown
+
+### Что учитывать
+
+- Параметры стратегии загружаются из `.env` (переменные `XTB_STRATEGY_PARAMS` и `XTB_STRATEGY_PARAMS_<STRATEGY>`)
+- Спреды оцениваются приблизительно (захардкожены в `DEFAULT_SPREADS`)
+- Нет моделирования slippage, комиссий, проскальзывания
+- Для достоверных результатов нужно минимум 3-5 дней данных (50K+ тиков на символ)
+- `end_of_data` в колонке Reason означает, что сделка не успела закрыться по SL/TP до конца данных
+
 ## Тесты
 
 Установка dev-зависимостей:
