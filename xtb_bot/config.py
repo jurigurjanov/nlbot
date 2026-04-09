@@ -1704,8 +1704,30 @@ _BOT_ENV_PREFIXES = ("XTB_", "IG_", "BOT_", "BROKER")
 _KNOWN_ENV_KEYS: frozenset[str] = frozenset({
     "BROKER",
     "BOT_STORAGE_PATH", "BOT_STRICT_BROKER_CONNECT",
-    "BOT_MAGIC_INSTANCE",
+    "BOT_MAGIC_INSTANCE", "BOT_DOTENV_PREFER_ENV",
 })
+
+# Prefixes for env vars consumed outside config.py (ig_client, worker, state_store, etc.)
+_KNOWN_ENV_PREFIXES_EXTRA: tuple[str, ...] = (
+    # IG broker / stream / epic / trading
+    "IG_STREAM_", "IG_EPIC_", "IG_OPEN_", "IG_TRADE_",
+    "IG_GUARANTEED_", "IG_INVALID_", "IG_REST_",
+    "IG_CONNECTIVITY_", "IG_STRATEGY_",
+    # XTB DB tuning
+    "XTB_DB_",
+    # XTB storage
+    "XTB_STORAGE_",
+    # XTB control / runtime
+    "XTB_CONTROL_", "XTB_RUNTIME_",
+    # XTB IG proxy / budget / account
+    "XTB_IG_",
+    # XTB multi-db async writer
+    "XTB_MULTI_DB_",
+    # XTB passive history
+    "XTB_PASSIVE_",
+    # XTB trade reason summary
+    "XTB_TRADE_REASON_",
+)
 
 
 def _warn_unrecognized_env_keys(used_keys: set[str]) -> None:
@@ -1714,13 +1736,14 @@ def _warn_unrecognized_env_keys(used_keys: set[str]) -> None:
             continue
         if key in used_keys or key in _KNOWN_ENV_KEYS:
             continue
-        # Strategy-scoped keys (XTB_SYMBOLS_MOMENTUM, XTB_STRATEGY_PARAMS_G1, etc.) are dynamic
+        # Strategy-scoped keys and keys consumed outside config.py
         if any(
             key.startswith(prefix)
             for prefix in (
                 "XTB_SYMBOLS_", "IG_SYMBOLS_",
                 "XTB_STRATEGY_PARAMS_", "IG_STRATEGY_PARAMS_",
                 "XTB_STRATEGY_PRESETS_", "IG_STRATEGY_PRESETS_",
+                *_KNOWN_ENV_PREFIXES_EXTRA,
             )
         ):
             continue
