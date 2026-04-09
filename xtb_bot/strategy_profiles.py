@@ -621,6 +621,287 @@ _MEAN_REVERSION_BB_PROFILES: Mapping[str, Mapping[str, Any]] = _freeze_mapping({
     "aggressive": _MEAN_REVERSION_BB_AGGRESSIVE,
 })
 
+# ---------------------------------------------------------------------------
+# Momentum profiles
+# ---------------------------------------------------------------------------
+# Conservative: wider stops, higher confidence, stronger trend confirmation.
+# Aggressive: tighter stops, lower confidence, faster entries.
+_MOMENTUM_CONSERVATIVE: Mapping[str, Any] = _freeze_mapping({
+    "fast_window": 8,
+    "slow_window": 21,
+    "momentum_ma_type": "ema",
+    "momentum_entry_mode": "cross_or_trend",
+    "momentum_confirm_bars": 2,
+    "momentum_timeframe_sec": 60,
+    "momentum_atr_window": 14,
+    "momentum_atr_multiplier": 2.0,
+    "momentum_risk_reward_ratio": 2.5,
+    "momentum_min_stop_loss_pips": 18.0,
+    "momentum_min_take_profit_pips": 36.0,
+    "momentum_low_tf_risk_profile_enabled": True,
+    "momentum_low_tf_atr_multiplier_cap": 2.0,
+    "momentum_low_tf_risk_reward_ratio_cap": 2.5,
+    "momentum_low_tf_min_stop_loss_pips": 14.0,
+    "momentum_low_tf_min_take_profit_pips": 28.0,
+    "momentum_max_spread_to_stop_ratio": 0.18,
+    "momentum_max_spread_to_atr_ratio": 0.35,
+    "momentum_trade_cooldown_sec": 420,
+    "momentum_trade_cooldown_win_sec": 120,
+    "momentum_trade_cooldown_loss_sec": 600,
+    "momentum_trade_cooldown_flat_sec": 240,
+    "momentum_min_slope_atr_ratio": 0.09,
+    "momentum_min_trend_gap_atr": 0.16,
+    "momentum_max_price_slow_gap_atr": 1.2,
+    "momentum_pullback_entry_max_gap_atr": 0.75,
+    "momentum_price_gap_mode": "wait_pullback",
+    "momentum_volume_confirmation": True,
+    "momentum_min_volume_ratio": 1.5,
+    "momentum_volume_min_samples": 10,
+    "momentum_volume_allow_missing": False,
+    "momentum_higher_tf_bias_enabled": True,
+    "momentum_regime_adx_filter_enabled": True,
+    "momentum_regime_min_adx": 26.0,
+    "momentum_regime_adx_hysteresis": 2.0,
+    "momentum_kama_gate_enabled": True,
+    "momentum_kama_min_efficiency_ratio": 0.18,
+    "momentum_kama_min_slope_atr_ratio": 0.06,
+    "momentum_session_filter_enabled": True,
+    "momentum_session_start_hour_utc": 7,
+    "momentum_session_end_hour_utc": 21,
+    "momentum_signal_only_min_confidence_for_entry": 0.66,
+    "momentum_paper_min_confidence_for_entry": 0.70,
+    "momentum_execution_min_confidence_for_entry": 0.74,
+})
+
+_MOMENTUM_AGGRESSIVE: Mapping[str, Any] = _freeze_mapping({
+    "fast_window": 8,
+    "slow_window": 21,
+    "momentum_ma_type": "ema",
+    "momentum_entry_mode": "cross_or_trend",
+    "momentum_confirm_bars": 1,
+    "momentum_timeframe_sec": 60,
+    "momentum_atr_window": 14,
+    "momentum_atr_multiplier": 1.5,
+    "momentum_risk_reward_ratio": 2.0,
+    "momentum_min_stop_loss_pips": 12.0,
+    "momentum_min_take_profit_pips": 22.0,
+    "momentum_low_tf_risk_profile_enabled": True,
+    "momentum_low_tf_atr_multiplier_cap": 1.5,
+    "momentum_low_tf_risk_reward_ratio_cap": 2.0,
+    "momentum_low_tf_min_stop_loss_pips": 9.0,
+    "momentum_low_tf_min_take_profit_pips": 18.0,
+    "momentum_max_spread_to_stop_ratio": 0.22,
+    "momentum_max_spread_to_atr_ratio": 0.45,
+    "momentum_trade_cooldown_sec": 240,
+    "momentum_trade_cooldown_win_sec": 60,
+    "momentum_trade_cooldown_loss_sec": 300,
+    "momentum_trade_cooldown_flat_sec": 120,
+    "momentum_min_slope_atr_ratio": 0.06,
+    "momentum_min_trend_gap_atr": 0.10,
+    "momentum_max_price_slow_gap_atr": 1.5,
+    "momentum_pullback_entry_max_gap_atr": 1.0,
+    "momentum_price_gap_mode": "wait_pullback",
+    "momentum_volume_confirmation": True,
+    "momentum_min_volume_ratio": 1.2,
+    "momentum_volume_min_samples": 8,
+    "momentum_volume_allow_missing": False,
+    "momentum_higher_tf_bias_enabled": True,
+    "momentum_regime_adx_filter_enabled": True,
+    "momentum_regime_min_adx": 22.0,
+    "momentum_regime_adx_hysteresis": 2.0,
+    "momentum_kama_gate_enabled": True,
+    "momentum_kama_min_efficiency_ratio": 0.14,
+    "momentum_kama_min_slope_atr_ratio": 0.04,
+    "momentum_session_filter_enabled": True,
+    "momentum_session_start_hour_utc": 6,
+    "momentum_session_end_hour_utc": 22,
+    "momentum_signal_only_min_confidence_for_entry": 0.56,
+    "momentum_paper_min_confidence_for_entry": 0.60,
+    "momentum_execution_min_confidence_for_entry": 0.64,
+})
+
+_MOMENTUM_PROFILES: Mapping[str, Mapping[str, Any]] = _freeze_mapping({
+    "safe": _MOMENTUM_CONSERVATIVE,
+    "conservative": _MOMENTUM_CONSERVATIVE,
+    "aggressive": _MOMENTUM_AGGRESSIVE,
+})
+
+# ---------------------------------------------------------------------------
+# G1 profiles
+# ---------------------------------------------------------------------------
+_G1_CONSERVATIVE: Mapping[str, Any] = _freeze_mapping({
+    "g1_trade_cooldown_sec": 2400,
+    "g1_entry_mode": "cross_only",
+    "g1_min_trend_gap_ratio": 0.00020,
+    "g1_min_cross_gap_ratio": 0.00015,
+    "g1_adx_hysteresis": 2.5,
+    "g1_min_slow_slope_ratio": 5e-05,
+    "g1_max_price_ema_gap_atr_multiple": 0.7,
+    "g1_index_max_price_ema_gap_atr_multiple": 0.8,
+    "g1_commodity_max_price_ema_gap_atr_multiple": 0.8,
+    "g1_min_volume_ratio": 1.7,
+    "g1_volume_require_spike": True,
+    "g1_kama_gate_enabled": True,
+    "g1_kama_min_efficiency_ratio": 0.20,
+    "g1_continuation_confidence_cap": 0.68,
+    "g1_cross_confidence_cap": 0.95,
+    "g1_signal_only_min_confidence_for_entry": 0.64,
+    "g1_paper_min_confidence_for_entry": 0.68,
+    "g1_execution_min_confidence_for_entry": 0.72,
+    "g1_fx_atr_multiplier": 2.0,
+    "g1_index_atr_multiplier": 2.5,
+    "g1_commodity_atr_multiplier": 2.8,
+    "g1_commodity_adx_threshold": 26.0,
+})
+
+_G1_AGGRESSIVE: Mapping[str, Any] = _freeze_mapping({
+    "g1_trade_cooldown_sec": 1200,
+    "g1_entry_mode": "cross_or_trend",
+    "g1_min_trend_gap_ratio": 0.00012,
+    "g1_min_cross_gap_ratio": 8e-05,
+    "g1_adx_hysteresis": 1.5,
+    "g1_min_slow_slope_ratio": 2e-05,
+    "g1_max_price_ema_gap_atr_multiple": 0.9,
+    "g1_index_max_price_ema_gap_atr_multiple": 1.0,
+    "g1_commodity_max_price_ema_gap_atr_multiple": 1.0,
+    "g1_min_volume_ratio": 1.3,
+    "g1_volume_require_spike": True,
+    "g1_kama_gate_enabled": True,
+    "g1_kama_min_efficiency_ratio": 0.15,
+    "g1_continuation_confidence_cap": 0.78,
+    "g1_cross_confidence_cap": 1.0,
+    "g1_signal_only_min_confidence_for_entry": 0.56,
+    "g1_paper_min_confidence_for_entry": 0.60,
+    "g1_execution_min_confidence_for_entry": 0.64,
+    "g1_fx_atr_multiplier": 1.6,
+    "g1_index_atr_multiplier": 2.0,
+    "g1_commodity_atr_multiplier": 2.4,
+    "g1_commodity_adx_threshold": 22.0,
+})
+
+_G1_PROFILES: Mapping[str, Mapping[str, Any]] = _freeze_mapping({
+    "safe": _G1_CONSERVATIVE,
+    "conservative": _G1_CONSERVATIVE,
+    "aggressive": _G1_AGGRESSIVE,
+})
+
+# ---------------------------------------------------------------------------
+# G2 profiles
+# ---------------------------------------------------------------------------
+_G2_CONSERVATIVE: Mapping[str, Any] = _freeze_mapping({
+    "g2_candle_timeframe_sec": 900,
+    "g2_atr_sl_multiplier": 2.8,
+    "g2_risk_reward_ratio": 2.2,
+    "g2_min_stop_loss_pips": 40.0,
+    "g2_min_take_profit_pips": 70.0,
+    "g2_allow_shorts": False,
+    "g2_min_trend_gap_ratio": 0.00055,
+    "g2_min_trend_slope_ratio": 0.0001,
+    "g2_min_atr_pct": 0.0005,
+    "g2_max_spread_to_stop_ratio": 0.20,
+    "g2_signal_only_min_confidence_for_entry": 0.62,
+    "g2_paper_min_confidence_for_entry": 0.66,
+    "g2_execution_min_confidence_for_entry": 0.72,
+})
+
+_G2_AGGRESSIVE: Mapping[str, Any] = _freeze_mapping({
+    "g2_candle_timeframe_sec": 900,
+    "g2_atr_sl_multiplier": 2.0,
+    "g2_risk_reward_ratio": 1.6,
+    "g2_min_stop_loss_pips": 30.0,
+    "g2_min_take_profit_pips": 45.0,
+    "g2_allow_shorts": True,
+    "g2_min_trend_gap_ratio": 0.00035,
+    "g2_min_trend_slope_ratio": 6e-05,
+    "g2_min_atr_pct": 0.0004,
+    "g2_max_spread_to_stop_ratio": 0.28,
+    "g2_signal_only_min_confidence_for_entry": 0.54,
+    "g2_paper_min_confidence_for_entry": 0.58,
+    "g2_execution_min_confidence_for_entry": 0.64,
+})
+
+_G2_PROFILES: Mapping[str, Mapping[str, Any]] = _freeze_mapping({
+    "safe": _G2_CONSERVATIVE,
+    "conservative": _G2_CONSERVATIVE,
+    "aggressive": _G2_AGGRESSIVE,
+})
+
+# ---------------------------------------------------------------------------
+# Trend-following profiles
+# ---------------------------------------------------------------------------
+_TREND_FOLLOWING_CONSERVATIVE: Mapping[str, Any] = _freeze_mapping({
+    "trend_risk_reward_ratio": 3.0,
+    "trend_min_stop_loss_pips": 25.0,
+    "trend_min_take_profit_pips": 60.0,
+    "trend_pullback_max_distance_atr": 1.3,
+    "trend_pullback_bounce_required": True,
+    "trend_bounce_rejection_enabled": True,
+    "trend_runaway_entry_enabled": False,
+    "trend_kama_gate_enabled": True,
+    "trend_kama_min_efficiency_ratio": 0.16,
+    "trend_min_volume_ratio": 1.5,
+    "trend_following_trade_cooldown_loss_sec": 600,
+    "trend_max_spread_to_stop_ratio": 0.20,
+    "trend_following_signal_only_min_confidence_for_entry": 0.62,
+    "trend_following_paper_min_confidence_for_entry": 0.66,
+    "trend_following_execution_min_confidence_for_entry": 0.72,
+})
+
+_TREND_FOLLOWING_AGGRESSIVE: Mapping[str, Any] = _freeze_mapping({
+    "trend_risk_reward_ratio": 2.0,
+    "trend_min_stop_loss_pips": 16.0,
+    "trend_min_take_profit_pips": 32.0,
+    "trend_pullback_max_distance_atr": 1.8,
+    "trend_pullback_bounce_required": True,
+    "trend_bounce_rejection_enabled": True,
+    "trend_runaway_entry_enabled": True,
+    "trend_runaway_confidence_penalty": 0.06,
+    "trend_kama_gate_enabled": True,
+    "trend_kama_min_efficiency_ratio": 0.12,
+    "trend_min_volume_ratio": 1.2,
+    "trend_following_trade_cooldown_loss_sec": 300,
+    "trend_max_spread_to_stop_ratio": 0.28,
+    "trend_following_signal_only_min_confidence_for_entry": 0.54,
+    "trend_following_paper_min_confidence_for_entry": 0.58,
+    "trend_following_execution_min_confidence_for_entry": 0.64,
+})
+
+_TREND_FOLLOWING_PROFILES: Mapping[str, Mapping[str, Any]] = _freeze_mapping({
+    "safe": _TREND_FOLLOWING_CONSERVATIVE,
+    "conservative": _TREND_FOLLOWING_CONSERVATIVE,
+    "aggressive": _TREND_FOLLOWING_AGGRESSIVE,
+})
+
+# ---------------------------------------------------------------------------
+# Donchian breakout profiles
+# ---------------------------------------------------------------------------
+_DONCHIAN_BREAKOUT_CONSERVATIVE: Mapping[str, Any] = _freeze_mapping({
+    "donchian_breakout_atr_multiplier": 1.8,
+    "donchian_breakout_risk_reward_ratio": 3.5,
+    "donchian_breakout_min_stop_loss_pips": 35.0,
+    "donchian_breakout_min_take_profit_pips": 100.0,
+    "donchian_breakout_min_channel_width_atr": 1.2,
+    "donchian_breakout_min_volume_ratio": 1.7,
+    "donchian_breakout_regime_min_adx": 27.0,
+})
+
+_DONCHIAN_BREAKOUT_AGGRESSIVE: Mapping[str, Any] = _freeze_mapping({
+    "donchian_breakout_atr_multiplier": 1.3,
+    "donchian_breakout_risk_reward_ratio": 2.5,
+    "donchian_breakout_min_stop_loss_pips": 25.0,
+    "donchian_breakout_min_take_profit_pips": 65.0,
+    "donchian_breakout_min_channel_width_atr": 0.8,
+    "donchian_breakout_min_volume_ratio": 1.3,
+    "donchian_breakout_regime_min_adx": 23.0,
+})
+
+_DONCHIAN_BREAKOUT_PROFILES: Mapping[str, Mapping[str, Any]] = _freeze_mapping({
+    "safe": _DONCHIAN_BREAKOUT_CONSERVATIVE,
+    "conservative": _DONCHIAN_BREAKOUT_CONSERVATIVE,
+    "aggressive": _DONCHIAN_BREAKOUT_AGGRESSIVE,
+})
+
+
 _DONCHIAN_BREAKOUT_PARAMETER_SURFACE_METADATA_KEYS: frozenset[str] = frozenset(
     {
         "donchian_breakout_parameter_surface_locked",
@@ -671,6 +952,13 @@ _DONCHIAN_BREAKOUT_SURFACE_MANAGED_KEYS: frozenset[str] = (
 )
 
 _STRATEGY_PROFILES: Mapping[str, Mapping[str, Mapping[str, Any]]] = _freeze_mapping({
+    "momentum": _MOMENTUM_PROFILES,
+    "momentum_index": _MOMENTUM_PROFILES,
+    "momentum_fx": _MOMENTUM_PROFILES,
+    "g1": _G1_PROFILES,
+    "g2": _G2_PROFILES,
+    "trend_following": _TREND_FOLLOWING_PROFILES,
+    "donchian_breakout": _DONCHIAN_BREAKOUT_PROFILES,
     "index_hybrid": _INDEX_HYBRID_PROFILES,
     "mean_breakout_v2": _MEAN_BREAKOUT_V2_PROFILES,
     "mean_reversion_bb": _MEAN_REVERSION_BB_PROFILES,

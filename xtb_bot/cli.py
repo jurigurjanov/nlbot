@@ -183,8 +183,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Apply built-in strategy profile "
-            "(index_hybrid: safe|conservative|aggressive; "
-            "mean_breakout_v2/mean_reversion_bb: conservative|aggressive, safe aliases conservative)"
+            "(all strategies: safe|conservative|aggressive; "
+            "safe aliases conservative)"
         ),
     )
     parser.add_argument(
