@@ -671,7 +671,8 @@ Examples:
   python backtest.py --db state.bck/xtb_bot.db --trades
         """,
     )
-    parser.add_argument("--db", required=True, help="Path to SQLite state database")
+    parser.add_argument("--db", default=None, help="Path to SQLite state database")
+    parser.add_argument("--download-dir", default=None, help="Use downloads dir (default: downloads/backtest.db)")
     parser.add_argument(
         "--strategy", default="momentum",
         help=f"Strategy name (available: {', '.join(sorted(available_strategies()))})",
@@ -686,9 +687,16 @@ Examples:
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
     args = parser.parse_args()
-    db_path = Path(args.db)
+    if args.download_dir:
+        db_path = Path(args.download_dir) / "backtest.db"
+    elif args.db:
+        db_path = Path(args.db)
+    else:
+        db_path = Path("downloads/backtest.db")
     if not db_path.exists():
         print(f"Database not found: {db_path}")
+        if not args.db and not args.download_dir:
+            print("Run 'python download_data.py' first to download data.")
         return 1
 
     symbols = [s.strip().upper() for s in args.symbols.split(",")] if args.symbols else None
