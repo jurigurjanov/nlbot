@@ -5,6 +5,7 @@ import math
 import time
 from typing import TYPE_CHECKING
 
+from xtb_bot.bot.broker_state import BotBrokerStateRuntime
 from xtb_bot.broker_method_support import call_broker_method_with_supported_kwargs
 from xtb_bot.models import Position, RunMode
 from xtb_bot.tolerances import FLOAT_COMPARISON_TOLERANCE
@@ -51,36 +52,36 @@ class BotCloseDetailsRuntime:
             if not is_close_event:
                 continue
             payload = event.get("payload")
-            if not self._bot._trade_event_matches_position(payload if isinstance(payload, dict) else None, position.position_id):
+            if not self._trade_event_matches_position(payload if isinstance(payload, dict) else None, position.position_id):
                 continue
             payload_dict = payload if isinstance(payload, dict) else {}
             broker_sync = payload_dict.get("broker_close_sync")
             broker_sync_dict = broker_sync if isinstance(broker_sync, dict) else {}
             close_price = (
-                self._bot._finite_float_or_none(payload_dict.get("close_price"))
-                or self._bot._finite_float_or_none(broker_sync_dict.get("close_price"))
-                or self._bot._finite_float_or_none(payload_dict.get("inferred_close_price"))
+                BotBrokerStateRuntime.finite_float_or_none(payload_dict.get("close_price"))
+                or BotBrokerStateRuntime.finite_float_or_none(broker_sync_dict.get("close_price"))
+                or BotBrokerStateRuntime.finite_float_or_none(payload_dict.get("inferred_close_price"))
             )
             pnl_currency = (
-                self._bot._normalize_currency_code(broker_sync_dict.get("pnl_currency"))
-                or self._bot._normalize_currency_code(payload_dict.get("pnl_currency"))
+                BotBrokerStateRuntime.normalize_currency_code(broker_sync_dict.get("pnl_currency"))
+                or BotBrokerStateRuntime.normalize_currency_code(payload_dict.get("pnl_currency"))
             )
             realized_pnl = (
-                self._bot._finite_float_or_none(broker_sync_dict.get("realized_pnl"))
-                or self._bot._finite_float_or_none(payload_dict.get("realized_pnl"))
+                BotBrokerStateRuntime.finite_float_or_none(broker_sync_dict.get("realized_pnl"))
+                or BotBrokerStateRuntime.finite_float_or_none(payload_dict.get("realized_pnl"))
             )
             pnl_value: float | None = realized_pnl
             pnl_is_estimated = False
             pnl_estimate_source: str | None = None
-            payload_pnl = self._bot._finite_float_or_none(payload_dict.get("pnl"))
-            inferred_close_price = self._bot._finite_float_or_none(payload_dict.get("inferred_close_price"))
+            payload_pnl = BotBrokerStateRuntime.finite_float_or_none(payload_dict.get("pnl"))
+            inferred_close_price = BotBrokerStateRuntime.finite_float_or_none(payload_dict.get("inferred_close_price"))
             if pnl_value is None and payload_pnl is not None and abs(payload_pnl) > FLOAT_COMPARISON_TOLERANCE:
                 pnl_value = payload_pnl
                 pnl_is_estimated = bool(payload_dict.get("pnl_is_estimated"))
                 pnl_estimate_source = (
                     str(payload_dict.get("pnl_estimate_source") or "").strip() or None
                 )
-            local_pnl_estimate = self._bot._finite_float_or_none(payload_dict.get("local_pnl_estimate"))
+            local_pnl_estimate = BotBrokerStateRuntime.finite_float_or_none(payload_dict.get("local_pnl_estimate"))
             if pnl_value is None and local_pnl_estimate is not None and abs(local_pnl_estimate) > FLOAT_COMPARISON_TOLERANCE:
                 pnl_value = local_pnl_estimate
                 pnl_is_estimated = True
@@ -89,7 +90,7 @@ class BotCloseDetailsRuntime:
                     or "event_local_pnl_estimate"
                 )
             if pnl_value is None and close_price is not None:
-                estimated_pnl, _ = self._bot._estimate_position_pnl_from_close_price(
+                estimated_pnl, _ = self._bot._broker_state.estimate_position_pnl_from_close_price(
                     position,
                     close_price,
                     pnl_currency,
@@ -105,7 +106,7 @@ class BotCloseDetailsRuntime:
                             else "event_close_price"
                         )
                     )
-            event_closed_at = self._bot._finite_float_or_none(event.get("ts"))
+            event_closed_at = BotBrokerStateRuntime.finite_float_or_none(event.get("ts"))
             event_has_close_details = (
                 close_price is not None
                 or realized_pnl is not None
@@ -114,8 +115,8 @@ class BotCloseDetailsRuntime:
                 or inferred_close_price is not None
             )
             closed_at = (
-                self._bot._finite_float_or_none(broker_sync_dict.get("closed_at"))
-                or self._bot._finite_float_or_none(payload_dict.get("broker_closed_at"))
+                BotBrokerStateRuntime.finite_float_or_none(broker_sync_dict.get("closed_at"))
+                or BotBrokerStateRuntime.finite_float_or_none(payload_dict.get("broker_closed_at"))
                 or (event_closed_at if event_has_close_details else None)
             )
             if close_price is None and closed_at is None and pnl_value is None:
@@ -128,7 +129,7 @@ class BotCloseDetailsRuntime:
                     "pnl_is_estimated": pnl_is_estimated,
                     "pnl_estimate_source": pnl_estimate_source,
                     "pnl_currency": pnl_currency,
-                    "event_ts": self._bot._finite_float_or_none(event.get("ts")) or 0.0,
+                    "event_ts": BotBrokerStateRuntime.finite_float_or_none(event.get("ts")) or 0.0,
                     "has_realized_pnl": realized_pnl is not None,
                 }
             )
@@ -138,9 +139,9 @@ class BotCloseDetailsRuntime:
             candidates,
             key=lambda item: (
                 1 if bool(item.get("has_realized_pnl")) else 0,
-                1 if self._bot._finite_float_or_none(item.get("pnl")) is not None else 0,
-                1 if self._bot._finite_float_or_none(item.get("close_price")) is not None else 0,
-                1 if self._bot._finite_float_or_none(item.get("closed_at")) is not None else 0,
+                1 if BotBrokerStateRuntime.finite_float_or_none(item.get("pnl")) is not None else 0,
+                1 if BotBrokerStateRuntime.finite_float_or_none(item.get("close_price")) is not None else 0,
+                1 if BotBrokerStateRuntime.finite_float_or_none(item.get("closed_at")) is not None else 0,
                 float(item.get("event_ts") or 0.0),
             ),
         )
@@ -152,28 +153,28 @@ class BotCloseDetailsRuntime:
         broker_sync: dict[str, object] | None,
     ) -> dict[str, object]:
         broker_sync_dict = broker_sync if isinstance(broker_sync, dict) else {}
-        event_details = self._bot._best_close_details_from_events(position)
-        close_price = self._bot._finite_float_or_none(broker_sync_dict.get("close_price"))
+        event_details = self._best_close_details_from_events(position)
+        close_price = BotBrokerStateRuntime.finite_float_or_none(broker_sync_dict.get("close_price"))
         if close_price is None and isinstance(event_details, dict):
-            close_price = self._bot._finite_float_or_none(event_details.get("close_price"))
-        closed_at = self._bot._finite_float_or_none(broker_sync_dict.get("closed_at"))
+            close_price = BotBrokerStateRuntime.finite_float_or_none(event_details.get("close_price"))
+        closed_at = BotBrokerStateRuntime.finite_float_or_none(broker_sync_dict.get("closed_at"))
         if closed_at is None and isinstance(event_details, dict):
-            closed_at = self._bot._finite_float_or_none(event_details.get("closed_at"))
-        realized_pnl = self._bot._finite_float_or_none(broker_sync_dict.get("realized_pnl"))
+            closed_at = BotBrokerStateRuntime.finite_float_or_none(event_details.get("closed_at"))
+        realized_pnl = BotBrokerStateRuntime.finite_float_or_none(broker_sync_dict.get("realized_pnl"))
         pnl_value = realized_pnl
         pnl_is_estimated = False
         pnl_estimate_source: str | None = None
-        pnl_currency = self._bot._normalize_currency_code(broker_sync_dict.get("pnl_currency"))
+        pnl_currency = BotBrokerStateRuntime.normalize_currency_code(broker_sync_dict.get("pnl_currency"))
         if pnl_currency is None and isinstance(event_details, dict):
-            pnl_currency = self._bot._normalize_currency_code(event_details.get("pnl_currency"))
+            pnl_currency = BotBrokerStateRuntime.normalize_currency_code(event_details.get("pnl_currency"))
         if pnl_value is None and isinstance(event_details, dict):
-            event_pnl = self._bot._finite_float_or_none(event_details.get("pnl"))
+            event_pnl = BotBrokerStateRuntime.finite_float_or_none(event_details.get("pnl"))
             if event_pnl is not None:
                 pnl_value = event_pnl
                 pnl_is_estimated = bool(event_details.get("pnl_is_estimated"))
                 pnl_estimate_source = str(event_details.get("pnl_estimate_source") or "").strip() or None
         if pnl_value is None and close_price is not None:
-            estimated_pnl, _ = self._bot._estimate_position_pnl_from_close_price(position, close_price, pnl_currency)
+            estimated_pnl, _ = self._bot._broker_state.estimate_position_pnl_from_close_price(position, close_price, pnl_currency)
             if estimated_pnl is not None:
                 pnl_value = estimated_pnl
                 pnl_is_estimated = True
@@ -271,23 +272,23 @@ class BotCloseDetailsRuntime:
             context=context,
             wait_timeout_sec=0.75,
         )
-        if not self._bot._broker_close_sync_has_evidence(broker_sync):
-            close_details = self._bot._resolved_close_details(position, None)
+        if not self._broker_close_sync_has_evidence(broker_sync):
+            close_details = self._resolved_close_details(position, None)
             if (
-                self._bot._finite_float_or_none(close_details.get("close_price")) is None
-                and self._bot._finite_float_or_none(close_details.get("closed_at")) is None
-                and self._bot._finite_float_or_none(close_details.get("pnl")) is None
+                BotBrokerStateRuntime.finite_float_or_none(close_details.get("close_price")) is None
+                and BotBrokerStateRuntime.finite_float_or_none(close_details.get("closed_at")) is None
+                and BotBrokerStateRuntime.finite_float_or_none(close_details.get("pnl")) is None
             ):
                 return False
         else:
-            close_details = self._bot._resolved_close_details(position, broker_sync)
+            close_details = self._resolved_close_details(position, broker_sync)
 
-        close_price = self._bot._finite_float_or_none(close_details.get("close_price"))
+        close_price = BotBrokerStateRuntime.finite_float_or_none(close_details.get("close_price"))
         if close_price is not None and close_price <= 0:
             close_price = None
-        closed_at_raw = self._bot._finite_float_or_none(close_details.get("closed_at"))
+        closed_at_raw = BotBrokerStateRuntime.finite_float_or_none(close_details.get("closed_at"))
         closed_at = min(now_ts, closed_at_raw) if closed_at_raw is not None and closed_at_raw > 0 else None
-        pnl_value = self._bot._finite_float_or_none(close_details.get("pnl"))
+        pnl_value = BotBrokerStateRuntime.finite_float_or_none(close_details.get("pnl"))
         pnl_is_estimated = bool(close_details.get("pnl_is_estimated")) if pnl_value is not None else None
         pnl_estimate_source = close_details.get("pnl_estimate_source")
         has_close_details = (close_price is not None) or (closed_at is not None) or (pnl_value is not None)
@@ -322,7 +323,7 @@ class BotCloseDetailsRuntime:
         else:
             # Position absence on broker confirms closure, but we keep existing close fields untouched
             # when broker history does not provide execution details yet.
-            preserved_closed_at = self._bot._finite_float_or_none(position.closed_at)
+            preserved_closed_at = BotBrokerStateRuntime.finite_float_or_none(position.closed_at)
             if preserved_closed_at is not None and preserved_closed_at > 0:
                 preserved_closed_at = min(now_ts, preserved_closed_at)
             else:
@@ -385,9 +386,9 @@ class BotCloseDetailsRuntime:
             pending_count = 0
             for position in closed_positions.values():
                 self._bot._pulse_runtime_monitor_progress()
-                close_price_existing = self._bot._finite_float_or_none(position.close_price)
-                closed_at_existing = self._bot._finite_float_or_none(position.closed_at)
-                pnl_existing = self._bot._finite_float_or_none(position.pnl)
+                close_price_existing = BotBrokerStateRuntime.finite_float_or_none(position.close_price)
+                closed_at_existing = BotBrokerStateRuntime.finite_float_or_none(position.closed_at)
+                pnl_existing = BotBrokerStateRuntime.finite_float_or_none(position.pnl)
                 has_good_close_details = (
                     close_price_existing is not None
                     and close_price_existing > 0
@@ -416,7 +417,7 @@ class BotCloseDetailsRuntime:
                 if pass_idx > 0:
                     pending_count += 1
                     continue
-                if not self._bot._closed_trade_details_retry_due(position.position_id, now_monotonic):
+                if not self._closed_trade_details_retry_due(position.position_id, now_monotonic):
                     pending_count += 1
                     continue
                 broker_sync = self._bot._get_broker_close_sync(
@@ -426,22 +427,22 @@ class BotCloseDetailsRuntime:
                 )
                 if not isinstance(broker_sync, dict):
                     broker_sync = None
-                close_details = self._bot._resolved_close_details(position, broker_sync)
-                close_price = self._bot._finite_float_or_none(close_details.get("close_price"))
+                close_details = self._resolved_close_details(position, broker_sync)
+                close_price = BotBrokerStateRuntime.finite_float_or_none(close_details.get("close_price"))
                 if close_price is not None and close_price <= 0:
                     close_price = None
-                closed_at = self._bot._finite_float_or_none(close_details.get("closed_at"))
+                closed_at = BotBrokerStateRuntime.finite_float_or_none(close_details.get("closed_at"))
                 if closed_at is not None and closed_at > 0:
                     closed_at = min(now_ts, closed_at)
                 else:
                     closed_at = None
-                pnl_value = self._bot._finite_float_or_none(close_details.get("pnl"))
+                pnl_value = BotBrokerStateRuntime.finite_float_or_none(close_details.get("pnl"))
                 pnl_is_estimated = bool(close_details.get("pnl_is_estimated")) if pnl_value is not None else None
                 pnl_estimate_source = close_details.get("pnl_estimate_source")
                 has_realized_pnl = bool(close_details.get("has_realized_pnl"))
                 if close_price is None and closed_at is None and pnl_value is None:
                     pending_count += 1
-                    self._bot._schedule_closed_trade_details_retry(position.position_id, now_monotonic)
+                    self._schedule_closed_trade_details_retry(position.position_id, now_monotonic)
                     continue
                 if (
                     has_realized_pnl
@@ -487,7 +488,7 @@ class BotCloseDetailsRuntime:
                 if not changed:
                     if incomplete_monetary_close:
                         pending_count += 1
-                        self._bot._schedule_closed_trade_details_retry(position.position_id, now_monotonic)
+                        self._schedule_closed_trade_details_retry(position.position_id, now_monotonic)
                     continue
                 self._bot.store.update_trade_status(
                     position.position_id,
@@ -526,7 +527,7 @@ class BotCloseDetailsRuntime:
                 )
                 if incomplete_monetary_close:
                     pending_count += 1
-                    self._bot._schedule_closed_trade_details_retry(position.position_id, now_monotonic)
+                    self._schedule_closed_trade_details_retry(position.position_id, now_monotonic)
                 else:
                     self._closed_trade_details_retry_after_monotonic.pop(position.position_id, None)
                     self._closed_trade_details_retry_backoff_sec.pop(position.position_id, None)
@@ -565,8 +566,8 @@ class BotCloseDetailsRuntime:
     def _schedule_closed_trade_details_retry(self, position_id: str, now_monotonic: float) -> None:
         key = str(position_id)
         base_backoff = max(
-            self._bot._runtime_closed_details_backfill_interval_sec,
-            self._bot._runtime_broker_sync_active_interval_sec,
+            self._bot._position_sync._runtime_closed_details_backfill_interval_sec,
+            self._bot._position_sync._runtime_broker_sync_active_interval_sec,
             60.0,
         )
         previous = float(self._closed_trade_details_retry_backoff_sec.get(key, 0.0))

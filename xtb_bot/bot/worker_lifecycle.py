@@ -6,6 +6,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 from xtb_bot.bot._assignment import WorkerAssignment
+from xtb_bot.bot.strategy_assignment import BotStrategyAssignmentRuntime
 from xtb_bot.models import RunMode
 from xtb_bot.worker import SymbolWorker
 
@@ -35,7 +36,7 @@ class BotWorkerLifecycleRuntime:
     def _make_worker(self, assignment: WorkerAssignment, stop_event: threading.Event) -> SymbolWorker:
         db_first_tick_max_age_sec: float | None = None
         if self._bot._db_first_enabled():
-            db_first_tick_max_age_sec = self._bot._db_first_tick_max_age_for_workers()
+            db_first_tick_max_age_sec = self._bot._db_first_tick._db_first_tick_max_age_for_workers()
         worker_mode = assignment.mode_override or self._bot.config.mode
         symbol = str(assignment.symbol).strip().upper()
         with self._bot._workers_lock:
@@ -68,7 +69,7 @@ class BotWorkerLifecycleRuntime:
             db_first_reads_enabled=self._bot._db_first_reads_enabled and self._bot.config.broker == "ig",
             db_first_tick_max_age_sec=db_first_tick_max_age_sec,
             latest_tick_getter=self._bot._load_latest_tick_from_memory_cache,
-            latest_tick_updater=self._bot._update_latest_tick_from_broker,
+            latest_tick_updater=self._bot._stream_ticks._update_latest_tick_from_broker,
             worker_lease_key=self._worker_lease_key(symbol),
             worker_lease_id=lease_id,
         )
@@ -97,7 +98,7 @@ class BotWorkerLifecycleRuntime:
 
             has_restored_position = self._bot.position_book.get(assignment.symbol) is not None
             support_cache_key = (
-                *self._bot._strategy_cache_identity(
+                *BotStrategyAssignmentRuntime._strategy_cache_identity(
                     assignment.strategy_name,
                     assignment.strategy_params,
                 ),
@@ -111,7 +112,7 @@ class BotWorkerLifecycleRuntime:
                     assignment.symbol,
                 )
             if (not has_restored_position) and (not supported):
-                strategy_payload = self._bot._assignment_strategy_labels(assignment)
+                strategy_payload = self._bot._strategy_assignment._assignment_strategy_labels(assignment)
                 logger.warning(
                     "Skipping symbol=%s for strategy=%s%s: unsupported symbol",
                     assignment.symbol,
@@ -123,7 +124,7 @@ class BotWorkerLifecycleRuntime:
                     assignment.symbol,
                     "Symbol skipped by strategy filter",
                     {
-                        **self._bot._strategy_event_payload(
+                        **self._bot._strategy_assignment._strategy_event_payload(
                             assignment.strategy_name,
                             assignment.strategy_params,
                         ),
@@ -158,7 +159,7 @@ class BotWorkerLifecycleRuntime:
                     self._bot._worker_lease_id_by_symbol.pop(normalized_symbol, None)
                 self._revoke_worker_lease(normalized_symbol)
                 raise
-            strategy_name, strategy_base = self._bot._assignment_strategy_labels(assignment)
+            strategy_name, strategy_base = self._bot._strategy_assignment._assignment_strategy_labels(assignment)
             logger.info(
                 "Started worker for %s | strategy=%s%s mode=%s source=%s",
                 assignment.symbol,
@@ -189,7 +190,7 @@ class BotWorkerLifecycleRuntime:
                     normalized_symbol,
                     "Worker stopped",
                     {
-                        **self._bot._strategy_event_payload(
+                        **self._bot._strategy_assignment._strategy_event_payload(
                             assignment.strategy_name,
                             assignment.strategy_params,
                         ),
@@ -224,10 +225,10 @@ class BotWorkerLifecycleRuntime:
             normalized_symbol,
             "Strategy switch deferred until position closes",
             {
-                "current_strategy": self._bot._assignment_strategy_labels(current)[0],
-                "current_strategy_base": self._bot._assignment_strategy_labels(current)[1],
-                "next_strategy": self._bot._assignment_strategy_labels(desired)[0],
-                "next_strategy_base": self._bot._assignment_strategy_labels(desired)[1],
+                "current_strategy": self._bot._strategy_assignment._assignment_strategy_labels(current)[0],
+                "current_strategy_base": self._bot._strategy_assignment._assignment_strategy_labels(current)[1],
+                "next_strategy": self._bot._strategy_assignment._assignment_strategy_labels(desired)[0],
+                "next_strategy_base": self._bot._strategy_assignment._assignment_strategy_labels(desired)[1],
                 "current_mode": current_mode,
                 "next_mode": desired_mode,
             },

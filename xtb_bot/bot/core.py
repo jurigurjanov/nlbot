@@ -72,48 +72,8 @@ class TradingBot:
         return self._position_sync._runtime_broker_sync_active_interval_sec
 
     @property
-    def _runtime_broker_sync_idle_interval_sec(self) -> float:
-        return self._position_sync._runtime_broker_sync_idle_interval_sec
-
-    @property
-    def _runtime_missing_backfill_interval_sec(self) -> float:
-        return self._position_sync._runtime_missing_backfill_interval_sec
-
-    @property
     def _runtime_closed_details_backfill_interval_sec(self) -> float:
         return self._position_sync._runtime_closed_details_backfill_interval_sec
-
-    @property
-    def _last_runtime_broker_sync_monotonic(self) -> float:
-        return self._position_sync._last_runtime_broker_sync_monotonic
-
-    @_last_runtime_broker_sync_monotonic.setter
-    def _last_runtime_broker_sync_monotonic(self, value: float) -> None:
-        self._position_sync._last_runtime_broker_sync_monotonic = value
-
-    @property
-    def _last_runtime_broker_sync_error_monotonic(self) -> float:
-        return self._position_sync._last_runtime_broker_sync_error_monotonic
-
-    @_last_runtime_broker_sync_error_monotonic.setter
-    def _last_runtime_broker_sync_error_monotonic(self, value: float) -> None:
-        self._position_sync._last_runtime_broker_sync_error_monotonic = value
-
-    @property
-    def _last_runtime_missing_backfill_monotonic(self) -> float:
-        return self._position_sync._last_runtime_missing_backfill_monotonic
-
-    @_last_runtime_missing_backfill_monotonic.setter
-    def _last_runtime_missing_backfill_monotonic(self, value: float) -> None:
-        self._position_sync._last_runtime_missing_backfill_monotonic = value
-
-    @property
-    def _last_runtime_closed_details_backfill_monotonic(self) -> float:
-        return self._position_sync._last_runtime_closed_details_backfill_monotonic
-
-    @_last_runtime_closed_details_backfill_monotonic.setter
-    def _last_runtime_closed_details_backfill_monotonic(self, value: float) -> None:
-        self._position_sync._last_runtime_closed_details_backfill_monotonic = value
 
     # -- IG budget compat proxies (accessed by tests) --
 
@@ -493,45 +453,11 @@ class TradingBot:
     # -- Strategy & Assignment compat proxies (accessed by tests) --
 
     @property
-    def _strategy_symbol_filter(self):
-        return self._strategy_assignment._strategy_symbol_filter
-
-    @_strategy_symbol_filter.setter
-    def _strategy_symbol_filter(self, value):
-        self._strategy_assignment._strategy_symbol_filter = value
-
-    @property
-    def _multi_strategy_rollout_mode_override_by_symbol(self):
-        return self._strategy_assignment._multi_strategy_rollout_mode_override_by_symbol
-
-    @_multi_strategy_rollout_mode_override_by_symbol.setter
-    def _multi_strategy_rollout_mode_override_by_symbol(self, value):
-        self._strategy_assignment._multi_strategy_rollout_mode_override_by_symbol = value
-
-    @property
     def _strategy_support_cache(self):
         return self._strategy_assignment._strategy_support_cache
 
-    @staticmethod
-    def _strategy_cache_identity(
-        strategy_name: str,
-        strategy_params: dict[str, object],
-    ) -> tuple[str, tuple[tuple[str, object], ...]]:
-        return BotStrategyAssignmentRuntime._strategy_cache_identity(strategy_name, strategy_params)
-
     def _strategy_params_for(self, strategy_name: str) -> dict[str, object]:
         return self._strategy_assignment._strategy_params_for(strategy_name)
-
-    def _multi_strategy_carrier_params(
-        self,
-        *,
-        base_strategy_name: str,
-        strategy_params: dict[str, object],
-    ) -> dict[str, object]:
-        return self._strategy_assignment._multi_strategy_carrier_params(
-            base_strategy_name=base_strategy_name,
-            strategy_params=strategy_params,
-        )
 
     def _worker_assignment_payload(
         self,
@@ -539,21 +465,6 @@ class TradingBot:
         strategy_params: dict[str, object],
     ) -> tuple[str, dict[str, object]]:
         return self._strategy_assignment._worker_assignment_payload(strategy_name, strategy_params)
-
-    @staticmethod
-    def _normalize_strategy_label(value: object) -> str | None:
-        return BotStrategyAssignmentRuntime._normalize_strategy_label(value)
-
-    def _strategy_base_label(
-        self,
-        strategy_name: object,
-        strategy_params: dict[str, object] | None = None,
-        *,
-        strategy_entry_hint: object | None = None,
-    ) -> str | None:
-        return self._strategy_assignment._strategy_base_label(
-            strategy_name, strategy_params, strategy_entry_hint=strategy_entry_hint,
-        )
 
     def _strategy_labels(
         self,
@@ -564,60 +475,6 @@ class TradingBot:
     ) -> tuple[str | None, str | None]:
         return self._strategy_assignment._strategy_labels(
             strategy_name, strategy_params, strategy_entry_hint=strategy_entry_hint,
-        )
-
-    def _assignment_strategy_labels(self, assignment: WorkerAssignment | None) -> tuple[str | None, str | None]:
-        return self._strategy_assignment._assignment_strategy_labels(assignment)
-
-    def _strategy_event_payload(
-        self,
-        strategy_name: object,
-        strategy_params: dict[str, object] | None = None,
-        *,
-        strategy_entry_hint: object | None = None,
-        strategy_key: str = "strategy",
-        base_key: str = "strategy_base",
-    ) -> dict[str, object]:
-        return self._strategy_assignment._strategy_event_payload(
-            strategy_name, strategy_params,
-            strategy_entry_hint=strategy_entry_hint,
-            strategy_key=strategy_key,
-            base_key=base_key,
-        )
-
-    def _default_strategy_entry_for_assignment(self, assignment: WorkerAssignment | None) -> str | None:
-        return self._strategy_assignment._default_strategy_entry_for_assignment(assignment)
-
-    def _apply_position_trade_identity(
-        self,
-        position: Position,
-        *,
-        strategy: object,
-        strategy_entry: object | None = None,
-        strategy_entry_component: object | None = None,
-        strategy_entry_signal: object | None = None,
-    ) -> None:
-        self._strategy_assignment._apply_position_trade_identity(
-            position,
-            strategy=strategy,
-            strategy_entry=strategy_entry,
-            strategy_entry_component=strategy_entry_component,
-            strategy_entry_signal=strategy_entry_signal,
-        )
-
-    def _resolved_recovery_trade_identity(
-        self,
-        *,
-        symbol: str,
-        existing_row: dict[str, object] | None,
-        matched_pending: PendingOpen | None,
-        default_assignment: WorkerAssignment | None,
-    ) -> tuple[str, str, str, str | None, str | None, str]:
-        return self._strategy_assignment._resolved_recovery_trade_identity(
-            symbol=symbol,
-            existing_row=existing_row,
-            matched_pending=matched_pending,
-            default_assignment=default_assignment,
         )
 
     @staticmethod
@@ -646,12 +503,6 @@ class TradingBot:
     def _schedule_disabled_by_multi_strategy(self) -> bool:
         return self._strategy_assignment._schedule_disabled_by_multi_strategy()
 
-    def _resolve_multi_strategy_rollout_mode_overrides(self) -> dict[str, RunMode]:
-        return self._strategy_assignment._resolve_multi_strategy_rollout_mode_overrides()
-
-    def _mode_override_for_symbol(self, symbol: str) -> RunMode | None:
-        return self._strategy_assignment._mode_override_for_symbol(symbol)
-
     def _db_first_loop_backoff_remaining_sec(
         self,
         loop_name: str,
@@ -677,13 +528,6 @@ class TradingBot:
 
     def _static_assignments(self) -> dict[str, WorkerAssignment]:
         return self._worker_reconcile._static_assignments()
-
-    @staticmethod
-    def _worker_lease_key(symbol: str) -> str:
-        return BotWorkerLifecycleRuntime._worker_lease_key(symbol)
-
-    def _acquire_worker_lease(self, symbol: str, lease_id: str) -> None:
-        self._worker_lifecycle._acquire_worker_lease(symbol, lease_id)
 
     def _revoke_worker_lease(self, symbol: str) -> None:
         self._worker_lifecycle._revoke_worker_lease(symbol)
@@ -731,26 +575,14 @@ class TradingBot:
     def _db_first_tick_effective_hard_max_age_sec(self, active_symbol_count: int | None = None) -> float:
         return self._db_first_tick._db_first_tick_effective_hard_max_age_sec(active_symbol_count)
 
-    def _db_first_tick_max_age_for_workers(self) -> float:
-        return self._db_first_tick._db_first_tick_max_age_for_workers()
-
-    def _estimated_active_db_first_symbol_count(self) -> int:
-        return self._db_first_tick._estimated_active_db_first_symbol_count()
-
     def _now_utc(self) -> datetime:
         return datetime.now(timezone.utc)
 
     def _register_stream_tick_persistence_hook(self) -> None:
         self._stream_ticks._register_stream_tick_persistence_hook()
 
-    def _update_latest_tick_from_broker(self, tick: PriceTick) -> None:
-        self._stream_ticks._update_latest_tick_from_broker(tick)
-
     def _load_latest_tick_from_memory_cache(self, symbol: str, max_age_sec: float) -> PriceTick | None:
         return self._stream_ticks._load_latest_tick_from_memory_cache(symbol, max_age_sec)
-
-    def _persist_stream_tick_from_broker(self, tick: PriceTick) -> None:
-        self._stream_ticks._persist_stream_tick_from_broker(tick)
 
     @staticmethod
     def _normalize_timestamp_seconds(raw_ts: float | int | str | None) -> float:
@@ -796,10 +628,6 @@ class TradingBot:
         return self._price_history._history_keep_rows_min
 
     @property
-    def _history_keep_rows_cap(self):
-        return self._price_history._history_keep_rows_cap
-
-    @property
     def _history_prefetch_enabled(self):
         return self._price_history._history_prefetch_enabled
 
@@ -808,20 +636,8 @@ class TradingBot:
         return self._price_history._history_prefetch_points
 
     @property
-    def _history_prefetch_resolution(self):
-        return self._price_history._history_prefetch_resolution
-
-    @property
-    def _history_prefetch_skip_ratio(self):
-        return self._price_history._history_prefetch_skip_ratio
-
-    @property
     def _passive_history_poll_interval_sec(self):
         return self._price_history._passive_history_poll_interval_sec
-
-    @property
-    def _passive_history_max_symbols_per_cycle(self):
-        return self._price_history._passive_history_max_symbols_per_cycle
 
     @property
     def _passive_history_refresh_lock(self):
@@ -833,13 +649,6 @@ class TradingBot:
     @staticmethod
     def _history_resolution_seconds(resolution: str) -> int | None:
         return BotPriceHistoryRuntime._history_resolution_seconds(resolution)
-
-    def _estimate_history_prefetch_specs(
-        self,
-        strategy_name: str,
-        strategy_params: dict[str, object],
-    ) -> tuple[tuple[str, int], ...]:
-        return self._price_history._estimate_history_prefetch_specs(strategy_name, strategy_params)
 
     def _register_symbol_history_requirement(
         self,
@@ -858,9 +667,6 @@ class TradingBot:
     def _history_prefetch_plan_for_symbol(self, symbol: str) -> list[tuple[str, int]]:
         return self._price_history._history_prefetch_plan_for_symbol(symbol)
 
-    def _candle_history_resolutions_for_symbol(self, symbol: str) -> tuple[int, ...]:
-        return self._price_history._candle_history_resolutions_for_symbol(symbol)
-
     def _history_prefetch_has_time_coverage(
         self,
         symbol: str,
@@ -869,9 +675,6 @@ class TradingBot:
         target_points: int,
     ) -> bool:
         return self._price_history._history_prefetch_has_time_coverage(symbol, resolution=resolution, target_points=target_points)
-
-    def _is_schedule_entry_active(self, now_utc: datetime, entry) -> bool:
-        return self._worker_reconcile._is_schedule_entry_active(now_utc, entry)
 
     def _schedule_assignments(self, now_utc: datetime | None = None) -> dict[str, WorkerAssignment]:
         return self._worker_reconcile._schedule_assignments(now_utc)
@@ -892,9 +695,6 @@ class TradingBot:
     def _stop_worker_for_symbol(self, symbol: str, reason: str) -> None:
         self._worker_lifecycle._stop_worker_for_symbol(symbol, reason)
 
-    def _record_deferred_switch(self, symbol: str, current: WorkerAssignment, desired: WorkerAssignment) -> None:
-        self._worker_lifecycle._record_deferred_switch(symbol, current, desired)
-
     def _reconcile_workers(self, now_utc: datetime | None = None) -> None:
         self._worker_reconcile._reconcile_workers(now_utc)
 
@@ -903,20 +703,6 @@ class TradingBot:
 
     def _runtime_monitor_interval_sec(self) -> float:
         return self._worker_health._runtime_monitor_interval_sec()
-
-    def _runtime_monitor_stale_after_sec(self) -> float:
-        return self._worker_health._runtime_monitor_stale_after_sec()
-
-    def _worker_stale_heartbeat_after_sec(self, worker: SymbolWorker) -> float:
-        return self._worker_health._worker_stale_heartbeat_after_sec(worker)
-
-    @staticmethod
-    def _worker_watchdog_blocking_operation_payload(
-        worker: SymbolWorker,
-        *,
-        now_wall: float,
-    ) -> dict[str, object] | None:
-        return BotWorkerHealthRuntime._worker_watchdog_blocking_operation_payload(worker, now_wall=now_wall)
 
     def _record_runtime_monitor_failure(self, task_name: str, exc: Exception) -> None:
         self._worker_health._record_runtime_monitor_failure(task_name, exc)
@@ -945,9 +731,6 @@ class TradingBot:
     def _monitor_loop_health_check_once(self) -> bool:
         return self._worker_health._monitor_loop_health_check_once()
 
-    def _worker_health_watchdog_loop(self) -> None:
-        self._worker_health._worker_health_watchdog_loop()
-
     def _start_worker_health_thread(self) -> None:
         self._worker_health._start_worker_health_thread()
 
@@ -965,16 +748,6 @@ class TradingBot:
 
     def _runtime_symbols_for_db_first_requests(self, now_utc: datetime | None = None) -> list[str]:
         return self._db_first_startup._runtime_symbols_for_db_first_requests(now_utc)
-
-    # -- DB-First Symbol Spec compat proxies --
-
-    @property
-    def _db_first_symbol_spec_poll_interval_sec(self):
-        return self._db_first_spec._db_first_symbol_spec_poll_interval_sec
-
-    @property
-    def _db_first_symbol_spec_refresh_age_sec(self):
-        return self._db_first_spec._db_first_symbol_spec_refresh_age_sec
 
     @property
     def _db_first_symbol_spec_retry_after_ts_by_symbol(self):
@@ -994,45 +767,6 @@ class TradingBot:
         wait_timeout_sec: float = 0.0,
     ) -> bool:
         return self._ig_budget.reserve(scope=scope, wait_timeout_sec=wait_timeout_sec)
-
-    def _active_symbols_for_db_first_tick_cache(self) -> list[str]:
-        return self._db_first_tick._active_symbols_for_db_first_tick_cache()
-
-    @staticmethod
-    def _coerce_finite_positive_float(value: object) -> float | None:
-        return BotDbFirstTickRuntime._coerce_finite_positive_float(value)
-
-    def _symbols_near_breakout_levels(self, active_symbols: list[str]) -> set[str]:
-        return self._db_first_tick._symbols_near_breakout_levels(active_symbols)
-
-    def _db_first_tick_priority_symbols_for_active(self, active_symbols: list[str]) -> list[str]:
-        return self._db_first_tick._db_first_tick_priority_symbols_for_active(active_symbols)
-
-    def _db_first_tick_symbol_buckets(self) -> tuple[list[str], list[str]]:
-        return self._db_first_tick._db_first_tick_symbol_buckets()
-
-    def _select_weighted_db_first_active_symbol(
-        self,
-        *,
-        active_symbols: list[str],
-        priority_symbols: list[str],
-    ) -> str:
-        return self._db_first_tick._select_weighted_db_first_active_symbol(
-            active_symbols=active_symbols, priority_symbols=priority_symbols,
-        )
-
-    def _select_db_first_tick_symbol(self, active_symbols: list[str], passive_symbols: list[str]) -> str | None:
-        return self._db_first_tick._select_db_first_tick_symbol(active_symbols, passive_symbols)
-
-    def _maybe_warn_db_first_active_cycle_too_long(
-        self,
-        *,
-        active_symbols: list[str],
-        request_interval_sec: float,
-    ) -> None:
-        self._db_first_tick._maybe_warn_db_first_active_cycle_too_long(
-            active_symbols=active_symbols, request_interval_sec=request_interval_sec,
-        )
 
     def _start_db_first_cache_workers(self) -> None:
         if not self._db_first_enabled():
@@ -1074,8 +808,11 @@ class TradingBot:
     def _db_first_tick_cache_loop(self) -> None:
         self._db_first_tick._db_first_tick_cache_loop()
 
-    def _maybe_prune_db_first_stale_ticks(self, *, active_symbol_count: int | None = None) -> None:
-        self._db_first_tick._maybe_prune_db_first_stale_ticks(active_symbol_count=active_symbol_count)
+    def _db_first_tick_symbol_buckets(self) -> tuple[list[str], list[str]]:
+        return self._db_first_tick._db_first_tick_symbol_buckets()
+
+    def _select_db_first_tick_symbol(self, active_symbols: list[str], passive_symbols: list[str]) -> str | None:
+        return self._db_first_tick._select_db_first_tick_symbol(active_symbols, passive_symbols)
 
     def _maybe_record_db_first_tick_cache_refresh_error(self, symbol: str, error: Exception) -> None:
         self._db_first_tick._maybe_record_db_first_tick_cache_refresh_error(symbol, error)
@@ -1106,42 +843,11 @@ class TradingBot:
             symbol, error_text, request_interval_sec=request_interval_sec, now_ts=now_ts,
         )
 
-    def _clear_db_first_symbol_spec_refresh_retry(self, symbol: str) -> None:
-        self._db_first_spec._clear_db_first_symbol_spec_refresh_retry(symbol)
-
-    @staticmethod
-    def _symbol_spec_change_payload(
-        previous: SymbolSpec | None,
-        current: SymbolSpec,
-    ) -> dict[str, dict[str, object]] | None:
-        return BotDbFirstSpecRuntime._symbol_spec_change_payload(previous, current)
-
-    def _symbol_spec_preload_is_strict(self) -> bool:
-        return self._db_first_spec._symbol_spec_preload_is_strict()
-
-    def _broker_candidate_chain(self, max_depth: int = 4) -> list[object]:
-        return self._db_first_spec._broker_candidate_chain(max_depth)
-
-    @staticmethod
-    def _is_startup_symbol_spec_fallback_error(error_text: str) -> bool:
-        return BotDbFirstSpecRuntime._is_startup_symbol_spec_fallback_error(error_text)
-
-    def _build_startup_symbol_spec_fallback(
-        self,
-        symbol: str,
-        *,
-        error_text: str = "",
-    ) -> SymbolSpec | None:
-        return self._db_first_spec._build_startup_symbol_spec_fallback(symbol, error_text=error_text)
-
     def _preload_symbol_specs_on_startup(self) -> None:
         self._db_first_spec._preload_symbol_specs_on_startup()
 
     def _db_first_account_cache_loop(self) -> None:
         self._db_first_startup._db_first_account_cache_loop()
-
-    def _maybe_warn_stale_db_first_account_snapshot(self, *, reason: str) -> None:
-        self._db_first_startup._maybe_warn_stale_db_first_account_snapshot(reason=reason)
 
     def _db_first_history_cache_loop(self) -> None:
         self._db_first_startup._db_first_history_cache_loop()
@@ -1178,60 +884,6 @@ class TradingBot:
     def _broker_public_api_backoff_remaining_sec(self) -> float:
         return self._broker_state.broker_public_api_backoff_remaining_sec()
 
-    def _broker_market_data_wait_remaining_sec(self) -> float:
-        return self._broker_state.broker_market_data_wait_remaining_sec()
-
-    @staticmethod
-    def _finite_float_or_none(raw: object) -> float | None:
-        return BotBrokerStateRuntime.finite_float_or_none(raw)
-
-    @staticmethod
-    def _normalize_currency_code(value: object) -> str | None:
-        return BotBrokerStateRuntime.normalize_currency_code(value)
-
-    def _broker_account_currency_code(self) -> str | None:
-        return self._broker_state.broker_account_currency_code()
-
-    def _currency_conversion_rate(
-        self,
-        from_currency: str | None,
-        to_currency: str | None,
-    ) -> tuple[float | None, str | None]:
-        return self._broker_state.currency_conversion_rate(from_currency, to_currency)
-
-    def _normalize_pnl_to_account_currency(
-        self,
-        pnl_amount: float | None,
-        pnl_currency: object | None,
-    ) -> tuple[float | None, dict[str, object]]:
-        return self._broker_state.normalize_pnl_to_account_currency(pnl_amount, pnl_currency)
-
-    def _estimate_position_pnl_from_close_price(
-        self,
-        position: Position,
-        close_price: float | None,
-        pnl_currency: object | None = None,
-    ) -> tuple[float | None, dict[str, object]]:
-        return self._broker_state.estimate_position_pnl_from_close_price(position, close_price, pnl_currency)
-
-    @staticmethod
-    def _trade_event_matches_position(payload: dict[str, object] | None, position_id: str) -> bool:
-        return BotCloseDetailsRuntime._trade_event_matches_position(payload, position_id)
-
-    def _best_close_details_from_events(self, position: Position) -> dict[str, object] | None:
-        return self._close_details._best_close_details_from_events(position)
-
-    def _resolved_close_details(
-        self,
-        position: Position,
-        broker_sync: dict[str, object] | None,
-    ) -> dict[str, object] | None:
-        return self._close_details._resolved_close_details(position, broker_sync)
-
-    @staticmethod
-    def _broker_close_sync_has_evidence(payload: dict[str, object] | None) -> bool:
-        return BotCloseDetailsRuntime._broker_close_sync_has_evidence(payload)
-
     def _get_broker_close_sync(
         self,
         position: Position,
@@ -1256,32 +908,6 @@ class TradingBot:
 
     def _backfill_closed_trade_details(self) -> int:
         return self._close_details._backfill_closed_trade_details()
-
-    def _closed_trade_details_retry_due(self, position_id: str, now_monotonic: float) -> bool:
-        return self._close_details._closed_trade_details_retry_due(position_id, now_monotonic)
-
-    def _schedule_closed_trade_details_retry(self, position_id: str, now_monotonic: float) -> None:
-        self._close_details._schedule_closed_trade_details_retry(position_id, now_monotonic)
-
-    @staticmethod
-    def _is_allowance_related_error(error_text: str) -> bool:
-        return BotTradeMetadataRuntime._is_allowance_related_error(error_text)
-
-    @staticmethod
-    def _slug_reason(value: str, fallback: str = "unknown") -> str:
-        return BotTradeMetadataRuntime._slug_reason(value, fallback)
-
-    def _extract_ig_error_code(self, error_text: str) -> str | None:
-        return self._trade_metadata._extract_ig_error_code(error_text)
-
-    def _extract_ig_api_endpoint(self, error_text: str) -> tuple[str, str] | None:
-        return self._trade_metadata._extract_ig_api_endpoint(error_text)
-
-    def _normalize_broker_error_reason(self, error_text: str) -> str:
-        return self._trade_metadata._normalize_broker_error_reason(error_text)
-
-    def _event_reason(self, event: dict[str, object]) -> tuple[str, str] | None:
-        return self._trade_metadata._event_reason(event)
 
     def _maybe_record_trade_reason_summary(self, now_monotonic: float, *, force: bool = False) -> None:
         self._trade_metadata._maybe_record_trade_reason_summary(now_monotonic, force=force)
@@ -1391,9 +1017,6 @@ class TradingBot:
             payload.get("remaining_value"),
         )
 
-    def _has_local_open_execution_positions(self) -> bool:
-        return self._position_sync._has_local_open_execution_positions()
-
     def _runtime_sync_interval_sec(
         self,
         *,
@@ -1418,24 +1041,6 @@ class TradingBot:
 
     def _runtime_sync_open_positions(self, force: bool = False) -> None:
         return self._position_sync._runtime_sync_open_positions(force=force)
-
-    def _filter_restored_positions_for_mode(self, restored: dict[str, Position]) -> dict[str, Position]:
-        return self._position_sync._filter_restored_positions_for_mode(restored)
-
-    def _match_pending_open(self, position: Position, pending_opens: list[PendingOpen]) -> PendingOpen | None:
-        return self._position_sync._match_pending_open(position, pending_opens)
-
-    def _restore_pending_trailing_override(self, pending: PendingOpen, position_id: str) -> None:
-        self._position_sync._restore_pending_trailing_override(pending, position_id)
-
-    def _sync_execution_positions_from_broker(
-        self,
-        local_restored: dict[str, Position],
-    ) -> tuple[dict[str, Position] | None, dict[str, object]]:
-        return self._position_sync._sync_execution_positions_from_broker(local_restored)
-
-    def _ensure_execution_startup_broker_sync_succeeded(self, summary: dict[str, object]) -> None:
-        self._position_sync._ensure_execution_startup_broker_sync_succeeded(summary)
 
     def _restore_open_positions(self) -> tuple[dict[str, Position], dict[str, object]]:
         return self._position_sync._restore_open_positions()

@@ -5,6 +5,7 @@ import math
 import time
 from typing import TYPE_CHECKING
 
+from xtb_bot.bot.trade_metadata import BotTradeMetadataRuntime
 from xtb_bot.models import SymbolSpec
 from xtb_bot.tolerances import FLOAT_COMPARISON_TOLERANCE, FLOAT_ROUNDING_TOLERANCE
 
@@ -87,7 +88,7 @@ class BotDbFirstSpecRuntime:
                     str(exc),
                     request_interval_sec=request_interval_sec,
                 )
-                if not self._bot._is_allowance_related_error(str(exc)):
+                if not BotTradeMetadataRuntime._is_allowance_related_error(str(exc)):
                     logger.debug("DB-first symbol spec refresh failed for %s: %s", symbol, exc)
             self._bot._db_first_cache_stop_event.wait(timeout=request_interval_sec)
 
@@ -234,7 +235,7 @@ class BotDbFirstSpecRuntime:
         upper_symbol = str(symbol).strip().upper()
         normalized_error = str(error_text or "").strip()
         allowance_related = (
-            self._bot._is_allowance_related_error(normalized_error)
+            BotTradeMetadataRuntime._is_allowance_related_error(normalized_error)
             or self._bot._broker_public_api_backoff_remaining_sec() > 0.0
         )
         if (
@@ -281,7 +282,7 @@ class BotDbFirstSpecRuntime:
             metadata["spec_origin"] = (
                 "critical_fallback_allowance" if allowance_related else "critical_fallback_startup"
             )
-            metadata["startup_fallback_reason"] = self._bot._slug_reason(
+            metadata["startup_fallback_reason"] = BotTradeMetadataRuntime._slug_reason(
                 normalized_error,
                 fallback="startup_preload",
             )
@@ -380,7 +381,7 @@ class BotDbFirstSpecRuntime:
                 )
             except Exception as exc:
                 error_text = str(exc)
-                if self._bot._is_allowance_related_error(error_text):
+                if BotTradeMetadataRuntime._is_allowance_related_error(error_text):
                     allowance_short_circuit = True
                     if previous is not None:
                         loaded_cached_count += 1

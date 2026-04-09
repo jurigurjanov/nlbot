@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from xtb_bot.bot._assignment import WorkerAssignment
+from xtb_bot.bot.strategy_assignment import BotStrategyAssignmentRuntime
 from xtb_bot.models import Position, RunMode
 
 if TYPE_CHECKING:
@@ -63,7 +64,7 @@ class BotWorkerReconcileRuntime:
                         symbol=symbol,
                         strategy_name=assignment.strategy_name,
                         strategy_params=dict(assignment.strategy_params),
-                        mode_override=self._bot._mode_override_for_symbol(symbol),
+                        mode_override=self._bot._strategy_assignment._mode_override_for_symbol(symbol),
                         source=assignment.source,
                         label=assignment.label,
                     ),
@@ -87,10 +88,10 @@ class BotWorkerReconcileRuntime:
             strategy_params = dict(fallback.strategy_params)
         elif strategy_name == _MULTI_STRATEGY_CARRIER_NAME:
             carrier_base_strategy = (
-                self._bot._normalize_strategy_label(row.get("strategy_entry"))
-                or self._bot._normalize_strategy_label(position.strategy_entry)
-                or self._bot._default_strategy_entry_for_assignment(fallback)
-                or self._bot._normalize_strategy_label(self._bot.config.strategy)
+                BotStrategyAssignmentRuntime._normalize_strategy_label(row.get("strategy_entry"))
+                or BotStrategyAssignmentRuntime._normalize_strategy_label(position.strategy_entry)
+                or self._bot._strategy_assignment._default_strategy_entry_for_assignment(fallback)
+                or BotStrategyAssignmentRuntime._normalize_strategy_label(self._bot.config.strategy)
                 or self._bot.config.strategy
             )
             carrier_name, carrier_params = self._bot._worker_assignment_payload(
@@ -110,7 +111,7 @@ class BotWorkerReconcileRuntime:
         elif fallback is not None and fallback.mode_override is not None:
             mode_override = fallback.mode_override
         else:
-            mode_override = self._bot._mode_override_for_symbol(position.symbol)
+            mode_override = self._bot._strategy_assignment._mode_override_for_symbol(position.symbol)
         return WorkerAssignment(
             symbol=position.symbol,
             strategy_name=strategy_name,
@@ -151,7 +152,7 @@ class BotWorkerReconcileRuntime:
                 symbol=symbol,
                 strategy_name=assignment_strategy_name,
                 strategy_params=dict(assignment_strategy_params),
-                mode_override=self._bot._mode_override_for_symbol(symbol),
+                mode_override=self._bot._strategy_assignment._mode_override_for_symbol(symbol),
                 source=source,
             )
             for symbol in self._bot.config.symbols
@@ -199,12 +200,12 @@ class BotWorkerReconcileRuntime:
                         symbol,
                         "Worker restarted",
                         {
-                            **self._bot._strategy_event_payload(
+                            **self._bot._strategy_assignment._strategy_event_payload(
                                 restart_assignment.strategy_name,
                                 restart_assignment.strategy_params,
                             ),
-                            "previous_strategy": self._bot._assignment_strategy_labels(current_assignment)[0],
-                            "previous_strategy_base": self._bot._assignment_strategy_labels(current_assignment)[1],
+                            "previous_strategy": self._bot._strategy_assignment._assignment_strategy_labels(current_assignment)[0],
+                            "previous_strategy_base": self._bot._strategy_assignment._assignment_strategy_labels(current_assignment)[1],
                         },
                     )
                     self._bot._start_worker_for_assignment(restart_assignment)
@@ -229,7 +230,7 @@ class BotWorkerReconcileRuntime:
                     continue
 
                 if active_position is not None:
-                    self._bot._record_deferred_switch(symbol, assignment, desired_assignment)
+                    self._bot._worker_lifecycle._record_deferred_switch(symbol, assignment, desired_assignment)
                     continue
 
                 current_mode = (

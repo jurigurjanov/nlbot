@@ -73,7 +73,7 @@ class BotTradeMetadataRuntime:
         raw_code = error_text[start:end].strip()
         if not raw_code:
             return None
-        return self._bot._slug_reason(raw_code, fallback="unknown")
+        return self._slug_reason(raw_code, fallback="unknown")
 
 
     def _extract_ig_api_endpoint(self, error_text: str) -> tuple[str, str] | None:
@@ -87,12 +87,12 @@ class BotTradeMetadataRuntime:
         parts = request_text.split()
         if len(parts) < 2:
             return None
-        method = self._bot._slug_reason(parts[0], fallback="request")
+        method = self._slug_reason(parts[0], fallback="request")
         raw_path = parts[1].strip()
         segments = [segment for segment in raw_path.split("/") if segment]
         if not segments:
             return method, "root"
-        resource = self._bot._slug_reason(segments[0], fallback="unknown")
+        resource = self._slug_reason(segments[0], fallback="unknown")
         if resource in {"positions", "workingorders"} and len(segments) > 1 and segments[1].lower() == "otc":
             resource = f"{resource}_otc"
         return method, resource
@@ -106,19 +106,19 @@ class BotTradeMetadataRuntime:
         if lowered.startswith("ig deal rejected:"):
             tail = text.split(":", 1)[1].strip()
             reject_reason = tail.split("|", 1)[0].strip()
-            return f"deal_rejected:{self._bot._slug_reason(reject_reason, fallback='unknown')}"
+            return f"deal_rejected:{self._slug_reason(reject_reason, fallback='unknown')}"
         if "requested size below broker minimum" in lowered:
             return "requested_size_below_broker_minimum"
         if "allowance cooldown is active" in lowered:
             return "allowance_cooldown_active"
-        endpoint = self._bot._extract_ig_api_endpoint(text)
+        endpoint = self._extract_ig_api_endpoint(text)
         if endpoint is not None:
             method, resource = endpoint
-            error_code = self._bot._extract_ig_error_code(text)
+            error_code = self._extract_ig_error_code(text)
             if error_code:
                 return f"ig_api_{method}_{resource}:{error_code}"
             return f"ig_api_{method}_{resource}:failed"
-        return self._bot._slug_reason(text, fallback="broker_error_unknown")
+        return self._slug_reason(text, fallback="broker_error_unknown")
 
 
     def _event_reason(self, event: dict[str, object]) -> tuple[str, str] | None:
@@ -140,12 +140,12 @@ class BotTradeMetadataRuntime:
         if message == "Broker allowance backoff active":
             kind = str(payload.get("kind") or "").strip()
             if kind:
-                return "block", f"allowance:{self._bot._slug_reason(kind, fallback='unknown')}"
+                return "block", f"allowance:{self._slug_reason(kind, fallback='unknown')}"
             error_text = str(payload.get("error") or "")
-            return "block", f"allowance:{self._bot._normalize_broker_error_reason(error_text)}"
+            return "block", f"allowance:{self._normalize_broker_error_reason(error_text)}"
         if message == "Broker error":
             error_text = str(payload.get("error") or "")
-            return "reject", self._bot._normalize_broker_error_reason(error_text)
+            return "reject", self._normalize_broker_error_reason(error_text)
         if message == "Signal hold reason":
             return "hold", str(payload.get("reason") or "unknown")
         return None
@@ -166,7 +166,7 @@ class BotTradeMetadataRuntime:
             aggregates: dict[tuple[str, str], dict[str, object]] = {}
             matched = 0
             for event in events:
-                reason_key = self._bot._event_reason(event)
+                reason_key = self._event_reason(event)
                 if reason_key is None:
                     continue
                 matched += 1

@@ -177,10 +177,10 @@ class BotWorkerHealthRuntime:
             )
             if heartbeat_age_sec is None:
                 continue
-            stale_after_sec = self._bot._worker_stale_heartbeat_after_sec(worker)
+            stale_after_sec = self._worker_stale_heartbeat_after_sec(worker)
             if heartbeat_age_sec < stale_after_sec:
                 continue
-            blocking_operation = self._bot._worker_watchdog_blocking_operation_payload(
+            blocking_operation = self._worker_watchdog_blocking_operation_payload(
                 worker,
                 now_wall=now_wall,
             )
@@ -209,7 +209,7 @@ class BotWorkerHealthRuntime:
             if blocking_operation is not None:
                 payload.update(blocking_operation)
             payload.update(
-                self._bot._strategy_event_payload(
+                self._bot._strategy_assignment._strategy_event_payload(
                     getattr(worker, "strategy_name", None),
                     (
                         getattr(assignment, "strategy_params", None)
@@ -271,7 +271,7 @@ class BotWorkerHealthRuntime:
         if not self._bot._runtime_monitor_watchdog_enabled:
             return False
         now_monotonic = time.monotonic()
-        stale_after_sec = self._bot._runtime_monitor_stale_after_sec()
+        stale_after_sec = self._runtime_monitor_stale_after_sec()
         last_progress_monotonic = max(
             self._bot._runtime_monitor_last_started_monotonic,
             self._bot._runtime_monitor_last_completed_monotonic,
@@ -337,7 +337,7 @@ class BotWorkerHealthRuntime:
             return
         self._bot._worker_health_stop_event.clear()
         thread = threading.Thread(
-            target=self._bot._worker_health_watchdog_loop,
+            target=self._worker_health_watchdog_loop,
             name="worker-health-watchdog",
             daemon=True,
         )

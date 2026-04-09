@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from xtb_bot.bot.trade_metadata import BotTradeMetadataRuntime
 from xtb_bot.models import RunMode
 
 if TYPE_CHECKING:
@@ -98,7 +99,7 @@ class BotDbFirstStartupRuntime:
                 break
             try:
                 tick = self._bot.broker.get_price(symbol)
-                self._bot._update_latest_tick_from_broker(tick)
+                self._bot._stream_ticks._update_latest_tick_from_broker(tick)
                 timestamp = self._bot._normalize_timestamp_seconds(getattr(tick, "timestamp", time.time()))
                 self._bot.store.upsert_broker_tick(
                     symbol=symbol,
@@ -183,7 +184,7 @@ class BotDbFirstStartupRuntime:
                     loop_name,
                     base_interval_sec=self._bot._db_first_account_snapshot_poll_interval_sec,
                 )
-                if not self._bot._is_allowance_related_error(str(exc)):
+                if not BotTradeMetadataRuntime._is_allowance_related_error(str(exc)):
                     logger.debug("DB-first account snapshot refresh failed: %s", exc)
                 self._bot._db_first_cache_stop_event.wait(
                     timeout=max(self._bot._db_first_account_snapshot_poll_interval_sec, backoff_sec)
@@ -249,7 +250,7 @@ class BotDbFirstStartupRuntime:
                     loop_name,
                     base_interval_sec=self._bot._db_first_history_poll_interval_sec,
                 )
-                if not self._bot._is_allowance_related_error(str(exc)):
+                if not BotTradeMetadataRuntime._is_allowance_related_error(str(exc)):
                     logger.debug("DB-first history cache refresh failed: %s", exc)
                 self._bot._db_first_cache_stop_event.wait(timeout=max(self._bot._db_first_history_poll_interval_sec, backoff_sec))
                 continue
@@ -296,7 +297,7 @@ class BotDbFirstStartupRuntime:
             if self._bot._history_prefetch_complete_for_all_symbols():
                 self._bot._runtime_deferred_history_prewarm_completed = True
             else:
-                max_symbols = max(1, min(4, self._bot._passive_history_max_symbols_per_cycle))
+                max_symbols = max(1, min(4, self._bot._price_history._passive_history_max_symbols_per_cycle))
                 summary = self._bot._prefill_price_history_from_broker(
                     force_all_symbols=False,
                     max_symbols=max_symbols,
@@ -311,7 +312,7 @@ class BotDbFirstStartupRuntime:
                 ):
                     payload = {
                         **summary,
-                        "resolution": self._bot._history_prefetch_resolution,
+                        "resolution": self._bot._price_history._history_prefetch_resolution,
                         "target_points": self._bot._history_prefetch_points,
                         "mode": self._bot.config.mode.value,
                         "fast_startup": True,

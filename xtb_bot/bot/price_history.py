@@ -8,6 +8,8 @@ import time
 from typing import TYPE_CHECKING
 
 from xtb_bot.bot._utils import _BoundedTtlCache
+from xtb_bot.bot.strategy_assignment import BotStrategyAssignmentRuntime
+from xtb_bot.bot.trade_metadata import BotTradeMetadataRuntime
 from xtb_bot.models import PriceTick
 from xtb_bot.tolerances import FLOAT_COMPARISON_TOLERANCE, FLOAT_ROUNDING_TOLERANCE
 
@@ -55,7 +57,7 @@ class BotPriceHistoryRuntime:
         self._last_passive_history_ts_by_symbol: dict[str, float] = {}
 
     def _estimate_history_keep_rows(self, strategy_name: str, strategy_params: dict[str, object]) -> int:
-        cache_key = self._bot._strategy_cache_identity(strategy_name, strategy_params)
+        cache_key = BotStrategyAssignmentRuntime._strategy_cache_identity(strategy_name, strategy_params)
         cached = self._strategy_history_estimate_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -106,7 +108,7 @@ class BotPriceHistoryRuntime:
         strategy_name: str,
         strategy_params: dict[str, object],
     ) -> tuple[tuple[str, int], ...]:
-        cache_key = self._bot._strategy_cache_identity(strategy_name, strategy_params)
+        cache_key = BotStrategyAssignmentRuntime._strategy_cache_identity(strategy_name, strategy_params)
         cached = self._strategy_prefetch_estimate_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -203,7 +205,7 @@ class BotPriceHistoryRuntime:
                 )
             keep_rows = max(keep_rows, required_rows, self._history_keep_rows_min)
             try:
-                prefetch_specs = self._bot._estimate_history_prefetch_specs(normalized_component, component_params)
+                prefetch_specs = self._estimate_history_prefetch_specs(normalized_component, component_params)
             except Exception as exc:
                 logger.debug(
                     "Failed to estimate history prefetch specs for %s/%s: %s",
@@ -319,7 +321,7 @@ class BotPriceHistoryRuntime:
             processed = 0
             max_tick_age_sec = max(
                 5.0,
-                min(300.0, self._bot._db_first_tick_max_age_for_workers() * 4.0),
+                min(300.0, self._bot._db_first_tick._db_first_tick_max_age_for_workers() * 4.0),
             )
 
             for symbol in ordered_symbols:
@@ -362,7 +364,7 @@ class BotPriceHistoryRuntime:
                     close=float(tick.mid),
                     volume=current_volume,
                     max_rows_per_symbol=keep_rows,
-                    candle_resolutions_sec=self._bot._candle_history_resolutions_for_symbol(symbol),
+                    candle_resolutions_sec=self._candle_history_resolutions_for_symbol(symbol),
                 )
                 self._last_passive_history_sample_monotonic_by_symbol[symbol] = now_monotonic
                 processed += 1
@@ -438,7 +440,7 @@ class BotPriceHistoryRuntime:
                     )
                 except Exception as exc:
                     text = str(exc)
-                    if self._bot._is_allowance_related_error(text):
+                    if BotTradeMetadataRuntime._is_allowance_related_error(text):
                         logger.info(
                             "Skipping history prefetch due allowance/backoff | symbol=%s resolution=%s error=%s",
                             symbol,
@@ -513,7 +515,7 @@ class BotPriceHistoryRuntime:
                             close=close,
                             volume=volume,
                             max_rows_per_symbol=keep_rows,
-                            candle_resolutions_sec=self._bot._candle_history_resolutions_for_symbol(symbol),
+                            candle_resolutions_sec=self._candle_history_resolutions_for_symbol(symbol),
                         )
                         if resolution_sec is not None and resolution_sec >= 60:
                             self._bot.store.append_candle_sample(
@@ -660,7 +662,7 @@ class BotPriceHistoryRuntime:
                         break
                     return
                 # Startup warmup must not block on broker-side REST pacing.
-                if force and self._bot._broker_market_data_wait_remaining_sec() > 0.0:
+                if force and self._bot._broker_state.broker_market_data_wait_remaining_sec() > 0.0:
                     break
 
                 if symbol in active_symbols:
@@ -682,7 +684,7 @@ class BotPriceHistoryRuntime:
                 except Exception as exc:
                     fetch_attempts += 1
                     error_text = str(exc)
-                    if self._bot._is_allowance_related_error(error_text):
+                    if BotTradeMetadataRuntime._is_allowance_related_error(error_text):
                         self._last_passive_history_error_monotonic_by_symbol[symbol] = now_monotonic
                         if force:
                             break
@@ -726,7 +728,7 @@ class BotPriceHistoryRuntime:
                     close=float(tick.mid),
                     volume=current_volume,
                     max_rows_per_symbol=keep_rows,
-                    candle_resolutions_sec=self._bot._candle_history_resolutions_for_symbol(symbol),
+                    candle_resolutions_sec=self._candle_history_resolutions_for_symbol(symbol),
                 )
                 self._last_passive_history_sample_monotonic_by_symbol[symbol] = now_monotonic
                 self._last_passive_history_error_monotonic_by_symbol.pop(symbol, None)

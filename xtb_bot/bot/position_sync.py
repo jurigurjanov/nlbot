@@ -6,6 +6,8 @@ import time
 from typing import TYPE_CHECKING
 
 from xtb_bot.models import PendingOpen, Position, RunMode
+from xtb_bot.bot.broker_state import BotBrokerStateRuntime
+from xtb_bot.bot.trade_metadata import BotTradeMetadataRuntime
 
 if TYPE_CHECKING:
     from xtb_bot.bot.core import TradingBot
@@ -129,7 +131,7 @@ class BotPositionSyncRuntime:
             now_ts = time.time()
             oldest_opened_at: float | None = None
             for position in local_by_id.values():
-                opened_at = self._bot._finite_float_or_none(getattr(position, "opened_at", None))
+                opened_at = BotBrokerStateRuntime.finite_float_or_none(getattr(position, "opened_at", None))
                 if opened_at is None or opened_at <= 0:
                     continue
                 if oldest_opened_at is None or opened_at < oldest_opened_at:
@@ -184,7 +186,7 @@ class BotPositionSyncRuntime:
         except Exception as exc:
             self._bot._pulse_runtime_monitor_progress()
             error_text = str(exc)
-            if self._bot._is_allowance_related_error(error_text):
+            if BotTradeMetadataRuntime._is_allowance_related_error(error_text):
                 if force or (
                     now_monotonic - self._last_runtime_broker_sync_error_monotonic
                 ) >= max(60.0, runtime_sync_interval_sec):
@@ -309,13 +311,13 @@ class BotPositionSyncRuntime:
                 strategy_entry_component,
                 strategy_entry_signal,
                 mode,
-            ) = self._bot._resolved_recovery_trade_identity(
+            ) = self._bot._strategy_assignment._resolved_recovery_trade_identity(
                 symbol=symbol,
                 existing_row=existing_row,
                 matched_pending=matched_pending,
                 default_assignment=default_assignment,
             )
-            self._bot._apply_position_trade_identity(
+            self._bot._strategy_assignment._apply_position_trade_identity(
                 position,
                 strategy=strategy,
                 strategy_entry=strategy_entry,
@@ -360,7 +362,7 @@ class BotPositionSyncRuntime:
                 symbol,
                 "Recovered broker-managed open position during runtime sync",
                 {
-                    **self._bot._strategy_event_payload(
+                    **self._bot._strategy_assignment._strategy_event_payload(
                         strategy,
                         (
                             default_assignment.strategy_params
@@ -492,7 +494,7 @@ class BotPositionSyncRuntime:
             )
         except Exception as exc:
             error_text = str(exc)
-            if self._bot._is_allowance_related_error(error_text):
+            if BotTradeMetadataRuntime._is_allowance_related_error(error_text):
                 logger.info(
                     "Managed broker position sync deferred on startup due to allowance backoff, using local state fallback: %s",
                     exc,
@@ -547,13 +549,13 @@ class BotPositionSyncRuntime:
                 strategy_entry_component,
                 strategy_entry_signal,
                 mode,
-            ) = self._bot._resolved_recovery_trade_identity(
+            ) = self._bot._strategy_assignment._resolved_recovery_trade_identity(
                 symbol=symbol,
                 existing_row=existing_row,
                 matched_pending=matched_pending,
                 default_assignment=default_assignment,
             )
-            self._bot._apply_position_trade_identity(
+            self._bot._strategy_assignment._apply_position_trade_identity(
                 position,
                 strategy=strategy,
                 strategy_entry=strategy_entry,
@@ -601,7 +603,7 @@ class BotPositionSyncRuntime:
                     symbol,
                     "Recovered broker-managed open position on startup",
                     {
-                        **self._bot._strategy_event_payload(
+                        **self._bot._strategy_assignment._strategy_event_payload(
                             strategy,
                             (
                                 default_assignment.strategy_params

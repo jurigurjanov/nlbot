@@ -7,6 +7,7 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+from xtb_bot.bot.trade_metadata import BotTradeMetadataRuntime
 from xtb_bot.models import PriceTick
 from xtb_bot.tolerances import FLOAT_ROUNDING_TOLERANCE
 
@@ -413,7 +414,7 @@ class BotDbFirstTickRuntime:
                 if tick is None:
                     self._bot._db_first_cache_stop_event.wait(timeout=min(0.5, request_interval_sec))
                     continue
-                self._bot._update_latest_tick_from_broker(tick)
+                self._bot._stream_ticks._update_latest_tick_from_broker(tick)
                 timestamp = self._bot._normalize_timestamp_seconds(getattr(tick, "timestamp", time.time()))
                 self._bot.store.upsert_broker_tick(
                     symbol=symbol,
@@ -460,8 +461,8 @@ class BotDbFirstTickRuntime:
             return
         now = time.time()
         error_text = str(error)
-        allowance_related = self._bot._is_allowance_related_error(error_text)
-        reason = self._bot._normalize_broker_error_reason(error_text)
+        allowance_related = BotTradeMetadataRuntime._is_allowance_related_error(error_text)
+        reason = self._bot._trade_metadata._normalize_broker_error_reason(error_text)
         disconnected_reason = reason == "ig_api_client_is:failed"
         if disconnected_reason:
             self._bot._maybe_reconnect_broker_for_db_first(now)
@@ -513,7 +514,7 @@ class BotDbFirstTickRuntime:
         }
         if assignment is not None:
             payload.update(
-                self._bot._strategy_event_payload(
+                self._bot._strategy_assignment._strategy_event_payload(
                     assignment.strategy_name,
                     assignment.strategy_params,
                 )
