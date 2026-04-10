@@ -372,7 +372,7 @@ def simulate_symbol(
     strategy: Strategy,
     spec: SymbolSpec | None,
     *,
-    warmup_bars: int = 250,
+    warmup_bars: int = 500,
     eval_interval_bars: int = 1,
     cooldown_bars: int = 5,
     spread_pips: float = 1.0,
@@ -773,7 +773,7 @@ def run_backtest(
     symbols: list[str] | None = None,
     params_override: dict[str, Any] | None = None,
     profile: str | None = None,
-    warmup_bars: int = 250,
+    warmup_bars: int = 500,
     candle_sec: int = 60,
     commission_pips: float = 0.0,
     parallel: bool = False,
@@ -885,7 +885,7 @@ Examples:
     parser.add_argument("--symbols", default=None, help="Comma-separated symbol filter")
     parser.add_argument("--params", default=None, help="JSON params override")
     parser.add_argument("--profile", default=None, help="Strategy profile: safe|conservative|aggressive")
-    parser.add_argument("--warmup", type=int, default=250, help="Warmup bars before trading (default: 250)")
+    parser.add_argument("--warmup", type=int, default=500, help="Warmup bars before trading (default: 500)")
     parser.add_argument("--candle-sec", type=int, default=60, help="Candle resolution in seconds (default: 60)")
     parser.add_argument("--commission-pips", type=float, default=0.0, help="Commission per trade in pips (default: 0)")
     parser.add_argument("--initial-balance", type=float, default=0.0, help="Initial account balance for P&L tracking (default: 0 = pips only)")
