@@ -70,6 +70,8 @@ class SimTrade:
     exit_ts: float = 0.0
     exit_reason: str = ""
     pnl_pips: float = 0.0
+    peak_favorable_pips: float = 0.0
+    trailing_activated: bool = False
 
 
 @dataclass
@@ -303,6 +305,67 @@ def _compute_pnl(side: Side, entry: float, exit_price: float, pip_size: float) -
     return (entry - exit_price) / pip_size
 
 
+# ---------------------------------------------------------------------------
+# Trailing stop engine
+# ---------------------------------------------------------------------------
+def _update_trailing_stop(
+    trade: SimTrade,
+    mark: float,
+    pip_size: float,
+    *,
+    trailing_distance_pips: float,
+    breakeven_offset_pips: float,
+    activation_ratio: float,
+    breakeven_min_peak_pips: float,
+) -> None:
+    """Update trade's stop_loss in-place based on trailing logic."""
+    tp_distance = abs(trade.take_profit - trade.entry_price)
+    if tp_distance <= 0:
+        return
+
+    if trade.side == Side.BUY:
+        favorable = mark - trade.entry_price
+        progress = favorable / tp_distance
+        peak_pips = max(trade.peak_favorable_pips, favorable / pip_size)
+        trade.peak_favorable_pips = peak_pips
+    else:
+        favorable = trade.entry_price - mark
+        progress = favorable / tp_distance
+        peak_pips = max(trade.peak_favorable_pips, favorable / pip_size)
+        trade.peak_favorable_pips = peak_pips
+
+    if favorable <= 0:
+        return
+
+    be_offset = breakeven_offset_pips * pip_size
+    trail_dist = trailing_distance_pips * pip_size
+
+    # Breakeven lock: once peak reaches threshold, lock SL at breakeven
+    if peak_pips >= breakeven_min_peak_pips:
+        if trade.side == Side.BUY:
+            be_level = trade.entry_price + be_offset
+            if be_level > trade.stop_loss:
+                trade.stop_loss = be_level
+        else:
+            be_level = trade.entry_price - be_offset
+            if be_level < trade.stop_loss:
+                trade.stop_loss = be_level
+
+    # Distance trailing: after activation, trail SL at fixed distance from mark
+    if progress >= activation_ratio:
+        trade.trailing_activated = True
+        if trade.side == Side.BUY:
+            candidate = mark - trail_dist
+            # Only move SL up, never down
+            if candidate > trade.stop_loss:
+                trade.stop_loss = candidate
+        else:
+            candidate = mark + trail_dist
+            # Only move SL down (for sell), never up
+            if candidate < trade.stop_loss:
+                trade.stop_loss = candidate
+
+
 def simulate_symbol(
     symbol: str,
     candles: list[Candle],
@@ -314,6 +377,11 @@ def simulate_symbol(
     cooldown_bars: int = 5,
     spread_pips: float = 1.0,
     commission_pips: float = 0.0,
+    trailing_enabled: bool = True,
+    trailing_distance_pips: float = 10.0,
+    trailing_activation_ratio: float = 0.3,
+    trailing_breakeven_offset_pips: float = 2.0,
+    trailing_breakeven_min_peak_pips: float = 4.0,
 ) -> SymbolResult:
     """
     Run strategy signals over candle history for one symbol.
@@ -340,6 +408,22 @@ def simulate_symbol(
 
     for bar_idx in range(warmup_bars, len(candles)):
         candle = candles[bar_idx]
+
+        # --- Trailing stop update (use previous bar's close as mark) ---
+        if open_trade is not None and trailing_enabled and bar_idx > warmup_bars:
+            prev_close = candles[bar_idx - 1].close
+            # Also track peak from candle extremes
+            if open_trade.side == Side.BUY:
+                mark = max(prev_close, candle.open)
+            else:
+                mark = min(prev_close, candle.open)
+            _update_trailing_stop(
+                open_trade, mark, pip_size,
+                trailing_distance_pips=trailing_distance_pips,
+                breakeven_offset_pips=trailing_breakeven_offset_pips,
+                activation_ratio=trailing_activation_ratio,
+                breakeven_min_peak_pips=trailing_breakeven_min_peak_pips,
+            )
 
         # --- Check open trade SL/TP against candle range ---
         if open_trade is not None:
@@ -626,7 +710,9 @@ def write_equity_csv(results: dict[str, SymbolResult], path: Path) -> None:
 # ---------------------------------------------------------------------------
 def _simulate_one(args: tuple) -> tuple[str, SymbolResult]:
     (symbol, ticks, strategy_name, strategy_params, spec,
-     warmup_bars, candle_sec, spread_pips, commission_pips) = args
+     warmup_bars, candle_sec, spread_pips, commission_pips,
+     trailing_enabled, trailing_distance_pips, trailing_activation_ratio,
+     trailing_breakeven_offset_pips, trailing_breakeven_min_peak_pips) = args
     candles = resample_to_candles(ticks, resolution_sec=candle_sec)
     strategy = create_strategy(strategy_name, strategy_params)
     result = simulate_symbol(
@@ -637,6 +723,11 @@ def _simulate_one(args: tuple) -> tuple[str, SymbolResult]:
         warmup_bars=warmup_bars,
         spread_pips=spread_pips,
         commission_pips=commission_pips,
+        trailing_enabled=trailing_enabled,
+        trailing_distance_pips=trailing_distance_pips,
+        trailing_activation_ratio=trailing_activation_ratio,
+        trailing_breakeven_offset_pips=trailing_breakeven_offset_pips,
+        trailing_breakeven_min_peak_pips=trailing_breakeven_min_peak_pips,
     )
     return symbol, result
 
@@ -655,6 +746,11 @@ def run_backtest(
     commission_pips: float = 0.0,
     parallel: bool = False,
     verbose: bool = False,
+    trailing_enabled: bool = True,
+    trailing_distance_pips: float = 10.0,
+    trailing_activation_ratio: float = 0.3,
+    trailing_breakeven_offset_pips: float = 2.0,
+    trailing_breakeven_min_peak_pips: float = 4.0,
 ) -> dict[str, SymbolResult]:
     """Run backtest for a strategy across symbols."""
 
@@ -688,7 +784,9 @@ def run_backtest(
         print(f"Running {len(history)} symbols in parallel ({workers} workers) ...")
         task_args = [
             (sym, ticks, strategy_name, params, specs.get(sym),
-             warmup_bars, candle_sec, get_spread(sym), commission_pips)
+             warmup_bars, candle_sec, get_spread(sym), commission_pips,
+             trailing_enabled, trailing_distance_pips, trailing_activation_ratio,
+             trailing_breakeven_offset_pips, trailing_breakeven_min_peak_pips)
             for sym, ticks in sorted(history.items())
         ]
         results: dict[str, SymbolResult] = {}
@@ -718,6 +816,11 @@ def run_backtest(
             warmup_bars=warmup_bars,
             spread_pips=spread,
             commission_pips=commission_pips,
+            trailing_enabled=trailing_enabled,
+            trailing_distance_pips=trailing_distance_pips,
+            trailing_activation_ratio=trailing_activation_ratio,
+            trailing_breakeven_offset_pips=trailing_breakeven_offset_pips,
+            trailing_breakeven_min_peak_pips=trailing_breakeven_min_peak_pips,
         )
         results[sym] = result
 
@@ -749,6 +852,11 @@ Examples:
     parser.add_argument("--warmup", type=int, default=250, help="Warmup bars before trading (default: 250)")
     parser.add_argument("--candle-sec", type=int, default=60, help="Candle resolution in seconds (default: 60)")
     parser.add_argument("--commission-pips", type=float, default=0.0, help="Commission per trade in pips (default: 0)")
+    parser.add_argument("--no-trailing", action="store_true", help="Disable trailing stop")
+    parser.add_argument("--trailing-distance", type=float, default=10.0, help="Trailing distance in pips (default: 10)")
+    parser.add_argument("--trailing-activation", type=float, default=0.3, help="Trailing activation ratio 0-1 (default: 0.3)")
+    parser.add_argument("--trailing-breakeven-offset", type=float, default=2.0, help="Breakeven offset pips (default: 2.0)")
+    parser.add_argument("--trailing-breakeven-peak", type=float, default=4.0, help="Min peak pips for breakeven (default: 4.0)")
     parser.add_argument("--trades", action="store_true", help="Show detailed trade list")
     parser.add_argument("--compare", action="store_true", help="Compare conservative vs aggressive profiles")
     parser.add_argument("--parallel", action="store_true", help="Run symbols in parallel (multi-process)")
@@ -770,6 +878,13 @@ Examples:
 
     symbols = [s.strip().upper() for s in args.symbols.split(",")] if args.symbols else None
     params_override = json.loads(args.params) if args.params else None
+    trailing_kw = dict(
+        trailing_enabled=not args.no_trailing,
+        trailing_distance_pips=args.trailing_distance,
+        trailing_activation_ratio=args.trailing_activation,
+        trailing_breakeven_offset_pips=args.trailing_breakeven_offset,
+        trailing_breakeven_min_peak_pips=args.trailing_breakeven_peak,
+    )
 
     if args.compare:
         t0 = time.monotonic()
@@ -785,6 +900,7 @@ Examples:
             commission_pips=args.commission_pips,
             parallel=args.parallel,
             verbose=args.verbose,
+            **trailing_kw,
         )
         print(format_results_table(results_cons, label=f"{args.strategy} / CONSERVATIVE"))
 
@@ -797,6 +913,7 @@ Examples:
             commission_pips=args.commission_pips,
             parallel=args.parallel,
             verbose=args.verbose,
+            **trailing_kw,
         )
         print(format_results_table(results_aggr, label=f"{args.strategy} / AGGRESSIVE"))
 
@@ -831,6 +948,7 @@ Examples:
         commission_pips=args.commission_pips,
         parallel=args.parallel,
         verbose=args.verbose,
+        **trailing_kw,
     )
     print(format_results_table(results, label=" / ".join(label_parts)))
 
