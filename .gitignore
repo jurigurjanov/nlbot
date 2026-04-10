@@ -4,6 +4,7 @@ __pycache__/
 .env
 state/
 *.db
+state.bck/
 node_modules/
 downloads/
 download/
