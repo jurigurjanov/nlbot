@@ -892,6 +892,7 @@ Examples:
     parser.add_argument("--pip-value", type=float, default=1.0, help="Value per pip in account currency (default: 1.0)")
     parser.add_argument("--spread-multiplier", type=float, default=1.0, help="Spread multiplier (default: 1.0, use 2.0 for stress test)")
     parser.add_argument("--entry-delay", type=int, default=0, help="Entry delay in bars/ticks (default: 0)")
+    parser.add_argument("--cooldown", type=int, default=5, help="Cooldown bars between trades (default: 5)")
     parser.add_argument("--no-trailing", action="store_true", help="Disable trailing stop")
     parser.add_argument("--trailing-distance", type=float, default=10.0, help="Trailing distance in pips (default: 10)")
     parser.add_argument("--trailing-activation", type=float, default=0.3, help="Trailing activation ratio 0-1 (default: 0.3)")
