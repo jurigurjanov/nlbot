@@ -326,6 +326,21 @@ class IgStreamMixin:
             self._stream_last_error = f"sdk_server_error:{code}:{message}"
             self._stream_sdk_connected = False
             self._stream_session_id = None
+            if self._stream_last_disconnect_ts is None:
+                self._stream_last_disconnect_ts = time.time()
+            self._stream_reconnect_attempts += 1
+            delay = self._stream_backoff_delay(self._stream_reconnect_attempts)
+            self._stream_next_retry_at = time.time() + delay
+            # Tear down the broken SDK client so _start_stream_sdk_locked can
+            # create a fresh one on the next connect() call.
+            self._stop_stream_sdk_locked()
+        logger.warning(
+            "IG Lightstreamer SDK server error, tearing down client | code=%s message=%s reconnect_in=%.1fs attempt=%s",
+            code,
+            message,
+            delay,
+            self._stream_reconnect_attempts,
+        )
 
     def _ensure_stream_sdk_symbol_table_locked(self, upper: str) -> int:
         from xtb_bot.ig_client import LIGHTSTREAMER_PRICE_FIELDS
@@ -707,6 +722,8 @@ class IgStreamMixin:
             if upper in self._stream_sdk_subscriptions:
                 return True
             if client is None or not account_id:
+                return False
+            if not self._stream_sdk_connected:
                 return False
 
         try:
