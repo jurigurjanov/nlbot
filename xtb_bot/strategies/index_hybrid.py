@@ -500,6 +500,24 @@ class IndexHybridStrategy(Strategy):
             False,
         )
 
+        # Fast MA trailing stop params
+        self._trailing_enabled = self._param_bool("index_hybrid_fast_ma_trailing_enabled", True)
+        self._trailing_activation_r_multiple = self._param_float(
+            "index_hybrid_fast_ma_trailing_activation_r_multiple", 0.8, min_val=0.0,
+        )
+        self._trailing_buffer_atr = self._param_float(
+            "index_hybrid_fast_ma_trailing_buffer_atr", 0.15, min_val=0.0,
+        )
+        self._trailing_buffer_pips = self._param_float(
+            "index_hybrid_fast_ma_trailing_buffer_pips", 0.0, min_val=0.0,
+        )
+        self._trailing_min_step_pips = self._param_float(
+            "index_hybrid_fast_ma_trailing_min_step_pips", 0.5, min_val=0.0,
+        )
+        self._trailing_update_cooldown_sec = self._param_float(
+            "index_hybrid_fast_ma_trailing_update_cooldown_sec", 5.0, min_val=0.0,
+        )
+
         self.min_history = (
             max(
                 self.fast_ema_window,
@@ -511,6 +529,25 @@ class IndexHybridStrategy(Strategy):
             )
             + 2
         )
+
+    def _trailing_payload(self, fast_ma_value: float) -> dict[str, object]:
+        if not self._trailing_enabled:
+            return {}
+        return {
+            "trailing_stop": {
+                "trailing_enabled": True,
+                "trailing_mode": "fast_ma",
+                "trailing_activation_r_multiple": self._trailing_activation_r_multiple,
+                "trailing_activation_min_profit_pips": 0.0,
+                "fast_ma_value": fast_ma_value,
+                "fast_ma_source": "fast_ema",
+                "fast_ma_use_closed_candle": True,
+                "fast_ma_buffer_atr": self._trailing_buffer_atr,
+                "fast_ma_buffer_pips": self._trailing_buffer_pips,
+                "fast_ma_min_step_pips": self._trailing_min_step_pips,
+                "fast_ma_update_cooldown_sec": self._trailing_update_cooldown_sec,
+            }
+        }
 
     @staticmethod
     def _as_bool(value: object, default: bool) -> bool:
@@ -1878,6 +1915,7 @@ class IndexHybridStrategy(Strategy):
                     "soft_filter_count": len(soft_filter_reasons),
                     **spread_meta,
                     **base_meta,
+                    **self._trailing_payload(fast_now),
                 },
             )
             return self._finalize_entry_signal(signal, prices=prices)
@@ -1981,6 +2019,7 @@ class IndexHybridStrategy(Strategy):
                     "soft_filter_count": len(soft_filter_reasons),
                     **spread_meta,
                     **base_meta,
+                    **self._trailing_payload(fast_now),
                 },
             )
             return self._finalize_entry_signal(signal, prices=prices)
@@ -2127,6 +2166,7 @@ class IndexHybridStrategy(Strategy):
                         "soft_filter_count": len(soft_filter_reasons),
                         **spread_meta,
                         **base_meta,
+                        **self._trailing_payload(fast_now),
                     },
                 )
                 return self._finalize_entry_signal(signal, prices=prices)
@@ -2213,6 +2253,7 @@ class IndexHybridStrategy(Strategy):
                         "soft_filter_count": len(soft_filter_reasons),
                         **spread_meta,
                         **base_meta,
+                        **self._trailing_payload(fast_now),
                     },
                 )
                 return self._finalize_entry_signal(signal, prices=prices)

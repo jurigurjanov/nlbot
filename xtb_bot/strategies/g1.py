@@ -377,6 +377,24 @@ class G1Strategy(Strategy):
                 "min_slow_slope_ratio": 0.00003,
             },
         )
+        # Fast MA trailing stop params
+        self._trailing_enabled = self._param_bool("g1_fast_ma_trailing_enabled", True)
+        self._trailing_activation_r_multiple = self._param_float(
+            "g1_fast_ma_trailing_activation_r_multiple", 0.8, min_val=0.0,
+        )
+        self._trailing_buffer_atr = self._param_float(
+            "g1_fast_ma_trailing_buffer_atr", 0.15, min_val=0.0,
+        )
+        self._trailing_buffer_pips = self._param_float(
+            "g1_fast_ma_trailing_buffer_pips", 0.0, min_val=0.0,
+        )
+        self._trailing_min_step_pips = self._param_float(
+            "g1_fast_ma_trailing_min_step_pips", 0.5, min_val=0.0,
+        )
+        self._trailing_update_cooldown_sec = self._param_float(
+            "g1_fast_ma_trailing_update_cooldown_sec", 5.0, min_val=0.0,
+        )
+
         self.min_history = max(
             self._profile_min_history(self.fx_profile),
             self._profile_min_history(self.index_profile),
@@ -389,6 +407,25 @@ class G1Strategy(Strategy):
             )
             + 2,
         )
+
+    def _trailing_payload(self, fast_ma_value: float) -> dict[str, object]:
+        if not self._trailing_enabled:
+            return {}
+        return {
+            "trailing_stop": {
+                "trailing_enabled": True,
+                "trailing_mode": "fast_ma",
+                "trailing_activation_r_multiple": self._trailing_activation_r_multiple,
+                "trailing_activation_min_profit_pips": 0.0,
+                "fast_ma_value": fast_ma_value,
+                "fast_ma_source": "fast_ema",
+                "fast_ma_use_closed_candle": True,
+                "fast_ma_buffer_atr": self._trailing_buffer_atr,
+                "fast_ma_buffer_pips": self._trailing_buffer_pips,
+                "fast_ma_min_step_pips": self._trailing_min_step_pips,
+                "fast_ma_update_cooldown_sec": self._trailing_update_cooldown_sec,
+            }
+        }
 
     @staticmethod
     def _as_int(params: dict[str, object], key: str, fallback_key: str, default: int, min_value: int) -> int:
@@ -2130,6 +2167,7 @@ class G1Strategy(Strategy):
                 "adx_warmup_extra_bars": self.adx_warmup_extra_bars,
                 "volume_confidence_boost_applied": volume_confidence_boost,
                 **volume_meta,
+                **self._trailing_payload(fast_now),
             },
         )
         return self._finalize_entry_signal(signal, prices=prices)

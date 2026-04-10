@@ -390,6 +390,24 @@ class MeanReversionBbStrategy(Strategy):
                 rsi_history = max(price_history, streak_history, rank_history)
             else:
                 rsi_history = max(self.rsi_period + 1, int(self.rsi_period * self.rsi_history_multiplier) + 1)
+        # Fast MA trailing stop params (uses BB midline as trailing anchor)
+        self._trailing_enabled = self._param_bool("mean_reversion_bb_fast_ma_trailing_enabled", True)
+        self._trailing_activation_r_multiple = self._param_float(
+            "mean_reversion_bb_fast_ma_trailing_activation_r_multiple", 0.8, min_val=0.0,
+        )
+        self._trailing_buffer_atr = self._param_float(
+            "mean_reversion_bb_fast_ma_trailing_buffer_atr", 0.15, min_val=0.0,
+        )
+        self._trailing_buffer_pips = self._param_float(
+            "mean_reversion_bb_fast_ma_trailing_buffer_pips", 0.0, min_val=0.0,
+        )
+        self._trailing_min_step_pips = self._param_float(
+            "mean_reversion_bb_fast_ma_trailing_min_step_pips", 0.5, min_val=0.0,
+        )
+        self._trailing_update_cooldown_sec = self._param_float(
+            "mean_reversion_bb_fast_ma_trailing_update_cooldown_sec", 5.0, min_val=0.0,
+        )
+
         self.min_history = max(
             self.bb_window + 1,
             rsi_history,
@@ -400,6 +418,25 @@ class MeanReversionBbStrategy(Strategy):
             if self.regime_volatility_expansion_filter_enabled
             else 0,
         )
+
+    def _trailing_payload(self, fast_ma_value: float) -> dict[str, object]:
+        if not self._trailing_enabled:
+            return {}
+        return {
+            "trailing_stop": {
+                "trailing_enabled": True,
+                "trailing_mode": "fast_ma",
+                "trailing_activation_r_multiple": self._trailing_activation_r_multiple,
+                "trailing_activation_min_profit_pips": 0.0,
+                "fast_ma_value": fast_ma_value,
+                "fast_ma_source": "bb_midline",
+                "fast_ma_use_closed_candle": True,
+                "fast_ma_buffer_atr": self._trailing_buffer_atr,
+                "fast_ma_buffer_pips": self._trailing_buffer_pips,
+                "fast_ma_min_step_pips": self._trailing_min_step_pips,
+                "fast_ma_update_cooldown_sec": self._trailing_update_cooldown_sec,
+            }
+        }
 
     @staticmethod
     def _split_tokens(raw: object) -> list[str]:
@@ -2089,6 +2126,7 @@ class MeanReversionBbStrategy(Strategy):
                     **volume_payload,
                     **vwap_payload,
                     **secondary_filter_payload,
+                    **self._trailing_payload(mean),
                 },
             )
             return self._finalize_entry_signal(signal, prices=prices)
@@ -2265,6 +2303,7 @@ class MeanReversionBbStrategy(Strategy):
                     **volume_payload,
                     **vwap_payload,
                     **secondary_filter_payload,
+                    **self._trailing_payload(mean),
                 },
             )
             return self._finalize_entry_signal(signal, prices=prices)

@@ -180,7 +180,44 @@ class G2Strategy(Strategy):
             max(0.05, float(params.get("g2_confidence_threshold_cap", 0.82))),
         )
 
+        # Fast MA trailing stop params
+        self._trailing_enabled = self._param_bool("g2_fast_ma_trailing_enabled", True)
+        self._trailing_activation_r_multiple = self._param_float(
+            "g2_fast_ma_trailing_activation_r_multiple", 0.8, min_val=0.0,
+        )
+        self._trailing_buffer_atr = self._param_float(
+            "g2_fast_ma_trailing_buffer_atr", 0.15, min_val=0.0,
+        )
+        self._trailing_buffer_pips = self._param_float(
+            "g2_fast_ma_trailing_buffer_pips", 0.0, min_val=0.0,
+        )
+        self._trailing_min_step_pips = self._param_float(
+            "g2_fast_ma_trailing_min_step_pips", 0.5, min_val=0.0,
+        )
+        self._trailing_update_cooldown_sec = self._param_float(
+            "g2_fast_ma_trailing_update_cooldown_sec", 5.0, min_val=0.0,
+        )
+
         self.min_history = max(self.ema_macro_window + 5, self.rsi_window + 4, self.atr_window + 4)
+
+    def _trailing_payload(self, fast_ma_value: float) -> dict[str, object]:
+        if not self._trailing_enabled:
+            return {}
+        return {
+            "trailing_stop": {
+                "trailing_enabled": True,
+                "trailing_mode": "fast_ma",
+                "trailing_activation_r_multiple": self._trailing_activation_r_multiple,
+                "trailing_activation_min_profit_pips": 0.0,
+                "fast_ma_value": fast_ma_value,
+                "fast_ma_source": "fast_ema",
+                "fast_ma_use_closed_candle": True,
+                "fast_ma_buffer_atr": self._trailing_buffer_atr,
+                "fast_ma_buffer_pips": self._trailing_buffer_pips,
+                "fast_ma_min_step_pips": self._trailing_min_step_pips,
+                "fast_ma_update_cooldown_sec": self._trailing_update_cooldown_sec,
+            }
+        }
 
     @staticmethod
     def _timezone_name(raw: object, default: str) -> str:
@@ -860,6 +897,7 @@ class G2Strategy(Strategy):
             "rsi_recovery_score": rsi_recovery_score,
             "confidence_threshold_cap": self.confidence_threshold_cap,
             **base_payload,
+            **self._trailing_payload(ema_fast_now),
         }
         return Signal(
             side=side,
