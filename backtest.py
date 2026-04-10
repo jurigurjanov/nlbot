@@ -382,6 +382,7 @@ def simulate_symbol(
     trailing_activation_ratio: float = 0.3,
     trailing_breakeven_offset_pips: float = 2.0,
     trailing_breakeven_min_peak_pips: float = 4.0,
+    entry_delay_bars: int = 0,
 ) -> SymbolResult:
     """
     Run strategy signals over candle history for one symbol.
@@ -405,9 +406,35 @@ def simulate_symbol(
     open_trade: SimTrade | None = None
     cooldown_until_bar: int = 0
     equity = 0.0
+    pending_entry: tuple[Side, float, float, float, int] | None = None  # (side, sl_pips, tp_pips, confidence, execute_at_bar)
 
     for bar_idx in range(warmup_bars, len(candles)):
         candle = candles[bar_idx]
+
+        # --- Execute pending delayed entry ---
+        if pending_entry is not None and open_trade is None and bar_idx >= pending_entry[4]:
+            p_side, p_sl_pips, p_tp_pips, p_confidence, _ = pending_entry
+            pending_entry = None
+            half_spread = spread_pips * pip_size * 0.5
+            if p_side == Side.BUY:
+                entry = candle.open + half_spread
+                sl = entry - p_sl_pips * pip_size
+                tp = entry + p_tp_pips * pip_size
+            else:
+                entry = candle.open - half_spread
+                sl = entry + p_sl_pips * pip_size
+                tp = entry - p_tp_pips * pip_size
+            open_trade = SimTrade(
+                symbol=symbol,
+                side=p_side,
+                entry_price=entry,
+                entry_ts=candle.ts,
+                stop_loss=sl,
+                take_profit=tp,
+                sl_pips=p_sl_pips,
+                tp_pips=p_tp_pips,
+                confidence=p_confidence,
+            )
 
         # --- Trailing stop update (use previous bar's close as mark) ---
         if open_trade is not None and trailing_enabled and bar_idx > warmup_bars:
@@ -505,32 +532,35 @@ def simulate_symbol(
             continue
         if bar_idx < cooldown_until_bar:
             continue
+        if pending_entry is not None:
+            continue
 
         sl_pips = max(signal.stop_loss_pips, 5.0)
         tp_pips = max(signal.take_profit_pips, sl_pips * 1.5)
 
-        half_spread = spread_pips * pip_size * 0.5
-
-        if signal.side == Side.BUY:
-            entry = candle.close + half_spread
-            sl = entry - sl_pips * pip_size
-            tp = entry + tp_pips * pip_size
+        if entry_delay_bars > 0:
+            pending_entry = (signal.side, sl_pips, tp_pips, signal.confidence, bar_idx + entry_delay_bars)
         else:
-            entry = candle.close - half_spread
-            sl = entry + sl_pips * pip_size
-            tp = entry - tp_pips * pip_size
-
-        open_trade = SimTrade(
-            symbol=symbol,
-            side=signal.side,
-            entry_price=entry,
-            entry_ts=candle.ts,
-            stop_loss=sl,
-            take_profit=tp,
-            sl_pips=sl_pips,
-            tp_pips=tp_pips,
-            confidence=signal.confidence,
-        )
+            half_spread = spread_pips * pip_size * 0.5
+            if signal.side == Side.BUY:
+                entry = candle.close + half_spread
+                sl = entry - sl_pips * pip_size
+                tp = entry + tp_pips * pip_size
+            else:
+                entry = candle.close - half_spread
+                sl = entry + sl_pips * pip_size
+                tp = entry - tp_pips * pip_size
+            open_trade = SimTrade(
+                symbol=symbol,
+                side=signal.side,
+                entry_price=entry,
+                entry_ts=candle.ts,
+                stop_loss=sl,
+                take_profit=tp,
+                sl_pips=sl_pips,
+                tp_pips=tp_pips,
+                confidence=signal.confidence,
+            )
 
     # Close any remaining open trade at last price
     if open_trade is not None:
@@ -712,7 +742,8 @@ def _simulate_one(args: tuple) -> tuple[str, SymbolResult]:
     (symbol, ticks, strategy_name, strategy_params, spec,
      warmup_bars, candle_sec, spread_pips, commission_pips,
      trailing_enabled, trailing_distance_pips, trailing_activation_ratio,
-     trailing_breakeven_offset_pips, trailing_breakeven_min_peak_pips) = args
+     trailing_breakeven_offset_pips, trailing_breakeven_min_peak_pips,
+     entry_delay_bars) = args
     candles = resample_to_candles(ticks, resolution_sec=candle_sec)
     strategy = create_strategy(strategy_name, strategy_params)
     result = simulate_symbol(
@@ -728,6 +759,7 @@ def _simulate_one(args: tuple) -> tuple[str, SymbolResult]:
         trailing_activation_ratio=trailing_activation_ratio,
         trailing_breakeven_offset_pips=trailing_breakeven_offset_pips,
         trailing_breakeven_min_peak_pips=trailing_breakeven_min_peak_pips,
+        entry_delay_bars=entry_delay_bars,
     )
     return symbol, result
 
@@ -751,6 +783,8 @@ def run_backtest(
     trailing_activation_ratio: float = 0.3,
     trailing_breakeven_offset_pips: float = 2.0,
     trailing_breakeven_min_peak_pips: float = 4.0,
+    entry_delay_bars: int = 0,
+    spread_multiplier: float = 1.0,
 ) -> dict[str, SymbolResult]:
     """Run backtest for a strategy across symbols."""
 
@@ -784,9 +818,10 @@ def run_backtest(
         print(f"Running {len(history)} symbols in parallel ({workers} workers) ...")
         task_args = [
             (sym, ticks, strategy_name, params, specs.get(sym),
-             warmup_bars, candle_sec, get_spread(sym), commission_pips,
+             warmup_bars, candle_sec, get_spread(sym) * spread_multiplier, commission_pips,
              trailing_enabled, trailing_distance_pips, trailing_activation_ratio,
-             trailing_breakeven_offset_pips, trailing_breakeven_min_peak_pips)
+             trailing_breakeven_offset_pips, trailing_breakeven_min_peak_pips,
+             entry_delay_bars)
             for sym, ticks in sorted(history.items())
         ]
         results: dict[str, SymbolResult] = {}
@@ -806,7 +841,7 @@ def run_backtest(
             print(f"  {sym}: {len(ticks)} ticks -> {len(candles)} candles ({candle_sec}s)")
 
         spec = specs.get(sym)
-        spread = get_spread(sym)
+        spread = get_spread(sym) * spread_multiplier
 
         result = simulate_symbol(
             symbol=sym,
@@ -821,6 +856,7 @@ def run_backtest(
             trailing_activation_ratio=trailing_activation_ratio,
             trailing_breakeven_offset_pips=trailing_breakeven_offset_pips,
             trailing_breakeven_min_peak_pips=trailing_breakeven_min_peak_pips,
+            entry_delay_bars=entry_delay_bars,
         )
         results[sym] = result
 
@@ -852,6 +888,10 @@ Examples:
     parser.add_argument("--warmup", type=int, default=250, help="Warmup bars before trading (default: 250)")
     parser.add_argument("--candle-sec", type=int, default=60, help="Candle resolution in seconds (default: 60)")
     parser.add_argument("--commission-pips", type=float, default=0.0, help="Commission per trade in pips (default: 0)")
+    parser.add_argument("--initial-balance", type=float, default=0.0, help="Initial account balance for P&L tracking (default: 0 = pips only)")
+    parser.add_argument("--pip-value", type=float, default=1.0, help="Value per pip in account currency (default: 1.0)")
+    parser.add_argument("--spread-multiplier", type=float, default=1.0, help="Spread multiplier (default: 1.0, use 2.0 for stress test)")
+    parser.add_argument("--entry-delay", type=int, default=0, help="Entry delay in bars/ticks (default: 0)")
     parser.add_argument("--no-trailing", action="store_true", help="Disable trailing stop")
     parser.add_argument("--trailing-distance", type=float, default=10.0, help="Trailing distance in pips (default: 10)")
     parser.add_argument("--trailing-activation", type=float, default=0.3, help="Trailing activation ratio 0-1 (default: 0.3)")
@@ -884,6 +924,8 @@ Examples:
         trailing_activation_ratio=args.trailing_activation,
         trailing_breakeven_offset_pips=args.trailing_breakeven_offset,
         trailing_breakeven_min_peak_pips=args.trailing_breakeven_peak,
+        entry_delay_bars=args.entry_delay,
+        spread_multiplier=args.spread_multiplier,
     )
 
     if args.compare:
@@ -954,6 +996,24 @@ Examples:
 
     if args.trades:
         print(format_trade_list(results))
+
+    if args.initial_balance > 0:
+        pv = args.pip_value
+        total_pnl_pips = sum(r.total_pnl_pips for r in results.values())
+        total_pnl_money = total_pnl_pips * pv
+        final_balance = args.initial_balance + total_pnl_money
+        total_trades = sum(r.total_trades for r in results.values())
+        max_dd_pips = max((r.max_drawdown_pips for r in results.values()), default=0.0)
+        max_dd_money = max_dd_pips * pv
+        print(f"\n{'ACCOUNT SUMMARY':=^60}")
+        print(f"  Initial balance:  ${args.initial_balance:,.2f}")
+        print(f"  Pip value:        ${pv:.2f}")
+        print(f"  Total trades:     {total_trades}")
+        print(f"  Total PnL:        {total_pnl_pips:+,.1f} pips = ${total_pnl_money:+,.2f}")
+        print(f"  Max drawdown:     {max_dd_pips:,.1f} pips = ${max_dd_money:,.2f}")
+        print(f"  Final balance:    ${final_balance:,.2f}")
+        pct_return = (total_pnl_money / args.initial_balance) * 100
+        print(f"  Return:           {pct_return:+.2f}%")
 
     if args.equity_csv:
         eq_path = Path(args.equity_csv)
