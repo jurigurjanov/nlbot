@@ -187,6 +187,48 @@ def load_price_history(
     return dict(history)
 
 
+def load_candles(
+    db_path: Path,
+    symbols: list[str] | None = None,
+    timeframe: int = 60,
+) -> dict[str, list[Candle]]:
+    """Load pre-built OHLCV candles from candles table. Returns {symbol: [Candle, ...]}."""
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    try:
+        # Check if candles table exists
+        tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if "candles" not in tables:
+            return {}
+        if symbols:
+            placeholders = ",".join("?" for _ in symbols)
+            rows = con.execute(
+                f"SELECT symbol, ts, open, high, low, close, volume FROM candles "
+                f"WHERE timeframe=? AND symbol IN ({placeholders}) ORDER BY symbol, ts",
+                [timeframe] + [s.upper() for s in symbols],
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT symbol, ts, open, high, low, close, volume FROM candles "
+                "WHERE timeframe=? ORDER BY symbol, ts",
+                (timeframe,),
+            ).fetchall()
+    finally:
+        con.close()
+
+    result: dict[str, list[Candle]] = defaultdict(list)
+    for row in rows:
+        result[row["symbol"]].append(Candle(
+            ts=float(row["ts"]),
+            open=float(row["open"]),
+            high=float(row["high"]),
+            low=float(row["low"]),
+            close=float(row["close"]),
+            volume=float(row["volume"]) if row["volume"] is not None else 0.0,
+        ))
+    return dict(result)
+
+
 def load_symbol_specs(db_path: Path) -> dict[str, SymbolSpec]:
     """Load broker symbol specs from DB."""
     con = sqlite3.connect(str(db_path))
@@ -739,12 +781,16 @@ def write_equity_csv(results: dict[str, SymbolResult], path: Path) -> None:
 # Parallel simulation helper
 # ---------------------------------------------------------------------------
 def _simulate_one(args: tuple) -> tuple[str, SymbolResult]:
-    (symbol, ticks, strategy_name, strategy_params, spec,
+    (symbol, data, strategy_name, strategy_params, spec,
      warmup_bars, candle_sec, spread_pips, commission_pips,
      trailing_enabled, trailing_distance_pips, trailing_activation_ratio,
      trailing_breakeven_offset_pips, trailing_breakeven_min_peak_pips,
-     entry_delay_bars) = args
-    candles = resample_to_candles(ticks, resolution_sec=candle_sec)
+     entry_delay_bars, use_prebuilt) = args
+    if use_prebuilt:
+        # data is list of tuples (ts, open, high, low, close, volume) for pickle compat
+        candles = [Candle(*c) for c in data]
+    else:
+        candles = resample_to_candles(data, resolution_sec=candle_sec)
     strategy = create_strategy(strategy_name, strategy_params)
     result = simulate_symbol(
         symbol=symbol,
@@ -803,26 +849,36 @@ def run_backtest(
     params.setdefault("stop_loss_pips", 25)
     params.setdefault("take_profit_pips", 50)
 
-    print(f"Loading price history from {db_path} ...")
-    history = load_price_history(db_path, symbols)
+    # Try pre-built candles first, fall back to raw ticks + resampling
+    prebuilt = load_candles(db_path, symbols, timeframe=candle_sec)
     specs = load_symbol_specs(db_path)
 
-    if not history:
-        print("No price history found!")
-        return {}
+    if prebuilt:
+        print(f"Loaded {sum(len(v) for v in prebuilt.values())} pre-built candles across {len(prebuilt)} symbols ({candle_sec}s)")
+        history = None
+    else:
+        print(f"Loading price history from {db_path} ...")
+        history = load_price_history(db_path, symbols)
+        if not history:
+            print("No price history found!")
+            return {}
+        print(f"Loaded {sum(len(v) for v in history.values())} ticks across {len(history)} symbols")
 
-    print(f"Loaded {sum(len(v) for v in history.values())} ticks across {len(history)} symbols")
+    sym_data = prebuilt if prebuilt else history
+    use_prebuilt = bool(prebuilt)
 
-    if parallel and len(history) > 1:
-        workers = min(len(history), os.cpu_count() or 4)
-        print(f"Running {len(history)} symbols in parallel ({workers} workers) ...")
+    if parallel and len(sym_data) > 1:
+        workers = min(len(sym_data), os.cpu_count() or 4)
+        print(f"Running {len(sym_data)} symbols in parallel ({workers} workers) ...")
         task_args = [
-            (sym, ticks, strategy_name, params, specs.get(sym),
+            (sym,
+             [(c.ts, c.open, c.high, c.low, c.close, c.volume) for c in data] if use_prebuilt else data,
+             strategy_name, params, specs.get(sym),
              warmup_bars, candle_sec, get_spread(sym) * spread_multiplier, commission_pips,
              trailing_enabled, trailing_distance_pips, trailing_activation_ratio,
              trailing_breakeven_offset_pips, trailing_breakeven_min_peak_pips,
-             entry_delay_bars)
-            for sym, ticks in sorted(history.items())
+             entry_delay_bars, use_prebuilt)
+            for sym, data in sorted(sym_data.items())
         ]
         results: dict[str, SymbolResult] = {}
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
@@ -835,10 +891,13 @@ def run_backtest(
     # Sequential
     strategy = create_strategy(strategy_name, params)
     results = {}
-    for sym, ticks in sorted(history.items()):
-        candles = resample_to_candles(ticks, resolution_sec=candle_sec)
+    for sym, data in sorted(sym_data.items()):
+        if use_prebuilt:
+            candles = data  # already list[Candle]
+        else:
+            candles = resample_to_candles(data, resolution_sec=candle_sec)
         if verbose:
-            print(f"  {sym}: {len(ticks)} ticks -> {len(candles)} candles ({candle_sec}s)")
+            print(f"  {sym}: {len(candles)} candles ({candle_sec}s)")
 
         spec = specs.get(sym)
         spread = get_spread(sym) * spread_multiplier
