@@ -17,7 +17,7 @@ from xtb_bot.strategies import create_strategy
 
 
 def _run_day_symbol(args):
-    sn, sym, ticks, spec, spread, params, warmup, cooldown = args
+    sn, sym, ticks, spec, spread, params, warmup, cooldown, monday_cooldown_hours = args
     strategy = create_strategy(sn, params)
     candles = resample_to_candles(ticks)
     if len(candles) < warmup + 10:
@@ -27,6 +27,7 @@ def _run_day_symbol(args):
         warmup_bars=warmup, spread_pips=spread, entry_delay_bars=2, cooldown_bars=cooldown,
         trailing_enabled=True, trailing_distance_pips=999.0, trailing_activation_ratio=0.99,
         trailing_breakeven_offset_pips=2.0, trailing_breakeven_min_peak_pips=8.0,
+        monday_cooldown_hours=monday_cooldown_hours,
     )
     return [(sn, t.pnl_pips, t.entry_ts) for t in r.trades]
 
@@ -38,6 +39,7 @@ def main():
     parser.add_argument("--from-date", default="2026-03-01")
     parser.add_argument("--to-date", default="2026-04-11")
     parser.add_argument("--cooldown", type=int, default=360)
+    parser.add_argument("--monday-cooldown", type=float, default=2.0, help="Monday no-trade hours UTC (default: 2.0)")
     parser.add_argument("--warmup", type=int, default=500)
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
@@ -92,7 +94,7 @@ def main():
                 if len(rows) < args.warmup + 50:
                     continue
                 ticks = [(float(r['ts']), float(r['close']), float(r['volume']) if r['volume'] else None) for r in rows]
-                tasks.append((sn, sym, ticks, specs.get(sym), get_spread(sym) * 2.0, strat_params[sn], args.warmup, args.cooldown))
+                tasks.append((sn, sym, ticks, specs.get(sym), get_spread(sym) * 2.0, strat_params[sn], args.warmup, args.cooldown, args.monday_cooldown))
 
         # Run in parallel
         by_strat = {sn: 0.0 for sn in strategies_list}

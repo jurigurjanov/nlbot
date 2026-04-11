@@ -158,8 +158,21 @@ class Strategy(ABC):
         self._runtime_symbol_pip_sizes = parse_symbol_pip_size_map(
             params.get(self._RUNTIME_SYMBOL_PIP_SIZES_KEY),
         )
+        self._base_symbol_blacklist = self._parse_symbol_set(
+            params.get("symbol_blacklist", ""),
+        )
+
+    @staticmethod
+    def _parse_symbol_set(raw: object) -> frozenset[str]:
+        if not raw:
+            return frozenset()
+        if isinstance(raw, (list, tuple, set, frozenset)):
+            return frozenset(normalize_symbol(s) for s in raw if str(s).strip())
+        return frozenset(normalize_symbol(s) for s in str(raw).split(",") if s.strip())
 
     def supports_symbol(self, symbol: str) -> bool:
+        if normalize_symbol(symbol) in self._base_symbol_blacklist:
+            return False
         return True
 
     @abstractmethod

@@ -425,6 +425,7 @@ def simulate_symbol(
     trailing_breakeven_offset_pips: float = 2.0,
     trailing_breakeven_min_peak_pips: float = 4.0,
     entry_delay_bars: int = 0,
+    monday_cooldown_hours: float = 2.0,
 ) -> SymbolResult:
     """
     Run strategy signals over candle history for one symbol.
@@ -576,6 +577,13 @@ def simulate_symbol(
             continue
         if pending_entry is not None:
             continue
+
+        # Monday cooldown: skip entries in first N hours of Monday (UTC)
+        if monday_cooldown_hours > 0:
+            from datetime import datetime as _dt, timezone as _tz
+            _candle_dt = _dt.fromtimestamp(candle.ts, tz=_tz.utc)
+            if _candle_dt.weekday() == 0 and _candle_dt.hour < monday_cooldown_hours:
+                continue
 
         sl_pips = max(signal.stop_loss_pips, 5.0)
         tp_pips = max(signal.take_profit_pips, sl_pips * 1.5)
@@ -785,7 +793,7 @@ def _simulate_one(args: tuple) -> tuple[str, SymbolResult]:
      warmup_bars, candle_sec, spread_pips, commission_pips,
      trailing_enabled, trailing_distance_pips, trailing_activation_ratio,
      trailing_breakeven_offset_pips, trailing_breakeven_min_peak_pips,
-     entry_delay_bars, use_prebuilt) = args
+     entry_delay_bars, use_prebuilt, monday_cooldown_hours) = args
     if use_prebuilt:
         # data is list of tuples (ts, open, high, low, close, volume) for pickle compat
         candles = [Candle(*c) for c in data]
@@ -806,6 +814,7 @@ def _simulate_one(args: tuple) -> tuple[str, SymbolResult]:
         trailing_breakeven_offset_pips=trailing_breakeven_offset_pips,
         trailing_breakeven_min_peak_pips=trailing_breakeven_min_peak_pips,
         entry_delay_bars=entry_delay_bars,
+        monday_cooldown_hours=monday_cooldown_hours,
     )
     return symbol, result
 
@@ -831,6 +840,7 @@ def run_backtest(
     trailing_breakeven_min_peak_pips: float = 4.0,
     entry_delay_bars: int = 0,
     spread_multiplier: float = 1.0,
+    monday_cooldown_hours: float = 2.0,
 ) -> dict[str, SymbolResult]:
     """Run backtest for a strategy across symbols."""
 
@@ -877,7 +887,7 @@ def run_backtest(
              warmup_bars, candle_sec, get_spread(sym) * spread_multiplier, commission_pips,
              trailing_enabled, trailing_distance_pips, trailing_activation_ratio,
              trailing_breakeven_offset_pips, trailing_breakeven_min_peak_pips,
-             entry_delay_bars, use_prebuilt)
+             entry_delay_bars, use_prebuilt, monday_cooldown_hours)
             for sym, data in sorted(sym_data.items())
         ]
         results: dict[str, SymbolResult] = {}
@@ -916,6 +926,7 @@ def run_backtest(
             trailing_breakeven_offset_pips=trailing_breakeven_offset_pips,
             trailing_breakeven_min_peak_pips=trailing_breakeven_min_peak_pips,
             entry_delay_bars=entry_delay_bars,
+            monday_cooldown_hours=monday_cooldown_hours,
         )
         results[sym] = result
 
@@ -952,6 +963,7 @@ Examples:
     parser.add_argument("--spread-multiplier", type=float, default=1.0, help="Spread multiplier (default: 1.0, use 2.0 for stress test)")
     parser.add_argument("--entry-delay", type=int, default=0, help="Entry delay in bars/ticks (default: 0)")
     parser.add_argument("--cooldown", type=int, default=5, help="Cooldown bars between trades (default: 5)")
+    parser.add_argument("--monday-cooldown", type=float, default=2.0, help="Monday no-trade hours UTC (default: 2.0)")
     parser.add_argument("--no-trailing", action="store_true", help="Disable trailing stop")
     parser.add_argument("--trailing-distance", type=float, default=10.0, help="Trailing distance in pips (default: 10)")
     parser.add_argument("--trailing-activation", type=float, default=0.3, help="Trailing activation ratio 0-1 (default: 0.3)")
@@ -986,6 +998,7 @@ Examples:
         trailing_breakeven_min_peak_pips=args.trailing_breakeven_peak,
         entry_delay_bars=args.entry_delay,
         spread_multiplier=args.spread_multiplier,
+        monday_cooldown_hours=args.monday_cooldown,
     )
 
     if args.compare:
