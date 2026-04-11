@@ -33,8 +33,13 @@ def main():
     con.row_factory = sqlite3.Row
     symbols = [r['symbol'] for r in con.execute('SELECT DISTINCT symbol FROM price_history ORDER BY symbol').fetchall()]
 
-    start = datetime(2026, 3, 1, tzinfo=timezone.utc)
-    end = datetime(2026, 4, 11, tzinfo=timezone.utc)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--from-date", default="2026-03-01")
+    ap.add_argument("--to-date", default="2026-04-11")
+    cli = ap.parse_args()
+    start = datetime.strptime(cli.from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end = datetime.strptime(cli.to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     warmup_start = start.timestamp() - (600 * 60)
     strats = ['trend_following', 'index_hybrid', 'mean_reversion_bb', 'donchian_breakout']
 
