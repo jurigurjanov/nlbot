@@ -38,6 +38,10 @@ If a parameter exists in `.env`, the Python default is **never used**. Always ch
 - `xtb_bot/risk_manager.py` — Position sizing and risk checks
 - `xtb_bot/state_store.py` — SQLite persistence layer
 
+## Parallelization
+
+Always run backtests, optimizations, and strategy matrix scans with **8 parallel workers** (`--workers 8` or `ProcessPoolExecutor(max_workers=8)`). Never run sequential when parallel is available.
+
 ## Commit Convention
 
 Always commit after code changes (standing instruction from user: "всегда делай коммиты после изменений в коде").
